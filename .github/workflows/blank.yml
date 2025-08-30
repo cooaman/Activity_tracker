@@ -1,11 +1,10 @@
-
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # manual trigger
   push:
     branches:
-      - main
+      - main           # adjust if your repo uses a different default branch
 
 jobs:
   build:
