@@ -1,10 +1,11 @@
+
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:   # allows manual trigger
+  workflow_dispatch:
   push:
     branches:
-      - main           # change if your repo default branch is different
+      - main
 
 jobs:
   build:
@@ -17,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'   # or the version you use locally
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
