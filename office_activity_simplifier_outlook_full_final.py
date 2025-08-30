@@ -204,7 +204,22 @@ class TaskApp(tk.Tk):
             lb.pack(fill=tk.BOTH, expand=True)
             self.kanban_lists[status] = lb
 
-    # -- All methods: CRUD, Outlook, Settings, CSV, Popups go here (as in previous build) --
+    # CRUD, Kanban, Outlook, CSV, Settings methods would be included here (same as earlier)
+
+    # Popups
+    def _show_today_popup(self):
+        due_today = self.db.fetch_due_today()
+        if due_today:
+            messagebox.showinfo("Today's Tasks", "\n".join([f"{r['title']} (Due: {r['due_date']})" if r['due_date'] else r['title'] for r in due_today]))
+        else:
+            messagebox.showinfo("Today's Tasks", "No tasks due today.")
+
+    def _show_overdue_popup(self):
+        overdue = self.db.fetch_overdue()
+        if overdue:
+            messagebox.showwarning("Overdue Tasks", "\n".join([f"{r['title']} (Due: {r['due_date']})" for r in overdue]))
+        else:
+            messagebox.showinfo("Overdue Tasks", "No overdue tasks.")
 
 def main():
     app = TaskApp()
