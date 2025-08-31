@@ -396,7 +396,7 @@ class TaskApp(tk.Tk):
         if not r: return
         self.db.update(self.kanban_selected_id, r["title"], new_desc, r["due_date"], r["priority"], r["status"])
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {"title": r["title"], "desc": new_desc, "due": r["due_date"]}, action="update")
+        self._sync_outlook_task(self.kanban_selected_id, {"title": r["title"], "desc": new_desc, "due": r["due_date"], "status": r["status"]}, action="update")
         messagebox.showinfo("Saved","Description updated successfully.")
 
     def _enable_kanban_buttons(self, status):
@@ -454,7 +454,7 @@ class TaskApp(tk.Tk):
         if not r: return
         self.db.update(task_id, r["title"], r["description"], r["due_date"], r["priority"], new_status)
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"]}, action="update")
+        self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
 
     # -------------------- Outlook --------------------
     def _get_flagged_emails(self):
@@ -462,32 +462,38 @@ class TaskApp(tk.Tk):
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         flagged = []
         try:
-            todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo
-            for task in todo_folder.Items:
+            inbox = outlook.GetDefaultFolder(6)  # Inbox
+            folders = [inbox] + list(inbox.Folders)
+            for folder in folders:
                 try:
-                    # Only import tasks not marked complete
-                    if not getattr(task, "Complete", False):
-                        due = task.DueDate.strftime("%Y-%m-%d") if getattr(task, "DueDate", None) else None
-                        flagged.append({
-                            "title": f"[Outlook] {task.Subject}",
-                            "description": (getattr(task, "Body", "") or "").strip()[:500],
-                            "due_date": due,
-                            "priority": "Medium",
-                            "status": "Pending",
-                            "outlook_id": task.EntryID
-                        })
+                    for item in folder.Items:
+                        try:
+                            if getattr(item, "FlagStatus", 0) == 2:  # flagged
+                                due = None
+                                if getattr(item, "TaskDueDate", None):
+                                    due = item.TaskDueDate.strftime("%Y-%m-%d")
+                                flagged.append({
+                                    "title": f"[Mail] {item.Subject}",
+                                    "description": (getattr(item, "Body", "") or "").strip()[:500],
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": item.EntryID
+                                })
+                        except Exception:
+                            continue
                 except Exception:
                     continue
         except Exception as e:
-            print("Error accessing To-Do List:", e)
+            print("Error scanning Outlook folders:", e)
         return flagged
 
     def _import_outlook_flags(self):
         rows=self._get_flagged_emails()
         if not rows:
-            messagebox.showinfo("Outlook","No active tasks found in To-Do List."); return
+            messagebox.showinfo("Outlook","No flagged emails found."); return
         self.db.bulk_add(rows); self._populate(); self._populate_kanban()
-        messagebox.showinfo("Outlook", f"Imported {len(rows)} active tasks.")
+        messagebox.showinfo("Outlook", f"Imported {len(rows)} flagged emails as tasks.")
 
     def _refresh_outlook_flags(self): 
         self._import_outlook_flags()
@@ -507,18 +513,32 @@ class TaskApp(tk.Tk):
         if not row or not row["outlook_id"]: return
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         try:
-            task = outlook.GetItemFromID(row["outlook_id"])
+            item = outlook.GetItemFromID(row["outlook_id"])
+            if not item: return
+
             if action == "delete":
-                task.Delete()
+                item.ClearTaskFlag()
+                item.Save()
                 return
+
             if action == "done":
-                task.MarkComplete()
-            else:  # update
-                task.Subject = new_data["title"]
-                task.Body = new_data["desc"]
-                if new_data["due"]:
-                    task.DueDate = datetime.strptime(new_data["due"], "%Y-%m-%d")
-            task.Save()
+                item.MarkComplete()
+                return
+
+            # status mapping
+            status = new_data.get("status")
+            if status in ("Pending", "In-Progress"):
+                item.FlagStatus = 2
+            elif status == "Done":
+                item.MarkComplete()
+
+            if new_data.get("due"):
+                item.TaskDueDate = datetime.strptime(new_data["due"], "%Y-%m-%d")
+
+            if new_data.get("title"):
+                item.FlagRequest = f"Follow up: {new_data['title']}"
+
+            item.Save()
         except Exception as e:
             print("Outlook sync error:", e)
 
