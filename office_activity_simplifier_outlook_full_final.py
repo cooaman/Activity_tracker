@@ -497,22 +497,29 @@ class TaskApp(tk.Tk):
         self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
     # Part 3 methods here)
         # -------------------- Outlook Sync --------------------
+       # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
-        """Import Active Tasks + Flagged Emails from Outlook To-Do List (olFolderToDo=28)."""
+        """
+        Import Active Tasks and Flagged Emails from Outlook 'To-Do List',
+        faithfully translated from your VBA code.
+        """
         if not HAS_OUTLOOK: 
             return []
+
         flagged = []
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+
+            # olFolderToDo = 28
+            todo_folder = outlook.GetDefaultFolder(28)
             items = todo_folder.Items
 
             for item in items:
                 try:
-                    class_name = item.__class__.__name__
+                    message_class = getattr(item, "MessageClass", "")
 
                     # TaskItem
-                    if class_name == "_TaskItem":
+                    if message_class == "IPM.Task":
                         if not item.Complete:
                             due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
                             flagged.append({
@@ -525,8 +532,8 @@ class TaskApp(tk.Tk):
                             })
 
                     # MailItem
-                    elif class_name == "_MailItem":
-                        if getattr(item,"FlagStatus",0) == 2:  # olFlagMarked
+                    elif message_class == "IPM.Note":
+                        if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
                             due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
                             flagged.append({
                                 "title": f"[Mail] {item.Subject}",
@@ -536,11 +543,13 @@ class TaskApp(tk.Tk):
                                 "status": "Pending",
                                 "outlook_id": item.EntryID
                             })
-                except Exception as e:
-                    print("Error scanning item:", e)
+
+                except Exception as inner_e:
+                    print("Item error:", inner_e)
 
         except Exception as e:
             print("Outlook fetch error:", e)
+
         return flagged
 
     def _import_outlook_flags(self):
@@ -569,7 +578,7 @@ class TaskApp(tk.Tk):
             if not row or not row["outlook_id"]: return
             entryid = row["outlook_id"]
 
-            todo_folder = outlook.GetDefaultFolder(28)
+            todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
             items = todo_folder.Items
             item = None
             for i in items:
