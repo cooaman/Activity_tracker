@@ -1,0 +1,44 @@
+Sub ListActiveTasksAndFlaggedEmailsFromToDoList()
+    Dim olApp As Outlook.Application
+    Dim olNs As Outlook.Namespace
+    Dim todoItems As Outlook.Items
+    Dim olItem As Object
+    Dim activeItemsList As String
+    Dim todoFolder As Outlook.MAPIFolder
+    
+    ' Initialize Outlook application
+    Set olApp = New Outlook.Application
+    Set olNs = olApp.GetNamespace("MAPI")
+    
+    ' Access the Tasks folder
+    Set todoFolder = olNs.GetDefaultFolder(olFolderToDo)
+    Set todoItems = todoFolder.Items
+    
+    ' Iterate through items and filter active tasks and flagged emails
+    For Each olItem In todoItems
+        ' Check for TaskItem
+        If TypeOf olItem Is Outlook.TaskItem Then
+            Dim task As Outlook.TaskItem
+            Set task = olItem
+            If Not task.Complete Then
+                activeItemsList = activeItemsList & "Task: " & task.Subject & " - Due: " & task.DueDate & vbCrLf
+            End If
+        
+        ' Check for MailItem
+        ElseIf TypeOf olItem Is Outlook.MailItem Then
+            Dim mail As Outlook.MailItem
+            Set mail = olItem
+            ' Check if the Email is flagged and not complete
+            If mail.FlagStatus = olFlagMarked Then
+                activeItemsList = activeItemsList & "Flagged Email: " & mail.Subject & " - Due: " & mail.TaskDueDate & vbCrLf
+            End If
+        End If
+    Next olItem
+    
+    ' Display the result
+    If activeItemsList <> "" Then
+        MsgBox "Active Tasks and Flagged Emails:" & vbCrLf & activeItemsList
+    Else
+        MsgBox "No active tasks or flagged emails found."
+    End If
+End Sub
