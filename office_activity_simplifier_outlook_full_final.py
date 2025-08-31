@@ -496,13 +496,18 @@ class TaskApp(tk.Tk):
         self._populate(); self._populate_kanban()
         self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
     # Part 3 methods here)
-           # -------------------- Outlook Sync --------------------
+         # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
         """
         Import Active Tasks and Flagged Emails from Outlook 'To-Do List'
-        faithfully translated from VBA (using item.Class).
+        (with debug logging to outlook_debug.log).
         """
+        def log(msg):
+            with open("outlook_debug.log", "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+
         if not HAS_OUTLOOK:
+            log("DEBUG: Outlook not available")
             return []
 
         flagged = []
@@ -513,9 +518,12 @@ class TaskApp(tk.Tk):
             todo_folder = outlook.GetDefaultFolder(28)
             items = todo_folder.Items
 
+            log("DEBUG: Scanning Outlook 'To-Do List'...")
             for item in items:
                 try:
                     cls = getattr(item, "Class", 0)
+                    subj = getattr(item, "Subject", "?")
+                    log(f"DEBUG: Found item - Class={cls}, Subject={subj}")
 
                     # TaskItem (Class 48)
                     if cls == 48:
@@ -544,11 +552,12 @@ class TaskApp(tk.Tk):
                             })
 
                 except Exception as inner_e:
-                    print("Item error:", inner_e)
+                    log(f"DEBUG: Item error: {inner_e}")
 
         except Exception as e:
-            print("Outlook fetch error:", e)
+            log(f"DEBUG: Outlook fetch error: {e}")
 
+        log(f"DEBUG: Total collected={len(flagged)}")
         return flagged
 
     def _import_outlook_flags(self):
@@ -602,7 +611,8 @@ class TaskApp(tk.Tk):
                     item.FlagStatus = 1  # olFlagComplete
                 item.Save()
         except Exception as e:
-            print("Outlook sync error:", e)
+            with open("outlook_debug.log", "a", encoding="utf-8") as f:
+                f.write(f"DEBUG: Outlook sync error: {e}\n")
 
     # -------------------- CSV --------------------
     def _import_csv(self):
