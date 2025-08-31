@@ -498,11 +498,11 @@ class TaskApp(tk.Tk):
     # Part 3 methods here)
          # -------------------- Outlook Sync --------------------
         # -------------------- Outlook Sync --------------------
+        # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
         """
         Import Active Tasks and Flagged Emails from Outlook 'To-Do List'
-        with debug logging to outlook_debug.log.
-        Only imports tasks that are not complete and emails that are flagged but not completed.
+        with deep debug logging into outlook_debug.log.
         """
         def log(msg):
             with open("outlook_debug.log", "a", encoding="utf-8") as f:
@@ -523,10 +523,10 @@ class TaskApp(tk.Tk):
                 try:
                     cls = getattr(item, "Class", 0)
                     subj = getattr(item, "Subject", "?")
-                    log(f"DEBUG: Found item - Class={cls}, Subject={subj}")
 
                     # TaskItem (Class 48)
                     if cls == 48:
+                        log(f"DEBUG TaskItem: Subject={subj}, Complete={getattr(item,'Complete',None)}, DueDate={getattr(item,'DueDate',None)}")
                         if not item.Complete:
                             due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                             flagged.append({
@@ -540,10 +540,20 @@ class TaskApp(tk.Tk):
 
                     # MailItem (Class 43)
                     elif cls == 43:
-                        if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
-                            completed_date = getattr(item, "TaskCompletedDate", None)
-                            if not completed_date:  # only include if NOT completed
-                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                        flag_status = getattr(item, "FlagStatus", None)
+                        is_marked = getattr(item, "IsMarkedAsTask", None)
+                        is_done = getattr(item, "IsMarkedAsTaskComplete", None)
+                        completed_date = getattr(item, "TaskCompletedDate", None)
+                        due_date = getattr(item, "TaskDueDate", None)
+
+                        log(f"DEBUG MailItem: Subject={subj}, FlagStatus={flag_status}, "
+                            f"IsMarkedAsTask={is_marked}, IsMarkedAsTaskComplete={is_done}, "
+                            f"CompletedDate={completed_date}, TaskDueDate={due_date}")
+
+                        # Candidate filter
+                        if flag_status == 2:  # olFlagMarked
+                            if not is_done:  # only if not marked complete
+                                due = due_date.strftime("%Y-%m-%d") if due_date else None
                                 flagged.append({
                                     "title": f"[Mail] {item.Subject}",
                                     "description": (getattr(item, "Body", "") or "")[:500],
