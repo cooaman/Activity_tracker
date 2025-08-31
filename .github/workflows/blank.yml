@@ -25,11 +25,8 @@ jobs:
           pip install pyinstaller pywin32 plyer
           if exist requirements.txt (pip install -r requirements.txt)
 
-      - name: Run pywin32 postinstall
-        run: python -m pywin32_postinstall install
-
       - name: Build EXE
-        run: pyinstaller --onefile --hidden-import=win32timezone office_activity_simplifier_outlook_full_final.py
+        run: pyinstaller --onefile --hidden-import=win32timezone --hidden-import=pywintypes office_activity_simplifier_outlook_full_final.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v3
