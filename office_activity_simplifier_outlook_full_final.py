@@ -496,14 +496,13 @@ class TaskApp(tk.Tk):
         self._populate(); self._populate_kanban()
         self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
     # Part 3 methods here)
-        # -------------------- Outlook Sync --------------------
-       # -------------------- Outlook Sync --------------------
+           # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
         """
-        Import Active Tasks and Flagged Emails from Outlook 'To-Do List',
-        faithfully translated from your VBA code.
+        Import Active Tasks and Flagged Emails from Outlook 'To-Do List'
+        faithfully translated from VBA (using item.Class).
         """
-        if not HAS_OUTLOOK: 
+        if not HAS_OUTLOOK:
             return []
 
         flagged = []
@@ -516,28 +515,28 @@ class TaskApp(tk.Tk):
 
             for item in items:
                 try:
-                    message_class = getattr(item, "MessageClass", "")
+                    cls = getattr(item, "Class", 0)
 
-                    # TaskItem
-                    if message_class == "IPM.Task":
+                    # TaskItem (Class 48)
+                    if cls == 48:
                         if not item.Complete:
-                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
+                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                             flagged.append({
                                 "title": f"[Task] {item.Subject}",
-                                "description": (getattr(item,"Body","") or "")[:500],
+                                "description": (getattr(item, "Body", "") or "")[:500],
                                 "due_date": due,
                                 "priority": "Medium",
                                 "status": "Pending",
                                 "outlook_id": item.EntryID
                             })
 
-                    # MailItem
-                    elif message_class == "IPM.Note":
+                    # MailItem (Class 43)
+                    elif cls == 43:
                         if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
-                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
+                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
                             flagged.append({
                                 "title": f"[Mail] {item.Subject}",
-                                "description": (getattr(item,"Body","") or "")[:500],
+                                "description": (getattr(item, "Body", "") or "")[:500],
                                 "due_date": due,
                                 "priority": "Medium",
                                 "status": "Pending",
