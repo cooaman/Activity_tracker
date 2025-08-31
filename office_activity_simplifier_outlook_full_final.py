@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3, json, os, csv
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 try:
     import win32com.client
@@ -289,7 +289,8 @@ class TaskApp(tk.Tk):
         self.statusbar = tk.Label(self, text="", anchor="w", relief="sunken")
         self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # -------------------- CRUD, Kanban, Outlook, CSV, Settings, Reminders, Popups --------------------
+    # -------------------- CRUD + Kanban + Outlook + CSV + Settings + Reminders --------------------
+    # (paste in Part 2 
         # -------------------- CRUD --------------------
     def _validate_form(self):
         title = self.title_var.get().strip()
@@ -494,56 +495,58 @@ class TaskApp(tk.Tk):
         self.db.update(task_id, r["title"], r["description"], r["due_date"], r["priority"], new_status)
         self._populate(); self._populate_kanban()
         self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
-    # (paste in Part 2 + Part 3 code here)
+    # Part 3 methods here)
         # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
+        """Import Active Tasks + Flagged Emails from Outlook To-Do List (olFolderToDo=28)."""
         if not HAS_OUTLOOK: 
             return []
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         flagged = []
-
         try:
-            # Incomplete tasks only
-            tasks_folder = outlook.GetDefaultFolder(13)  # Tasks
-            tasks = tasks_folder.Items.Restrict("[Complete] = False")
-            for item in tasks:
-                title = item.Subject or "Untitled Task"
-                desc = getattr(item, "Body", "")[:500]
-                due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
-                flagged.append({
-                    "title": f"[Task] {title}",
-                    "description": desc,
-                    "due_date": due,
-                    "priority": "Medium",
-                    "status": "Pending",
-                    "outlook_id": item.EntryID
-                })
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+            items = todo_folder.Items
 
-            # Active flagged mails
-            inbox = outlook.GetDefaultFolder(6)  # Inbox
-            mails = inbox.Items.Restrict("[FlagStatus] = 2 AND [IsTaskCompleted] = False")
-            for mail in mails:
-                title = mail.Subject or "No Subject"
-                desc = (getattr(mail,"Body","") or "").strip()[:500]
-                due = mail.TaskDueDate.strftime("%Y-%m-%d") if getattr(mail,"TaskDueDate",None) else None
-                flagged.append({
-                    "title": f"[Mail] {title}",
-                    "description": desc,
-                    "due_date": due,
-                    "priority": "Medium",
-                    "status": "Pending",
-                    "outlook_id": mail.EntryID
-                })
+            for item in items:
+                try:
+                    class_name = item.__class__.__name__
+
+                    # TaskItem
+                    if class_name == "_TaskItem":
+                        if not item.Complete:
+                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
+                            flagged.append({
+                                "title": f"[Task] {item.Subject}",
+                                "description": (getattr(item,"Body","") or "")[:500],
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+
+                    # MailItem
+                    elif class_name == "_MailItem":
+                        if getattr(item,"FlagStatus",0) == 2:  # olFlagMarked
+                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
+                            flagged.append({
+                                "title": f"[Mail] {item.Subject}",
+                                "description": (getattr(item,"Body","") or "")[:500],
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+                except Exception as e:
+                    print("Error scanning item:", e)
 
         except Exception as e:
             print("Outlook fetch error:", e)
-
         return flagged
 
     def _import_outlook_flags(self):
         flagged = self._get_flagged_emails()
         if not flagged:
-            messagebox.showinfo("Outlook", "No active flagged tasks/emails found.")
+            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
             return
         self.db.bulk_add(flagged)
         self._populate(); self._populate_kanban()
@@ -556,6 +559,7 @@ class TaskApp(tk.Tk):
         self.after(minutes*60*1000, self._refresh_outlook_flags)
 
     def _sync_outlook_task(self, task_id, data, action="update"):
+        """Push updates back to Outlook To-Do List."""
         if not HAS_OUTLOOK: return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -565,17 +569,12 @@ class TaskApp(tk.Tk):
             if not row or not row["outlook_id"]: return
             entryid = row["outlook_id"]
 
+            todo_folder = outlook.GetDefaultFolder(28)
+            items = todo_folder.Items
             item = None
-            try:
-                tasks_folder = outlook.GetDefaultFolder(13)
-                for t in tasks_folder.Items:
-                    if t.EntryID == entryid: item = t; break
-            except: pass
-
-            if not item:
-                inbox = outlook.GetDefaultFolder(6)
-                for mail in inbox.Items:
-                    if mail.EntryID == entryid: item = mail; break
+            for i in items:
+                if i.EntryID == entryid:
+                    item = i; break
 
             if not item: return
 
@@ -589,8 +588,10 @@ class TaskApp(tk.Tk):
             elif action=="delete":
                 item.Delete()
             elif action=="done":
-                if hasattr(item,"MarkComplete"): item.MarkComplete()
-                else: item.FlagStatus = 1
+                if hasattr(item,"MarkComplete"):
+                    item.MarkComplete()
+                elif hasattr(item,"FlagStatus"):
+                    item.FlagStatus = 1  # olFlagComplete
                 item.Save()
         except Exception as e:
             print("Outlook sync error:", e)
@@ -664,7 +665,6 @@ class TaskApp(tk.Tk):
         rows = self.db.fetch_due_today()
         msg = "\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No tasks due today."
         messagebox.showinfo("Today's Tasks", msg)
-
 # -------------------- Main --------------------
 def main():
     app=TaskApp()
