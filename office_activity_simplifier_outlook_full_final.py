@@ -56,7 +56,6 @@ class TaskDB:
             );
             """
         )
-        # Add column if missing
         try:
             cur.execute("ALTER TABLE tasks ADD COLUMN outlook_id TEXT;")
         except sqlite3.OperationalError:
@@ -466,8 +465,8 @@ class TaskApp(tk.Tk):
             todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo
             for task in todo_folder.Items:
                 try:
-                    status = getattr(task, "Status", None)
-                    if status in (0, 1):  # Active tasks only
+                    # Only import tasks not marked complete
+                    if not getattr(task, "Complete", False):
                         due = task.DueDate.strftime("%Y-%m-%d") if getattr(task, "DueDate", None) else None
                         flagged.append({
                             "title": f"[Outlook] {task.Subject}",
