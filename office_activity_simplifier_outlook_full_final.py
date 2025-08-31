@@ -499,10 +499,12 @@ class TaskApp(tk.Tk):
          # -------------------- Outlook Sync --------------------
         # -------------------- Outlook Sync --------------------
         # -------------------- Outlook Sync --------------------
+        # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
         """
         Import Active Tasks and Flagged Emails from Outlook 'To-Do List'
-        with deep debug logging into outlook_debug.log.
+        with debug logging into outlook_debug.log.
+        Only imports tasks that are not complete and emails that are flagged but not completed.
         """
         def log(msg):
             with open("outlook_debug.log", "a", encoding="utf-8") as f:
@@ -526,7 +528,6 @@ class TaskApp(tk.Tk):
 
                     # TaskItem (Class 48)
                     if cls == 48:
-                        log(f"DEBUG TaskItem: Subject={subj}, Complete={getattr(item,'Complete',None)}, DueDate={getattr(item,'DueDate',None)}")
                         if not item.Complete:
                             due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                             flagged.append({
@@ -541,27 +542,23 @@ class TaskApp(tk.Tk):
                     # MailItem (Class 43)
                     elif cls == 43:
                         flag_status = getattr(item, "FlagStatus", None)
-                        is_marked = getattr(item, "IsMarkedAsTask", None)
                         is_done = getattr(item, "IsMarkedAsTaskComplete", None)
                         completed_date = getattr(item, "TaskCompletedDate", None)
                         due_date = getattr(item, "TaskDueDate", None)
 
                         log(f"DEBUG MailItem: Subject={subj}, FlagStatus={flag_status}, "
-                            f"IsMarkedAsTask={is_marked}, IsMarkedAsTaskComplete={is_done}, "
-                            f"CompletedDate={completed_date}, TaskDueDate={due_date}")
+                            f"IsMarkedAsTaskComplete={is_done}, CompletedDate={completed_date}, Due={due_date}")
 
-                        # Candidate filter
-                        if flag_status == 2:  # olFlagMarked
-                            if not is_done:  # only if not marked complete
-                                due = due_date.strftime("%Y-%m-%d") if due_date else None
-                                flagged.append({
-                                    "title": f"[Mail] {item.Subject}",
-                                    "description": (getattr(item, "Body", "") or "")[:500],
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": item.EntryID
-                                })
+                        if flag_status == 2 and not is_done:  # olFlagMarked and not completed
+                            due = due_date.strftime("%Y-%m-%d") if due_date else None
+                            flagged.append({
+                                "title": f"[Mail] {item.Subject}",
+                                "description": (getattr(item, "Body", "") or "")[:500],
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
 
                 except Exception as inner_e:
                     log(f"DEBUG: Item error: {inner_e}")
@@ -577,12 +574,64 @@ class TaskApp(tk.Tk):
         if not flagged:
             messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
             return
-        self.db.bulk_add(flagged)
-        self._populate(); self._populate_kanban()
-        messagebox.showinfo("Outlook", f"Imported {len(flagged)} tasks.")
+
+        cur = self.db.conn.cursor()
+        new_tasks = []
+        for task in flagged:
+            cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (task["outlook_id"],))
+            if not cur.fetchone():  # only add if not already imported
+                new_tasks.append(task)
+
+        if new_tasks:
+            self.db.bulk_add(new_tasks)
+            self._populate(); self._populate_kanban()
+            messagebox.showinfo("Outlook", f"Imported {len(new_tasks)} new tasks.")
+        else:
+            messagebox.showinfo("Outlook", "No new Outlook tasks to import.")
 
     def _refresh_outlook_flags(self):
-        self._import_outlook_flags()
+        """Two-way sync between Outlook To-Do List and the tool."""
+        flagged = self._get_flagged_emails()
+        if not flagged:
+            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+            return
+
+        cur = self.db.conn.cursor()
+        new_count, updated_count, synced_count = 0, 0, 0
+
+        # 1. Import new or update changed from Outlook -> Tool
+        for task in flagged:
+            cur.execute("SELECT * FROM tasks WHERE outlook_id=?", (task["outlook_id"],))
+            row = cur.fetchone()
+            if not row:
+                self.db.bulk_add([task])
+                new_count += 1
+            else:
+                if (row["title"] != task["title"] or
+                    row["description"] != task["description"] or
+                    row["due_date"] != task["due_date"] or
+                    row["status"] != task["status"]):
+                    self.db.update(row["id"], task["title"], task["description"],
+                                   task["due_date"], task["priority"], task["status"])
+                    updated_count += 1
+
+        # 2. Push updates from Tool -> Outlook
+        cur.execute("SELECT * FROM tasks WHERE outlook_id IS NOT NULL")
+        for row in cur.fetchall():
+            self._sync_outlook_task(row["id"], {
+                "title": row["title"],
+                "desc": row["description"],
+                "due": row["due_date"],
+                "status": row["status"]
+            }, action="update")
+            synced_count += 1
+
+        self._populate(); self._populate_kanban()
+
+        messagebox.showinfo("Outlook Sync",
+                            f"New Imported: {new_count}\n"
+                            f"Updated from Outlook: {updated_count}\n"
+                            f"Pushed back to Outlook: {synced_count}")
 
     def _schedule_outlook_refresh(self, minutes):
         self.after(minutes*60*1000, self._refresh_outlook_flags)
