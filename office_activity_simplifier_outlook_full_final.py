@@ -281,8 +281,7 @@ class TaskApp(tk.Tk):
 
         self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled")
         self.btn_next.pack(side=tk.LEFT, padx=5)
-
-    # -------------------- CRUD --------------------
+            # -------------------- CRUD --------------------
     def _validate_form(self):
         title = self.title_var.get().strip()
         if not title:
@@ -461,31 +460,37 @@ class TaskApp(tk.Tk):
         if not HAS_OUTLOOK: return []
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         flagged = []
+
+        def scan_folder(folder):
+            try:
+                for item in folder.Items:
+                    try:
+                        if getattr(item, "FlagStatus", 0) == 2:  # flagged
+                            due = None
+                            if getattr(item, "TaskDueDate", None):
+                                due = item.TaskDueDate.strftime("%Y-%m-%d")
+                            flagged.append({
+                                "title": f"[Mail] {item.Subject}",
+                                "description": (getattr(item, "Body", "") or "").strip()[:500],
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+                    except Exception:
+                        continue
+                for sub in folder.Folders:
+                    scan_folder(sub)
+            except Exception:
+                pass
+
         try:
-            inbox = outlook.GetDefaultFolder(6)  # Inbox
-            folders = [inbox] + list(inbox.Folders)
-            for folder in folders:
-                try:
-                    for item in folder.Items:
-                        try:
-                            if getattr(item, "FlagStatus", 0) == 2:  # flagged
-                                due = None
-                                if getattr(item, "TaskDueDate", None):
-                                    due = item.TaskDueDate.strftime("%Y-%m-%d")
-                                flagged.append({
-                                    "title": f"[Mail] {item.Subject}",
-                                    "description": (getattr(item, "Body", "") or "").strip()[:500],
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": item.EntryID
-                                })
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
+            for store in outlook.Stores:
+                root = store.GetRootFolder()
+                scan_folder(root)
         except Exception as e:
-            print("Error scanning Outlook folders:", e)
+            print("Outlook scan error:", e)
+
         return flagged
 
     def _import_outlook_flags(self):
@@ -517,15 +522,10 @@ class TaskApp(tk.Tk):
             if not item: return
 
             if action == "delete":
-                item.ClearTaskFlag()
-                item.Save()
-                return
-
+                item.ClearTaskFlag(); item.Save(); return
             if action == "done":
-                item.MarkComplete()
-                return
+                item.MarkComplete(); return
 
-            # status mapping
             status = new_data.get("status")
             if status in ("Pending", "In-Progress"):
                 item.FlagStatus = 2
@@ -534,10 +534,8 @@ class TaskApp(tk.Tk):
 
             if new_data.get("due"):
                 item.TaskDueDate = datetime.strptime(new_data["due"], "%Y-%m-%d")
-
             if new_data.get("title"):
                 item.FlagRequest = f"Follow up: {new_data['title']}"
-
             item.Save()
         except Exception as e:
             print("Outlook sync error:", e)
