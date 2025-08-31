@@ -165,30 +165,16 @@ class TaskApp(tk.Tk):
     def _build_ui(self):
         toolbar = ttk.Frame(self, padding=8)
         toolbar.pack(fill=tk.X)
-        ttk.Button(toolbar, text="Show Overdue", command=self._show_overdue_popup).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(toolbar, text="Import CSV (Bulk)", command=self._import_csv).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(toolbar, text="Export CSV", command=self._export_csv).pack(
-            side=tk.LEFT, padx=6
-        )
-        if HAS_OUTLOOK:
-            ttk.Button(
-                toolbar, text="Import Outlook Flags", command=self._import_outlook_flags
-            ).pack(side=tk.LEFT, padx=6)
-            ttk.Button(
-                toolbar,
-                text="Refresh Outlook Flags",
-                command=self._refresh_outlook_flags,
-            ).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(
-            side=tk.RIGHT, padx=6
-        )
+        ttk.Button(toolbar, text="Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Import CSV (Bulk)", command=self._import_csv).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=6)
+
+        # Outlook buttons always visible, but handle gracefully
+        ttk.Button(toolbar, text="Import Outlook Flags", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Refresh Outlook Flags", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=6)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -243,18 +229,10 @@ class TaskApp(tk.Tk):
         btns = ttk.Frame(list_tab)
         btns.pack(fill=tk.X, padx=8, pady=(0, 10))
         ttk.Button(btns, text="Add New", command=self._add_task).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Update Selected", command=self._update_task).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(btns, text="Delete Selected", command=self._delete_task).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(btns, text="Clear Form", command=self._clear_form).pack(
-            side=tk.LEFT, padx=6
-        )
+        ttk.Button(btns, text="Update Selected", command=self._update_task).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Delete Selected", command=self._delete_task).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Clear Form", command=self._clear_form).pack(side=tk.LEFT, padx=6)
 
         # Kanban tab
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
@@ -296,12 +274,8 @@ class TaskApp(tk.Tk):
         data = self._validate_form()
         if not data:
             return
-        self.db.add(
-            data["title"], data["desc"], data["due"], data["priority"], data["status"]
-        )
-        self._populate()
-        self._populate_kanban()
-        self._clear_form()
+        self.db.add(data["title"], data["desc"], data["due"], data["priority"], data["status"])
+        self._populate(); self._populate_kanban(); self._clear_form()
 
     def _update_task(self):
         sel = self.tree.selection()
@@ -312,16 +286,8 @@ class TaskApp(tk.Tk):
         data = self._validate_form()
         if not data:
             return
-        self.db.update(
-            task_id,
-            data["title"],
-            data["desc"],
-            data["due"],
-            data["priority"],
-            data["status"],
-        )
-        self._populate()
-        self._populate_kanban()
+        self.db.update(task_id, data["title"], data["desc"], data["due"], data["priority"], data["status"])
+        self._populate(); self._populate_kanban()
 
     def _delete_task(self):
         sel = self.tree.selection()
@@ -330,9 +296,7 @@ class TaskApp(tk.Tk):
         task_id = int(self.tree.item(sel[0], "values")[0])
         if messagebox.askyesno("Confirm", "Delete selected task?"):
             self.db.delete(task_id)
-            self._populate()
-            self._populate_kanban()
-            self._clear_form()
+            self._populate(); self._populate_kanban(); self._clear_form()
 
     def _mark_done(self):
         sel = self.tree.selection()
@@ -340,8 +304,7 @@ class TaskApp(tk.Tk):
             return
         task_id = int(self.tree.item(sel[0], "values")[0])
         self.db.mark_done(task_id)
-        self._populate()
-        self._populate_kanban()
+        self._populate(); self._populate_kanban()
 
     def _on_select(self, event):
         sel = self.tree.selection()
@@ -360,21 +323,15 @@ class TaskApp(tk.Tk):
         self.desc_text.insert(tk.END, row[0] if row else "")
 
     def _clear_form(self):
-        self.title_var.set("")
-        self.due_var.set("")
-        self.priority_var.set("Medium")
-        self.status_var.set("Pending")
+        self.title_var.set(""); self.due_var.set("")
+        self.priority_var.set("Medium"); self.status_var.set("Pending")
         self.desc_text.delete("1.0", tk.END)
 
     def _populate(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
         for r in self.db.fetch():
-            self.tree.insert(
-                "",
-                tk.END,
-                values=(r["id"], r["title"], r["due_date"] or "—", r["priority"], r["status"]),
-            )
+            self.tree.insert("", tk.END, values=(r["id"], r["title"], r["due_date"] or "—", r["priority"], r["status"]))
 
     def _kanban_label(self, r):
         label = f"[#{r['id']}] {r['title']}"
@@ -383,55 +340,51 @@ class TaskApp(tk.Tk):
         return label
 
     def _populate_kanban(self):
-        for lb in self.kanban_lists.values():
-            lb.delete(0, tk.END)
+        for lb in self.kanban_lists.values(): lb.delete(0, tk.END)
         for status, lb in self.kanban_lists.items():
             for r in self.db.fetch_by_status(status):
-                idx = lb.size()
-                lb.insert(tk.END, self._kanban_label(r))
-                if status == "Pending":
-                    lb.itemconfig(idx, bg="#fff9d6")
-                elif status == "In-Progress":
-                    lb.itemconfig(idx, bg="#d6ecff")
-                elif status == "Done":
-                    lb.itemconfig(idx, bg="#d6ffd6", fg="#555555")
-                if r["priority"] == "High":
-                    lb.itemconfig(idx, fg="red")  # safe on macOS
+                idx = lb.size(); lb.insert(tk.END, self._kanban_label(r))
+                if status == "Pending": lb.itemconfig(idx, bg="#fff9d6")
+                elif status == "In-Progress": lb.itemconfig(idx, bg="#d6ecff")
+                elif status == "Done": lb.itemconfig(idx, bg="#d6ffd6", fg="#555555")
+                if r["priority"] == "High": lb.itemconfig(idx, fg="red")
 
     # -------------------- Outlook Integration --------------------
     def _get_flagged_emails(self):
+        if not HAS_OUTLOOK:
+            return []
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6)
-        messages = inbox.Items
+        inbox = outlook.GetDefaultFolder(6)  # 6 = Inbox
+        folders = [inbox] + list(inbox.Folders)  # include subfolders
         flagged = []
-        for msg in messages:
+        for folder in folders:
             try:
-                if hasattr(msg, "FlagStatus") and msg.FlagStatus == 2:
-                    due_date = (
-                        msg.FlagDueBy.strftime("%Y-%m-%d") if msg.FlagDueBy else None
-                    )
-                    flagged.append(
-                        {
-                            "title": f"[Outlook] {msg.Subject}",
-                            "description": (msg.Body or "").strip()[:500],
-                            "due_date": due_date,
-                            "priority": "Medium",
-                            "status": "Pending",
-                        }
-                    )
+                messages = folder.Items
+                for msg in messages:
+                    try:
+                        if hasattr(msg, "FlagStatus") and msg.FlagStatus == 2:  # only flagged
+                            due_date = msg.FlagDueBy.strftime("%Y-%m-%d") if msg.FlagDueBy else None
+                            flagged.append({
+                                "title": f"[Outlook] {msg.Subject}",
+                                "description": (msg.Body or "").strip()[:500],
+                                "due_date": due_date,
+                                "priority": "Medium",
+                                "status": "Pending",
+                            })
+                    except Exception:
+                        continue
             except Exception:
                 continue
         return flagged
 
     def _import_outlook_flags(self):
         rows = self._get_flagged_emails()
-        if rows:
-            self.db.bulk_add(rows)
-            self._populate()
-            self._populate_kanban()
-            messagebox.showinfo("Outlook", f"Imported {len(rows)} flagged emails as tasks.")
-        else:
-            messagebox.showinfo("Outlook", "No flagged emails found.")
+        if not rows:
+            messagebox.showinfo("Outlook", "No flagged emails found or Outlook not available.")
+            return
+        self.db.bulk_add(rows)
+        self._populate(); self._populate_kanban()
+        messagebox.showinfo("Outlook", f"Imported {len(rows)} flagged emails as tasks.")
 
     def _refresh_outlook_flags(self):
         self._import_outlook_flags()
@@ -439,115 +392,57 @@ class TaskApp(tk.Tk):
     def _schedule_outlook_refresh(self, interval_minutes=30):
         ms = interval_minutes * 60 * 1000
         def callback():
-            try:
-                self._refresh_outlook_flags()
-            finally:
-                self.after(ms, callback)
+            try: self._refresh_outlook_flags()
+            finally: self.after(ms, callback)
         self.after(ms, callback)
 
     # -------------------- CSV Import/Export --------------------
     def _import_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
+        if not path: return
         with open(path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            rows = [
-                {
-                    "title": row["Title"],
-                    "description": row.get("Description", ""),
-                    "due_date": row.get("Due Date"),
-                    "priority": row.get("Priority", "Medium"),
-                    "status": row.get("Status", "Pending"),
-                }
-                for row in reader
-            ]
-        self.db.bulk_add(rows)
-        self._populate()
-        self._populate_kanban()
+            rows = [{"title": row["Title"], "description": row.get("Description",""),
+                     "due_date": row.get("Due Date"), "priority": row.get("Priority","Medium"),
+                     "status": row.get("Status","Pending")} for row in reader]
+        self.db.bulk_add(rows); self._populate(); self._populate_kanban()
 
     def _export_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv")
-        if not path:
-            return
+        if not path: return
         rows = self.db.fetch()
-        with open(path, "w", newline="", encoding="utf-8") as f:
+        with open(path,"w",newline="",encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "Title",
-                    "Description",
-                    "Due Date",
-                    "Priority",
-                    "Status",
-                    "Created",
-                    "Updated",
-                    "Done At",
-                    "ID",
-                ]
-            )
+            writer.writerow(["Title","Description","Due Date","Priority","Status","Created","Updated","Done At","ID"])
             for r in rows:
-                writer.writerow(
-                    [
-                        r["title"],
-                        r["description"],
-                        r["due_date"],
-                        r["priority"],
-                        r["status"],
-                        r["created_at"],
-                        r["updated_at"],
-                        r["done_at"],
-                        r["id"],
-                    ]
-                )
+                writer.writerow([r["title"],r["description"],r["due_date"],r["priority"],r["status"],r["created_at"],r["updated_at"],r["done_at"],r["id"]])
 
-      # -------------------- Settings --------------------
+    # -------------------- Settings --------------------
     def _open_settings(self):
-        dlg = tk.Toplevel(self)
-        dlg.title("Settings")
-        dlg.geometry("320x160")
-        interval_var = tk.IntVar(
-            value=self.settings.get("outlook_refresh_minutes", 30)
-        )
+        dlg = tk.Toplevel(self); dlg.title("Settings"); dlg.geometry("320x160")
+        interval_var = tk.IntVar(value=self.settings.get("outlook_refresh_minutes",30))
         ttk.Label(dlg, text="Outlook Auto-Refresh Interval (minutes):").pack(pady=10)
-        entry = ttk.Entry(dlg, textvariable=interval_var)
-        entry.pack()
-
+        entry = ttk.Entry(dlg, textvariable=interval_var); entry.pack()
         def save_and_close():
             self.settings["outlook_refresh_minutes"] = interval_var.get()
             save_settings(self.settings)
             messagebox.showinfo("Settings", "Saved. Restart app to apply.", parent=dlg)
             dlg.destroy()
-
         ttk.Button(dlg, text="Save", command=save_and_close).pack(pady=10)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg.transient(self); dlg.grab_set()
 
     # -------------------- Popups --------------------
     def _show_today_popup(self):
         due_today = self.db.fetch_due_today()
         if due_today:
-            messagebox.showinfo(
-                "Today's Tasks",
-                "\n".join(
-                    [
-                        f"{r['title']} (Due: {r['due_date']})"
-                        if r["due_date"]
-                        else r["title"]
-                        for r in due_today
-                    ]
-                ),
-            )
+            messagebox.showinfo("Today's Tasks", "\n".join([f"{r['title']} (Due: {r['due_date']})" if r["due_date"] else r["title"] for r in due_today]))
         else:
             messagebox.showinfo("Today's Tasks", "No tasks due today.")
 
     def _show_overdue_popup(self):
         overdue = self.db.fetch_overdue()
         if overdue:
-            messagebox.showwarning(
-                "Overdue Tasks",
-                "\n".join([f"{r['title']} (Due: {r['due_date']})" for r in overdue]),
-            )
+            messagebox.showwarning("Overdue Tasks", "\n".join([f"{r['title']} (Due: {r['due_date']})" for r in overdue]))
         else:
             messagebox.showinfo("Overdue Tasks", "No overdue tasks.")
 
