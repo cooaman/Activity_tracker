@@ -23,7 +23,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller pywin32 plyer
-          if exist requirements.txt (pip install -r requirements.txt)
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
       - name: Build EXE
         run: pyinstaller --onefile --hidden-import=win32timezone --hidden-import=pywintypes office_activity_simplifier_outlook_full_final.py
