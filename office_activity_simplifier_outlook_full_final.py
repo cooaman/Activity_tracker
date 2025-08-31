@@ -497,10 +497,12 @@ class TaskApp(tk.Tk):
         self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"], "status": new_status}, action="update")
     # Part 3 methods here)
          # -------------------- Outlook Sync --------------------
+        # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
         """
         Import Active Tasks and Flagged Emails from Outlook 'To-Do List'
-        (with debug logging to outlook_debug.log).
+        with debug logging to outlook_debug.log.
+        Only imports tasks that are not complete and emails that are flagged but not completed.
         """
         def log(msg):
             with open("outlook_debug.log", "a", encoding="utf-8") as f:
@@ -513,9 +515,7 @@ class TaskApp(tk.Tk):
         flagged = []
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-            # olFolderToDo = 28
-            todo_folder = outlook.GetDefaultFolder(28)
+            todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo
             items = todo_folder.Items
 
             log("DEBUG: Scanning Outlook 'To-Do List'...")
@@ -541,15 +541,17 @@ class TaskApp(tk.Tk):
                     # MailItem (Class 43)
                     elif cls == 43:
                         if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
-                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                            flagged.append({
-                                "title": f"[Mail] {item.Subject}",
-                                "description": (getattr(item, "Body", "") or "")[:500],
-                                "due_date": due,
-                                "priority": "Medium",
-                                "status": "Pending",
-                                "outlook_id": item.EntryID
-                            })
+                            completed_date = getattr(item, "TaskCompletedDate", None)
+                            if not completed_date:  # only include if NOT completed
+                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                                flagged.append({
+                                    "title": f"[Mail] {item.Subject}",
+                                    "description": (getattr(item, "Body", "") or "")[:500],
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": item.EntryID
+                                })
 
                 except Exception as inner_e:
                     log(f"DEBUG: Item error: {inner_e}")
