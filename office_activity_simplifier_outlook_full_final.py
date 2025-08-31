@@ -51,19 +51,25 @@ class TaskDB:
                 status TEXT DEFAULT 'Pending',
                 created_at TEXT,
                 updated_at TEXT,
-                done_at TEXT
+                done_at TEXT,
+                outlook_id TEXT
             );
             """
         )
+        # Add column if missing
+        try:
+            cur.execute("ALTER TABLE tasks ADD COLUMN outlook_id TEXT;")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
-    def add(self, title, description, due_date, priority, status="Pending"):
+    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
             self.conn.execute(
-                "INSERT INTO tasks(title, description, due_date, priority, status, created_at, updated_at, done_at) VALUES(?,?,?,?,?,?,?,?)",
-                (title, description, due_date, priority, status, now, now, done_at),
+                "INSERT INTO tasks(title, description, due_date, priority, status, created_at, updated_at, done_at, outlook_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (title, description, due_date, priority, status, now, now, done_at, outlook_id),
             )
 
     def update(self, task_id, title, description, due_date, priority, status):
@@ -131,7 +137,7 @@ class TaskDB:
         with self.conn:
             for r in rows:
                 self.conn.execute(
-                    "INSERT INTO tasks(title, description, due_date, priority, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO tasks(title, description, due_date, priority, status, created_at, updated_at, outlook_id) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         r["title"],
                         r.get("description", ""),
@@ -140,6 +146,7 @@ class TaskDB:
                         r.get("status", "Pending"),
                         now,
                         now,
+                        r.get("outlook_id"),
                     ),
                 )
 
@@ -171,8 +178,8 @@ class TaskApp(tk.Tk):
         ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Import CSV (Bulk)", command=self._import_csv).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="Import Outlook Flags", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="Refresh Outlook Flags", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Refresh Outlook Tasks", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=6)
 
         self.notebook = ttk.Notebook(self)
@@ -305,13 +312,13 @@ class TaskApp(tk.Tk):
 
     def _update_task(self):
         sel = self.tree.selection()
-        if not sel:
-            messagebox.showinfo("No selection", "Select a task to update."); return
+        if not sel: return
         task_id = int(self.tree.item(sel[0], "values")[0])
         d = self._validate_form()
         if not d: return
         self.db.update(task_id, d["title"], d["desc"], d["due"], d["priority"], d["status"])
         self._populate(); self._populate_kanban()
+        self._sync_outlook_task(task_id, d, action="update")
 
     def _delete_task(self):
         sel = self.tree.selection()
@@ -319,12 +326,14 @@ class TaskApp(tk.Tk):
         task_id = int(self.tree.item(sel[0], "values")[0])
         if messagebox.askyesno("Confirm","Delete selected task?"):
             self.db.delete(task_id); self._populate(); self._populate_kanban(); self._clear_form()
+            self._sync_outlook_task(task_id, {}, action="delete")
 
     def _mark_done(self):
         sel = self.tree.selection()
         if not sel: return
         task_id = int(self.tree.item(sel[0], "values")[0])
         self.db.mark_done(task_id); self._populate(); self._populate_kanban()
+        self._sync_outlook_task(task_id, {}, action="done")
 
     def _on_select(self,event):
         sel = self.tree.selection()
@@ -388,6 +397,7 @@ class TaskApp(tk.Tk):
         if not r: return
         self.db.update(self.kanban_selected_id, r["title"], new_desc, r["due_date"], r["priority"], r["status"])
         self._populate(); self._populate_kanban()
+        self._sync_outlook_task(self.kanban_selected_id, {"title": r["title"], "desc": new_desc, "due": r["due_date"]}, action="update")
         messagebox.showinfo("Saved","Description updated successfully.")
 
     def _enable_kanban_buttons(self, status):
@@ -405,10 +415,12 @@ class TaskApp(tk.Tk):
     def _delete_selected_kanban(self):
         if not self.kanban_selected_id: return
         self._delete_task_kanban(self.kanban_selected_id)
+        self._sync_outlook_task(self.kanban_selected_id, {}, action="delete")
 
     def _mark_done_selected_kanban(self):
         if not self.kanban_selected_id: return
         self._mark_done_kanban(self.kanban_selected_id)
+        self._sync_outlook_task(self.kanban_selected_id, {}, action="done")
 
     def _move_prev_selected(self):
         if not self.kanban_selected_id: return
@@ -443,6 +455,7 @@ class TaskApp(tk.Tk):
         if not r: return
         self.db.update(task_id, r["title"], r["description"], r["due_date"], r["priority"], new_status)
         self._populate(); self._populate_kanban()
+        self._sync_outlook_task(task_id, {"title": r["title"], "desc": r["description"], "due": r["due_date"]}, action="update")
 
     # -------------------- Outlook --------------------
     def _get_flagged_emails(self):
@@ -450,10 +463,11 @@ class TaskApp(tk.Tk):
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         flagged = []
         try:
-            todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo = 28
+            todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo
             for task in todo_folder.Items:
                 try:
-                    if getattr(task, "FlagStatus", None) == 2 or getattr(task, "IsMarkedAsTask", False):
+                    status = getattr(task, "Status", None)
+                    if status in (0, 1):  # Active tasks only
                         due = task.DueDate.strftime("%Y-%m-%d") if getattr(task, "DueDate", None) else None
                         flagged.append({
                             "title": f"[Outlook] {task.Subject}",
@@ -461,6 +475,7 @@ class TaskApp(tk.Tk):
                             "due_date": due,
                             "priority": "Medium",
                             "status": "Pending",
+                            "outlook_id": task.EntryID
                         })
                 except Exception:
                     continue
@@ -471,9 +486,9 @@ class TaskApp(tk.Tk):
     def _import_outlook_flags(self):
         rows=self._get_flagged_emails()
         if not rows:
-            messagebox.showinfo("Outlook","No flagged emails found or Outlook not available."); return
+            messagebox.showinfo("Outlook","No active tasks found in To-Do List."); return
         self.db.bulk_add(rows); self._populate(); self._populate_kanban()
-        messagebox.showinfo("Outlook", f"Imported {len(rows)} flagged emails as tasks.")
+        messagebox.showinfo("Outlook", f"Imported {len(rows)} active tasks.")
 
     def _refresh_outlook_flags(self): 
         self._import_outlook_flags()
@@ -481,11 +496,32 @@ class TaskApp(tk.Tk):
     def _schedule_outlook_refresh(self, interval_minutes=30):
         ms=interval_minutes*60*1000
         def cb():
-            try: 
-                self._refresh_outlook_flags()
-            finally: 
-                self.after(ms,cb)
+            try: self._refresh_outlook_flags()
+            finally: self.after(ms,cb)
         self.after(ms,cb)
+
+    def _sync_outlook_task(self, task_id, new_data, action="update"):
+        if not HAS_OUTLOOK: return
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone()
+        if not row or not row["outlook_id"]: return
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        try:
+            task = outlook.GetItemFromID(row["outlook_id"])
+            if action == "delete":
+                task.Delete()
+                return
+            if action == "done":
+                task.MarkComplete()
+            else:  # update
+                task.Subject = new_data["title"]
+                task.Body = new_data["desc"]
+                if new_data["due"]:
+                    task.DueDate = datetime.strptime(new_data["due"], "%Y-%m-%d")
+            task.Save()
+        except Exception as e:
+            print("Outlook sync error:", e)
 
     # -------------------- CSV --------------------
     def _import_csv(self):
