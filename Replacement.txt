@@ -1,0 +1,40 @@
+    def _sync_outlook_task(self, task_id, data, action="update"):
+        """
+        Sync only the status (Done / In-Progress) back to Outlook.
+        Do NOT touch subject or body.
+        """
+        if not HAS_OUTLOOK:
+            return
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+            row = cur.fetchone()
+            if not row or not row["outlook_id"]:
+                return
+
+            entryid = row["outlook_id"]
+            try:
+                item = outlook.GetItemFromID(entryid)
+            except:
+                return
+            if not item:
+                return
+
+            # ✅ Only update status flags
+            if action in ["update", "done"]:
+                if data.get("status") == "Done":
+                    if hasattr(item, "MarkComplete"):
+                        item.MarkComplete()
+                    elif hasattr(item, "FlagStatus"):
+                        item.FlagStatus = 1  # olFlagComplete
+                else:
+                    if hasattr(item, "FlagStatus"):
+                        item.FlagStatus = 2  # olFlagMarked (active / in progress)
+                item.Save()
+
+            elif action == "delete":
+                item.Delete()
+
+        except Exception as e:
+            print("Outlook sync error:", e)
