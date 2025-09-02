@@ -56,11 +56,10 @@ class TaskDB:
             'status TEXT DEFAULT "Pending",'
             'created_at TEXT,'
             'updated_at TEXT,'
-            'done_at TEXT,'
-            'outlook_id TEXT,'
-            'progress_log TEXT'
+            'done_at TEXT'
             ');'
         )
+        # Auto-migrate missing columns
         try: cur.execute("ALTER TABLE tasks ADD COLUMN outlook_id TEXT;")
         except sqlite3.OperationalError: pass
         try: cur.execute("ALTER TABLE tasks ADD COLUMN progress_log TEXT;")
@@ -240,15 +239,11 @@ class TaskApp(tk.Tk):
         ttk.Button(btns, text="Delete Selected", command=self._delete_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Clear Form", command=self._clear_form).pack(side=tk.LEFT, padx=6)
 
-        # Kanban board etc continues...
-
-                # -------------------- Kanban Board --------------------
+        # -------------------- Kanban --------------------
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.kanban_tab, text="Kanban Board")
 
-        frame = ttk.Frame(self.kanban_tab)
-        frame.pack(fill=tk.BOTH, expand=True)
-
+        frame = ttk.Frame(self.kanban_tab); frame.pack(fill=tk.BOTH, expand=True)
         self.kanban_lists = {}
         frame.rowconfigure(0, weight=1)
 
@@ -393,75 +388,55 @@ class TaskApp(tk.Tk):
                 if r["priority"]: display += f" | {r['priority']}"
                 idx = lb.size()
                 lb.insert(tk.END, display)
-
-                if r["priority"] == "High":
-                    lb.itemconfig(idx, fg="red")
-                elif r["priority"] == "Medium":
-                    lb.itemconfig(idx, fg="orange")
-                else:
-                    lb.itemconfig(idx, fg="green")
-
+                if r["priority"] == "High": lb.itemconfig(idx, fg="red")
+                elif r["priority"] == "Medium": lb.itemconfig(idx, fg="orange")
+                else: lb.itemconfig(idx, fg="green")
                 if r["due_date"] and r["status"] != "Done":
                     try:
                         if datetime.strptime(r["due_date"], "%Y-%m-%d").date() < date.today():
                             lb.itemconfig(idx, fg="red", font=("TkDefaultFont", 10, "bold"))
                     except: pass
 
-
-                    # Part 3
-                        # -------------------- Kanban Actions --------------------
+    # -------------------- Kanban Methods --------------------
     def _kanban_select(self, event):
-        lb = event.widget
-        idx = lb.curselection()
+        lb = event.widget; idx = lb.curselection()
         if not idx: return
         line = lb.get(idx[0])
         if not line.startswith("[#"): return
         task_id = int(line.split("]")[0][2:])
         self.kanban_selected_id = task_id
         self.kanban_selected_status = lb.status_name
-
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+        cur = self.db.conn.cursor(); cur.execute("SELECT description,progress_log FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone()
-        if not row: return
-
-        # description
-        self.kanban_desc.delete("1.0", tk.END)
-        if row["description"]:
-            self.kanban_desc.insert(tk.END, row["description"])
-
-        # progress
-        self.kanban_progress.delete("1.0", tk.END)
-        if row["progress_log"]:
-            self.kanban_progress.insert(tk.END, row["progress_log"])
-
+        self.kanban_desc.delete("1.0", tk.END); self.kanban_progress.delete("1.0", tk.END)
+        if row:
+            if row[0]: self.kanban_desc.insert(tk.END, row[0])
+            if row[1]: self.kanban_progress.insert(tk.END, row[1])
         self._enable_kanban_buttons(lb.status_name)
 
     def _save_kanban_desc(self):
         if not self.kanban_selected_id: return
         new_desc = self.kanban_desc.get("1.0", tk.END).strip()
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
+        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
         r = cur.fetchone()
         if not r: return
         self.db.update(self.kanban_selected_id, r["title"], new_desc, r["due_date"], r["priority"], r["status"])
         self._populate(); self._populate_kanban()
+        self._sync_outlook_task(self.kanban_selected_id, {"status": r["status"]}, action="update")
 
     def _update_progress(self):
         if not self.kanban_selected_id: return
-        new_entry = self.kanban_progress.get("1.0", tk.END).strip()
-        if not new_entry: return
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
-        r = cur.fetchone()
-        old_log = r["progress_log"] if r and r["progress_log"] else ""
-        today = date.today().isoformat()
-        new_line = f"[{today}] {new_entry}\n"
-        updated = new_line + old_log  # prepend
+        new_progress = self.kanban_progress.get("1.0", tk.END).strip()
+        if not new_progress: return
+        cur = self.db.conn.cursor(); cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
+        row = cur.fetchone()
+        existing = row[0] if row and row[0] else ""
+        now = date.today().isoformat()
+        new_entry = f"[{now}] {new_progress}\n"
+        updated_log = new_entry + existing
         with self.db.conn:
-            self.db.conn.execute("UPDATE tasks SET progress_log=? WHERE id=?", (updated, self.kanban_selected_id))
-        self._populate(); self._populate_kanban()
-        self.kanban_progress.delete("1.0", tk.END); self.kanban_progress.insert(tk.END, updated)
+            self.db.conn.execute("UPDATE tasks SET progress_log=?, updated_at=? WHERE id=?", (updated_log, _now_iso(), self.kanban_selected_id))
+        self.kanban_progress.delete("1.0", tk.END); self.kanban_progress.insert(tk.END, updated_log)
 
     def _enable_kanban_buttons(self, status):
         self.btn_edit.config(state="normal")
@@ -473,8 +448,7 @@ class TaskApp(tk.Tk):
 
     def _edit_selected_kanban(self):
         if not self.kanban_selected_id: return
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
+        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
         r = cur.fetchone()
         if r:
             self.title_var.set(r["title"])
@@ -486,10 +460,9 @@ class TaskApp(tk.Tk):
 
     def _delete_selected_kanban(self):
         if not self.kanban_selected_id: return
-        if messagebox.askyesno("Confirm","Delete selected task?"):
-            self.db.delete(self.kanban_selected_id)
-            self._populate(); self._populate_kanban()
-            self._sync_outlook_task(self.kanban_selected_id, {}, action="delete")
+        self.db.delete(self.kanban_selected_id)
+        self._populate(); self._populate_kanban()
+        self._sync_outlook_task(self.kanban_selected_id, {}, action="delete")
 
     def _mark_done_selected_kanban(self):
         if not self.kanban_selected_id: return
@@ -509,7 +482,6 @@ class TaskApp(tk.Tk):
         if idx_status < len(STATUSES)-1:
             self._move_task(self.kanban_selected_id, STATUSES[idx_status+1])
 
-    # -------------------- Kanban Drag & Drop --------------------
     def _on_drag_start(self, event):
         lb = event.widget
         idx = lb.nearest(event.y)
@@ -518,8 +490,7 @@ class TaskApp(tk.Tk):
             self.drag_data["source"] = lb
 
     def _on_drag_stop(self, event):
-        if not self.drag_data["task"]:
-            return
+        if not self.drag_data["task"]: return
         target_lb = event.widget
         if isinstance(target_lb, tk.Listbox) and target_lb != self.drag_data["source"]:
             line = self.drag_data["task"]
@@ -529,8 +500,7 @@ class TaskApp(tk.Tk):
         self.drag_data = {"task": None, "source": None}
 
     def _move_task(self, task_id, new_status):
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
         r = cur.fetchone()
         if not r: return
         self.db.update(task_id, r["title"], r["description"], r["due_date"], r["priority"], new_status)
@@ -547,155 +517,116 @@ class TaskApp(tk.Tk):
             items = todo_folder.Items
             for item in items:
                 try:
-                    cls = getattr(item, "Class", 0)
-                    if cls == 48:  # TaskItem
+                    cls = getattr(item,"Class",0)
+                    if cls == 48: # TaskItem
                         if not item.Complete:
-                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                            flagged.append({
-                                "title": f"[Task] {item.Subject}",
-                                "description": (getattr(item, "Body", "") or "")[:500],
-                                "due_date": due,
-                                "priority": "Medium",
-                                "status": "Pending",
-                                "outlook_id": item.EntryID
-                            })
-                    elif cls == 43:  # MailItem
-                        if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
-                            if getattr(item, "IsMarkedAsTask", False) and not getattr(item, "IsTaskCompleted", False):
-                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                                flagged.append({
-                                    "title": f"[Mail] {item.Subject}",
-                                    "description": (getattr(item, "Body", "") or "")[:500],
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": item.EntryID
-                                })
-                except Exception: pass
-        except Exception as e:
-            print("Outlook fetch error:", e)
+                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
+                            flagged.append({"title": f"[Task] {item.Subject}","description": (getattr(item,"Body","") or "")[:500],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
+                    elif cls == 43: # MailItem
+                        if getattr(item,"FlagStatus",0) == 2:
+                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
+                            flagged.append({"title": f"[Mail] {item.Subject}","description": (getattr(item,"Body","") or "")[:500],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
+                except Exception as inner_e: pass
+        except Exception as e: print("Outlook fetch error:", e)
         return flagged
 
     def _import_outlook_flags(self):
         flagged = self._get_flagged_emails()
         if not flagged:
-            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
-            return
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT outlook_id FROM tasks WHERE outlook_id IS NOT NULL")
-        existing = {r["outlook_id"] for r in cur.fetchall()}
-        new = [f for f in flagged if f["outlook_id"] not in existing]
-        if new:
-            self.db.bulk_add(new)
-            self._populate(); self._populate_kanban()
-            messagebox.showinfo("Outlook", f"Imported {len(new)} tasks.")
+            messagebox.showinfo("Outlook", "No active tasks or flagged emails found."); return
+        cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks"); existing=[r[0] for r in cur.fetchall() if r[0]]
+        new_items=[f for f in flagged if f["outlook_id"] not in existing]
+        if new_items:
+            self.db.bulk_add(new_items); self._populate(); self._populate_kanban()
+            messagebox.showinfo("Outlook", f"Imported {len(new_items)} tasks (skipped duplicates).")
         else:
-            messagebox.showinfo("Outlook", "No new tasks to import.")
+            messagebox.showinfo("Outlook","No new tasks to import.")
 
-    def _refresh_outlook_flags(self):
-        self._import_outlook_flags()
+    def _refresh_outlook_flags(self): self._import_outlook_flags()
 
-    def _schedule_outlook_refresh(self, minutes):
-        self.after(minutes*60*1000, self._refresh_outlook_flags)
+    def _schedule_outlook_refresh(self, minutes): self.after(minutes*60*1000, self._refresh_outlook_flags)
 
     def _sync_outlook_task(self, task_id, data, action="update"):
         if not HAS_OUTLOOK: return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+            cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
             row = cur.fetchone()
             if not row or not row["outlook_id"]: return
-            entryid = row["outlook_id"]
-            try: item = outlook.GetItemFromID(entryid)
+            entryid=row["outlook_id"]
+            try: item=outlook.GetItemFromID(entryid)
             except: return
             if not item: return
-
-            if action in ["update", "done"]:
-                if data.get("status") == "Done":
+            if action in ["update","done"]:
+                if data.get("status")=="Done":
                     if hasattr(item,"MarkComplete"): item.MarkComplete()
-                    elif hasattr(item,"FlagStatus"): item.FlagStatus = 1
+                    elif hasattr(item,"FlagStatus"): item.FlagStatus=1
                 else:
-                    if hasattr(item,"FlagStatus"): item.FlagStatus = 2
+                    if hasattr(item,"FlagStatus"): item.FlagStatus=2
                 item.Save()
-            elif action=="delete":
-                item.Delete()
-        except Exception as e:
-            print("Outlook sync error:", e)
+            elif action=="delete": item.Delete()
+        except Exception as e: print("Outlook sync error:", e)
 
     # -------------------- CSV --------------------
     def _import_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv")])
         if not path: return
-        rows = []
+        rows=[]
         with open(path,newline="",encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+            reader=csv.DictReader(f)
             for r in reader:
-                row = {k.strip().lower(): (v.strip() if v else "") for k,v in r.items()}
+                row={k.strip().lower(): (v.strip() if v else "") for k,v in r.items()}
                 if not row.get("title"): continue
-                rows.append({
-                    "title": row.get("title","Untitled Task"),
-                    "description": row.get("description",""),
-                    "due_date": row.get("due_date") or None,
-                    "priority": row.get("priority","Medium"),
-                    "status": row.get("status","Pending")
-                })
+                rows.append({"title": row.get("title","Untitled Task"),"description": row.get("description",""),"due_date": row.get("due_date") or None,"priority": row.get("priority","Medium"),"status": row.get("status","Pending")})
         if rows:
-            self.db.bulk_add(rows)
-            self._populate(); self._populate_kanban()
+            self.db.bulk_add(rows); self._populate(); self._populate_kanban()
             messagebox.showinfo("CSV Import", f"Imported {len(rows)} tasks.")
-        else:
-            messagebox.showwarning("CSV Import","No valid tasks found.")
+        else: messagebox.showwarning("CSV Import","No valid tasks found.")
 
     def _export_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
         if not path: return
-        rows = self.db.fetch()
+        rows=self.db.fetch()
         with open(path,"w",newline="",encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["title","description","due_date","priority","status","progress_log"])
-            for r in rows:
-                writer.writerow([r["title"], r["description"], r["due_date"], r["priority"], r["status"], r["progress_log"] or ""])
+            writer=csv.writer(f); writer.writerow(["title","description","due_date","priority","status"])
+            for r in rows: writer.writerow([r["title"],r["description"],r["due_date"],r["priority"],r["status"]])
         messagebox.showinfo("CSV Export", f"Exported {len(rows)} tasks.")
 
     # -------------------- Settings --------------------
     def _open_settings(self):
-        win = tk.Toplevel(self); win.title("Settings")
+        win=tk.Toplevel(self); win.title("Settings")
         tk.Label(win,text="Outlook Refresh Minutes").grid(row=0,column=0,sticky="w")
-        refresh_var = tk.IntVar(value=self.settings.get("outlook_refresh_minutes",30))
+        refresh_var=tk.IntVar(value=self.settings.get("outlook_refresh_minutes",30))
         tk.Entry(win,textvariable=refresh_var).grid(row=0,column=1)
-        show_desc_var = tk.BooleanVar(value=self.settings.get("show_description",False))
+        show_desc_var=tk.BooleanVar(value=self.settings.get("show_description",False))
         tk.Checkbutton(win,text="Show Description in Task List",variable=show_desc_var).grid(row=1,column=0,columnspan=2,sticky="w")
-
         def save_and_close():
             self.settings["outlook_refresh_minutes"]=refresh_var.get()
             self.settings["show_description"]=show_desc_var.get()
             save_settings(self.settings)
-            messagebox.showinfo("Settings","Saved. Restart app to apply fully.")
-            win.destroy()
+            messagebox.showinfo("Settings","Saved. Restart app to apply fully."); win.destroy()
         ttk.Button(win,text="Save",command=save_and_close).grid(row=2,column=0,columnspan=2,pady=6)
 
     # -------------------- Reminders --------------------
     def _check_reminders(self):
-        due_today = self.db.fetch_due_today()
-        if due_today and HAS_NOTIFY:
-            notification.notify(title="Tasks Due Today", message=f"{len(due_today)} tasks due today", timeout=5)
+        due_today=self.db.fetch_due_today()
+        if due_today and HAS_NOTIFY: notification.notify(title="Tasks Due Today", message=f"{len(due_today)} tasks due today", timeout=5)
         self.after(3600*1000, self._check_reminders)
 
     # -------------------- Popups --------------------
     def _show_overdue_popup(self):
-        rows = self.db.fetch_overdue()
-        msg = "\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No overdue tasks."
+        rows=self.db.fetch_overdue()
+        msg="\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No overdue tasks."
         messagebox.showinfo("Overdue Tasks", msg)
 
     def _show_today_popup(self):
-        rows = self.db.fetch_due_today()
-        msg = "\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No tasks due today."
+        rows=self.db.fetch_due_today()
+        msg="\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No tasks due today."
         messagebox.showinfo("Today's Tasks", msg)
 
 # -------------------- Main --------------------
 def main():
-    app = TaskApp()
+    app=TaskApp()
     app.mainloop()
 
 if __name__=="__main__":
