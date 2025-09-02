@@ -536,9 +536,8 @@ class TaskApp(tk.Tk):
             # --- Tasks from To-Do List ---
             try:
                 todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
-                items = todo_folder.Items
-                for item in items:
-                    if getattr(item, "Class", 0) == 48 and not item.Complete:
+                for item in todo_folder.Items:
+                    if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
                         due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         flagged.append({
                             "title": f"[Task] {item.Subject}",
@@ -551,12 +550,21 @@ class TaskApp(tk.Tk):
             except Exception as e:
                 print("To-Do List fetch error:", e)
 
-            # --- Inbox + all subfolders ---
+            # --- Inbox + all subfolders (recursive flagged mails) ---
             try:
                 inbox = outlook.GetDefaultFolder(6)  # Inbox
                 self._get_flagged_from_folder(inbox, flagged)
             except Exception as e:
                 print("Inbox flagged mail fetch error:", e)
+
+            # --- For Follow Up Search Folder ---
+            try:
+                search_root = outlook.GetDefaultFolder(23)  # Search Folders
+                for folder in search_root.Folders:
+                    if folder.Name.lower() == "for follow up":
+                        self._get_flagged_from_folder(folder, flagged)
+            except Exception as e:
+                print("Search folder fetch error:", e)
 
         except Exception as e:
             print("Outlook fetch error:", e)
