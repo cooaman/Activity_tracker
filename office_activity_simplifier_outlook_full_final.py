@@ -424,27 +424,28 @@ class TaskApp(tk.Tk):
         self._sync_outlook_task(self.kanban_selected_id, {"title": r["title"], "desc": new_desc, "due": r["due_date"], "status": r["status"]}, action="update")
 
     def _update_progress(self):
-        if not self.kanban_selected_id:
-            messagebox.showinfo("No Task", "Select a task in Kanban first."); return
-        new_entry = self.kanban_progress.get("1.0", tk.END).strip()
-        if not new_entry:
-            messagebox.showinfo("Empty", "Write some progress update before saving."); return
+    if not self.kanban_selected_id:
+        messagebox.showinfo("No Task", "Select a task in Kanban first."); return
+    new_entry = self.kanban_progress.get("1.0", tk.END).strip()
+    if not new_entry:
+        messagebox.showinfo("Empty", "Write some progress update before saving."); return
 
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
-        row = cur.fetchone()
-        old_log = row["progress_log"] if row and row["progress_log"] else ""
+    cur = self.db.conn.cursor()
+    cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
+    row = cur.fetchone()
+    old_log = row["progress_log"] if row and row["progress_log"] else ""
 
-        today = date.today().isoformat()
-        updated_log = old_log + f"\n[{today}] {new_entry}" if old_log else f"[{today}] {new_entry}"
+    today = date.today().isoformat()
+    # ✅ Prepend instead of append
+    updated_log = f"[{today}] {new_entry}" + ("\n" + old_log if old_log else "")
 
-        with self.db.conn:
-            self.db.conn.execute("UPDATE tasks SET progress_log=? WHERE id=?", (updated_log, self.kanban_selected_id))
+    with self.db.conn:
+        self.db.conn.execute("UPDATE tasks SET progress_log=? WHERE id=?", (updated_log, self.kanban_selected_id))
 
-        self.kanban_progress.delete("1.0", tk.END)
-        self.kanban_progress.insert(tk.END, updated_log)
+    self.kanban_progress.delete("1.0", tk.END)
+    self.kanban_progress.insert(tk.END, updated_log)
 
-        messagebox.showinfo("Progress Saved", "Task progress updated successfully.")
+    messagebox.showinfo("Progress Saved", "Task progress updated successfully.")
 
     def _enable_kanban_buttons(self, status):
         self.btn_edit.config(state="normal")
@@ -583,30 +584,46 @@ class TaskApp(tk.Tk):
     def _schedule_outlook_refresh(self, minutes):
         self.after(minutes*60*1000, self._refresh_outlook_flags)
 
-    def _sync_outlook_task(self, task_id, data, action="update"):
-        if not HAS_OUTLOOK: return
+        def _sync_outlook_task(self, task_id, data, action="update"):
+        """
+        Sync only the status (Done / In-Progress) back to Outlook.
+        Do NOT touch subject or body.
+        """
+        if not HAS_OUTLOOK:
+            return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
             row = cur.fetchone()
-            if not row or not row["outlook_id"]: return
+            if not row or not row["outlook_id"]:
+                return
+
             entryid = row["outlook_id"]
-            try: item = outlook.GetItemFromID(entryid)
-            except: return
-            if not item: return
-            if action=="update":
-                if hasattr(item,"Subject"): item.Subject = data.get("title", item.Subject)
-                if hasattr(item,"Body"): item.Body = data.get("desc", item.Body)
-                if data.get("due"):
-                    try: item.DueDate = datetime.strptime(data["due"], "%Y-%m-%d")
-                    except: pass
+            try:
+                item = outlook.GetItemFromID(entryid)
+            except:
+                return
+            if not item:
+                return
+
+            # ✅ Only update status flags
+            if action in ["update", "done"]:
+                if data.get("status") == "Done":
+                    if hasattr(item, "MarkComplete"):
+                        item.MarkComplete()
+                    elif hasattr(item, "FlagStatus"):
+                        item.FlagStatus = 1  # olFlagComplete
+                else:
+                    if hasattr(item, "FlagStatus"):
+                        item.FlagStatus = 2  # olFlagMarked (active / in progress)
                 item.Save()
-            elif action=="delete": item.Delete()
-            elif action=="done":
-                if hasattr(item,"MarkComplete"): item.MarkComplete()
-                elif hasattr(item,"FlagStatus"): item.FlagStatus = 1
-                item.Save()
-        except Exception as e: print("Outlook sync error:", e)
+
+            elif action == "delete":
+                item.Delete()
+
+        except Exception as e:
+            print("Outlook sync error:", e)
 
     # -------------------- CSV --------------------
     def _import_csv(self):
