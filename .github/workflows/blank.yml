@@ -22,11 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if exist requirements.txt (
-            pip install -r requirements.txt
-          ) else (
-            echo "No requirements.txt found, skipping..."
-          )
+          if (Test-Path requirements.txt) { pip install -r requirements.txt } else { echo "No requirements.txt found, skipping..." }
 
       - name: Build EXE with PyInstaller
         run: |
