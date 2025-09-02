@@ -1,6 +1,9 @@
 name: Build EXE
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -16,22 +19,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Build EXE
         run: |
-          pyinstaller --noconfirm --clean `
-            --onefile `
-            --windowed `
-            --name OfficeActivitySimplifier `
-            office_activity_simplifier_outlook_full_final.py
+          python -m pip install --upgrade pip
+          if exist requirements.txt (
+            pip install -r requirements.txt
+          ) else (
+            echo "No requirements.txt found, skipping..."
+          )
 
-      - name: Upload EXE artifact
+      - name: Build EXE with PyInstaller
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --noconsole office_activity_simplifier_outlook_full_final.py
+
+      - name: Upload EXE Artifact
         uses: actions/upload-artifact@v4
         with:
           name: OfficeActivitySimplifier
-          path: dist/OfficeActivitySimplifier.exe
+          path: dist/office_activity_simplifier_outlook_full_final.exe
