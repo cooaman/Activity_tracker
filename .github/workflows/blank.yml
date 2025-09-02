@@ -29,10 +29,10 @@ jobs:
 
     - name: Build EXE (No Console)
       run: |
-        pyinstaller --onefile --noconsole ^
-          --hidden-import=win32timezone ^
-          --hidden-import=pywintypes ^
-          --name OfficeActivitySimplifier ^
+        pyinstaller --onefile --noconsole `
+          --hidden-import=win32timezone `
+          --hidden-import=pywintypes `
+          --name OfficeActivitySimplifier `
           office_activity_simplifier_outlook_full_final.py
 
     - name: Upload EXE artifact
