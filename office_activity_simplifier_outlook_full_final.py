@@ -278,7 +278,7 @@ class TaskApp(tk.Tk):
             col.grid(row=0, column=idx, sticky="nsew", padx=6)
             frame.columnconfigure(idx, weight=2)
             ttk.Label(col, text=status, font=("", 12, "bold")).pack()
-            lb = tk.Listbox(col, height=30, width=55)
+            lb = tk.Listbox(col, height=40, width=55, selectmode=tk.EXTENDED)
             lb.pack(fill=tk.BOTH, expand=True)
             lb.status_name = status
             lb.bind("<<ListboxSelect>>", self._kanban_select)
@@ -345,11 +345,20 @@ class TaskApp(tk.Tk):
 
     def _delete_task(self):
         sel = self.tree.selection()
-        if not sel: return
-        task_id = int(self.tree.item(sel[0], "values")[0])
-        self.db.delete(task_id)
-        self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {}, action="delete")
+        if not sel:
+            return
+
+        confirm = messagebox.askyesno("Confirm Delete", f"Delete {len(sel)} selected task(s)?")
+        if not confirm:
+            return
+
+        for s in sel:
+            task_id = int(self.tree.item(s, "values")[0])
+            self.db.delete(task_id)
+            self._sync_outlook_task(task_id, {}, action="delete")
+
+        self._populate()
+        self._populate_kanban()
 
     def _mark_done(self):
         sel = self.tree.selection()
@@ -457,10 +466,23 @@ class TaskApp(tk.Tk):
             self.notebook.select(0)
 
     def _delete_selected_kanban(self):
-        if not self.kanban_selected_id: return
-        self.db.delete(self.kanban_selected_id)
-        self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {}, action="delete")
+        for status, lb in self.kanban_lists.items():
+            sel = lb.curselection()
+            if not sel:
+                continue
+
+            confirm = messagebox.askyesno("Confirm Delete", f"Delete {len(sel)} selected task(s)?")
+            if not confirm:
+                return
+
+            for idx in sel:
+                line = lb.get(idx)
+                task_id = int(line.split("]")[0][1:])
+                self.db.delete(task_id)
+                self._sync_outlook_task(task_id, {}, action="delete")
+
+        self._populate()
+        self._populate_kanban()
 
     def _mark_done_selected_kanban(self):
         if not self.kanban_selected_id: return
@@ -487,15 +509,25 @@ class TaskApp(tk.Tk):
         self._sync_outlook_task(task_id, {"status": new_status}, action="update")
 
     def _update_progress(self):
-        if not self.kanban_selected_id: return
+        if not self.kanban_selected_id:
+            return
         new_line = self.kanban_progress.get("1.0", tk.END).strip()
-        if not new_line: return
+        if not new_line:
+            return
         now = date.today().isoformat()
         entry = f"[{now}] {new_line}\n"
-        cur = self.db.conn.cursor(); cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
+
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
         old = cur.fetchone()[0] or ""
+
+        # prepend latest entry
         new_log = entry + old
         self.db.update_progress(self.kanban_selected_id, new_log)
+
+        # refresh panel
+        self.kanban_progress.delete("1.0", tk.END)
+        self.kanban_progress.insert(tk.END, new_log)
         self._populate_kanban()
 
 
@@ -540,7 +572,7 @@ class TaskApp(tk.Tk):
                     if getattr(item, "Class", 0) == 43 and getattr(item,"FlagStatus",0) == 2: 
                         due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         flagged.append({
-                            "title": f"[Task] {item.Subject}",
+                            "title": f"[OUTLOOK_MAIL] {item.Subject}",
                             "description": item.Body or "",
                             "due_date": due,
                             "priority": "Medium",
