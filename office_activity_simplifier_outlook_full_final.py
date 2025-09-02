@@ -493,57 +493,57 @@ class TaskApp(tk.Tk):
         self._populate_kanban()
 
     # -------------------- Outlook --------------------
-        def _get_flagged_emails(self):
-            if not HAS_OUTLOOK:
-                return []
-            flagged = []
+    def _get_flagged_emails(self):
+        if not HAS_OUTLOOK:
+            return []
+        flagged = []
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+            # --- 1. Tasks from To-Do List ---
             try:
-                outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-                # --- 1. Tasks from To-Do List ---
-                try:
-                    todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
-                    for item in todo_folder.Items:
-                        try:
-                            if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
-                                due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                                flagged.append({
-                                    "title": f"[Task] {item.Subject}",
-                                    "description": item.Body or "",
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": item.EntryID
-                                })
-                        except Exception:
-                            continue
-                except Exception as e:
-                    print("To-Do List fetch error:", e)
-
-                # --- 2. Flagged Emails from Inbox ---
-                try:
-                    inbox = outlook.GetDefaultFolder(6)  # Inbox
-                    for item in inbox.Items:
-                        try:
-                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:  # MailItem flagged
-                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                                desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
-                                flagged.append({
-                                    "title": f"[Mail] {item.Subject}",
-                                    "description": desc,
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": item.EntryID
-                                })
-                        except Exception:
-                            continue
-                except Exception as e:
-                    print("Inbox flagged mail fetch error:", e)
-
+                todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+                for item in todo_folder.Items:
+                    try:
+                        if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
+                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
+                            flagged.append({
+                                "title": f"[Task] {item.Subject}",
+                                "description": item.Body or "",
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+                    except Exception:
+                        continue
             except Exception as e:
-                print("Outlook fetch error:", e)
-            return flagged
+                print("To-Do List fetch error:", e)
+
+            # --- 2. Flagged Emails from Inbox ---
+            try:
+                inbox = outlook.GetDefaultFolder(6)  # Inbox
+                for item in inbox.Items:
+                    try:
+                        if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:  # MailItem flagged
+                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                            desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+                            flagged.append({
+                                "title": f"[Mail] {item.Subject}",
+                                "description": desc,
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+                    except Exception:
+                        continue
+            except Exception as e:
+                print("Inbox flagged mail fetch error:", e)
+
+        except Exception as e:
+            print("Outlook fetch error:", e)
+        return flagged
     
 
     def _import_outlook_flags(self):
