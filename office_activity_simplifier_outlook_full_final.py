@@ -538,45 +538,29 @@ class TaskApp(tk.Tk):
                 todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
                 items = todo_folder.Items
                 for item in items:
-                    try:
-                        if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
-                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                            flagged.append({
-                                "title": f"[Task] {item.Subject}",
-                                "description": item.Body or "",
-                                "due_date": due,
-                                "priority": "Medium",
-                                "status": "Pending",
-                                "outlook_id": item.EntryID
-                            })
-                    except Exception:
-                        continue
-            except Exception as e:
-                print("To-Do List fetch error:", e)
-
-            # --- Flagged Emails from Inbox only (not all subfolders) ---
-            try:
-                inbox = outlook.GetDefaultFolder(6)  # Inbox
-                items = inbox.Items
-                items.Sort("[ReceivedTime]", True)
-                flagged_items = items.Restrict("[FlagStatus] = 2")
-                for item in flagged_items:
-                    if getattr(item, "Class", 0) == 43:  # MailItem
-                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                        desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+                    if getattr(item, "Class", 0) == 48 and not item.Complete:
+                        due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         flagged.append({
-                            "title": f"[Mail] {item.Subject}",
-                            "description": desc,
+                            "title": f"[Task] {item.Subject}",
+                            "description": item.Body or "",
                             "due_date": due,
                             "priority": "Medium",
                             "status": "Pending",
                             "outlook_id": item.EntryID
                         })
             except Exception as e:
+                print("To-Do List fetch error:", e)
+
+            # --- Inbox + all subfolders ---
+            try:
+                inbox = outlook.GetDefaultFolder(6)  # Inbox
+                self._get_flagged_from_folder(inbox, flagged)
+            except Exception as e:
                 print("Inbox flagged mail fetch error:", e)
 
         except Exception as e:
             print("Outlook fetch error:", e)
+
         return flagged
     
 
