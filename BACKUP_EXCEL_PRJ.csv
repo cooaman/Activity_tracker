@@ -1,0 +1,32 @@
+title,description,due_date,priority,status
+UPDATE BCCM MPP PLANNING,,2025-09-04,Medium,Pending
+Work Completion,"FETE069 - 8/8/2025 Requested
+FETE079 - 8/8/2025 Received
+FETE080
+FETE088 - 8/25/2025 Received
+FETE091
+FETE082 - 8/8/2025 Received
+FETE083 - 8/25/2025 Received
+FETE085 - 8/8/2025 Received",2025-09-30,Low,In-Progress
+"Limit and Master Sample for Coverglass , required for PPAP",RE: Re: BCCM TFT CC22/24_Cover Lens _Serial Development_ SPINKS,2025-10-05,Low,Pending
+SDRAM IC PCN,Template data pending from Davide  ;AmandeeP_6/2/2025 : Go Ahead Received ;6/12/2025 : Go ahead for High Temp Endurance ; 8/4/2025 : Budget is requested,,Medium,Pending
+Contrast and Luminance plot at EOL,As there is addition of ALCf in Backlight of TFT. Contrast and luminance plot will change and we need to take care these things at EOL also. Min and Max Optics Samples,,Medium,In-Progress
+Plaques submission to STLA,,,Medium,In-Progress
+PCN/PTN Validation Approval,Report to be sent,,Low,Pending
+BCCM LCD PTN,BCCM | LCD PTN Verfificaiton,,Low,Pending
+STH to PTH Implementation timeplan,Signed TA to be shared ; 8/18/2025 : PN to be created by Manish,,High,Pending
+CRs to be moved in JIRA for the current progress,afety Tool IDs Pending,,High,Pending
+TFT PCN for Manufacture plant,PCN Notification ID : 2025_0000002354       6/13/2025 : OPLs shared back,,High,Pending
+PCN | 520966230816  | Flash Memory IC Impact,8/13/2025 : Reminder sent for club with 520966200726,,High,Pending
+Need CAN periodicity alignment from STLA,Need CAN periodicity alignment from STLA,,High,Pending
+AAR Improvement sample for Optics,8/19/2025 1900002714 : PR Raisd  | mail Subject : RE: Customer Query for TFT Visible on WS at Night,,High,Pending
+E20 | ISC to be performed for Industrialization,ISC to be performed,,High,Pending
+RE: BCCM | PCN/PTN info LED,"/19/2025 : Red LED is Ok , Orange LED feedback is pending from hardware . PWM Supportability to be verified",,High,Pending
+RPT Correction to be done,RPT Correction to be done,,High,Pending
+VO Proposal - IMMO & RKE Circuit Removal from BCCM PEPS Variant,Discussion needed  with STLA,,High,Pending
+Language translation for FETE093,PR Created : 1900002581,,High,Done
+IMDS = Child Part submission for Acrylic,IMDS = Child Part submission for Acrylic,,High,Pending
+ISC realignment and align on Confluence,ISC realignment and align on Confluence,,High,Pending
+PR PO for Renesas flasher PCB,PR Raised : 1900002571,,High,Pending
+FETE092 SBR Sound pattern Effort estimation,8/25/2025 : Email sent,,High,Done
+Maintenance commessa hours clean up,done ji done,,,Done
