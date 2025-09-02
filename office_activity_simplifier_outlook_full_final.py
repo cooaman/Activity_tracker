@@ -302,20 +302,25 @@ class TaskApp(tk.Tk):
         frame.columnconfigure(len(STATUSES), weight=1)
 
         ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
-        self.kanban_html = None
-        self.kanban_text = None
 
         if HAS_HTML:
+            # HTML for Outlook tasks (hidden by default until selected)
             self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15)
+            # Text for manual/CSV tasks (hidden by default until selected)
             self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
         else:
-            self.kanban_html = tk.Text(desc_frame, wrap="word", height=15, width=50)
-            self.kanban_text = self.kanban_html  # fallback to Text widget              
+            # No HTML support → always fallback to Text
+            self.kanban_html = None
+            self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
 
-        # Always have a Text widget for manual tasks
-        self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
-        self.kanban_text.pack(fill=tk.BOTH, expand=True)
+        # Don’t pack yet — pack() will be decided in _kanban_select()
         ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=5)
+
+        # --- Progress Log Section ---
+        ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
+        self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
+        self.kanban_progress.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(desc_frame, text="Update Progress", command=self._update_progress).pack(pady=5)
 
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
         self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
@@ -461,7 +466,7 @@ class TaskApp(tk.Tk):
         if outlook_id and HAS_HTML:
             clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
             if os.name == "nt":  # reduce font size on Windows
-                clean = f"<div style='font-size:10pt'>{clean}</div>"
+                clean = f"<div style='font-size:8pt'>{clean}</div>"
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
             self.kanban_html.pack(fill=tk.BOTH, expand=True)
