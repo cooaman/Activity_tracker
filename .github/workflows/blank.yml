@@ -28,10 +28,15 @@ jobs:
         pip install pyinstaller pywin32 plyer
 
     - name: Build EXE (No Console)
-      run: pyinstaller --onefile --noconsole --hidden-import=win32timezone --hidden-import=pywintypes office_activity_simplifier_outlook_full_final.py
+      run: |
+        pyinstaller --onefile --noconsole ^
+          --hidden-import=win32timezone ^
+          --hidden-import=pywintypes ^
+          --name OfficeActivitySimplifier ^
+          office_activity_simplifier_outlook_full_final.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
       with:
         name: OfficeActivitySimplifier
-        path: dist/office_activity_simplifier_outlook_full_final.exe
+        path: dist/OfficeActivitySimplifier.exe
