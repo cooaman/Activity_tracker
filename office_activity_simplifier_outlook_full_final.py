@@ -187,6 +187,17 @@ class TaskApp(tk.Tk):
 
         self._check_reminders()
 
+
+    def _treeview_sort_column(self, col, reverse):
+        l = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        try:
+            l.sort(key=lambda t: datetime.strptime(t[0], "%Y-%m-%d"), reverse=reverse)
+        except:
+            l.sort(reverse=reverse)
+        for index, (val, k) in enumerate(l):
+            self.tree.move(k, "", index)
+        self.tree.heading(col, command=lambda: self._treeview_sort_column(col, not reverse))
+        
     # -------------------- UI --------------------
     def _build_ui(self):
         toolbar = ttk.Frame(self, padding=8)
@@ -217,7 +228,8 @@ class TaskApp(tk.Tk):
         self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         for col in cols:
-            self.tree.heading(col, text=col.title())
+            self.tree.heading(col, text=col.title(),
+                      command=lambda _col=col: self._treeview_sort_column(_col, False))
 
         # Apply widths
         if self.settings.get("show_description", False):
