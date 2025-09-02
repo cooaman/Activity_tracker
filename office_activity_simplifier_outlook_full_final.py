@@ -302,12 +302,19 @@ class TaskApp(tk.Tk):
         frame.columnconfigure(len(STATUSES), weight=1)
 
         ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
+        self.kanban_html = None
+        self.kanban_text = None
+
         if HAS_HTML:
             self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True)
+            self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
         else:
             self.kanban_html = tk.Text(desc_frame, wrap="word", height=15, width=50)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True)
+            self.kanban_text = self.kanban_html  # fallback to Text widget              
+
+        # Always have a Text widget for manual tasks
+        self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
+        self.kanban_text.pack(fill=tk.BOTH, expand=True)
         ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=5)
 
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
@@ -450,35 +457,22 @@ class TaskApp(tk.Tk):
         prog = row["progress_log"] or ""
         outlook_id = row["outlook_id"]
 
-        # Reset description display
-        if outlook_id:
-            # Outlook imported task → read-only with HTML preview
-            if HAS_HTML:
-                clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-                # Reduce font size if Windows
-                if os.name == "nt":
-                    self.kanban_html.set_html(f"<div style='font-size:10pt'>{clean}</div>")
-                else:
-                    self.kanban_html.set_html(clean)
-                try:
-                    self.kanban_html.config(state="disabled")
-                except:
-                    pass
-            else:
-                self.kanban_html.delete("1.0", tk.END)
-                self.kanban_html.insert(tk.END, desc)
-                self.kanban_html.config(state="disabled")
-        else:
-            # Manual / CSV-imported task → editable
-            if HAS_HTML:
-                # Replace HTMLLabel with editable Text for manual tasks
-                self.kanban_html.destroy()
-                self.kanban_html = tk.Text(self.kanban_html.master, wrap="word", height=15, width=50)
-                self.kanban_html.pack(fill=tk.BOTH, expand=True)
+        # Outlook imported task → show HTML preview (read-only)
+        if outlook_id and HAS_HTML:
+            clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+            if os.name == "nt":  # reduce font size on Windows
+                clean = f"<div style='font-size:10pt'>{clean}</div>"
+            self.kanban_text.pack_forget()
+            self.kanban_html.set_html(clean)
+            self.kanban_html.pack(fill=tk.BOTH, expand=True)
 
-            self.kanban_html.delete("1.0", tk.END)
-            self.kanban_html.insert(tk.END, desc)
-            self.kanban_html.config(state="normal")
+        # Manual / CSV task → editable Text box
+        else:
+            if HAS_HTML:
+                self.kanban_html.pack_forget()
+            self.kanban_text.pack(fill=tk.BOTH, expand=True)
+            self.kanban_text.delete("1.0", tk.END)
+            self.kanban_text.insert(tk.END, desc)
 
         # Update progress log
         self.kanban_progress.delete("1.0", tk.END)
@@ -730,20 +724,25 @@ class TaskApp(tk.Tk):
             messagebox.showwarning("No Task", "Please select a task in Kanban first.")
             return
 
-        if HAS_HTML:
-            # HTMLLabel is display-only → fallback: keep description unchanged
-            messagebox.showinfo("Info", "HTML description cannot be edited directly. Use Task List tab to update.")
-            return
-        else:
-            new_desc = self.kanban_html.get("1.0", tk.END).strip()
-
         cur = self.db.conn.cursor()
         cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
         r = cur.fetchone()
-        if not r: return
+        if not r:
+            return
+
+        # If Outlook imported → do not allow editing description
+        if r["outlook_id"]:
+            messagebox.showinfo("Info", "Outlook tasks cannot be edited here. Update directly in Outlook.")
+            return
+
+        # Manual / CSV task → allow editing
+        new_desc = self.kanban_text.get("1.0", tk.END).strip()
         self.db.update(self.kanban_selected_id, r["title"], new_desc, r["due_date"], r["priority"], r["status"])
-        self._populate(); self._populate_kanban()
+        self._populate()
+        self._populate_kanban()
         self._sync_outlook_task(self.kanban_selected_id, {"desc": new_desc}, action="update")
+        messagebox.showinfo("Saved", "Description updated successfully.")
+        
 
 
     def _show_overdue_popup(self):
