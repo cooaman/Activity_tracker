@@ -290,7 +290,7 @@ class TaskApp(tk.Tk):
             col.grid(row=0, column=idx, sticky="nsew", padx=6)
             frame.columnconfigure(idx, weight=2)
             ttk.Label(col, text=status, font=("", 12, "bold")).pack()
-            lb = tk.Listbox(col, height=40, width=55, selectmode=tk.EXTENDED)
+            lb = tk.Listbox(col, height=45, width=55, selectmode=tk.EXTENDED)
             lb.pack(fill=tk.BOTH, expand=True)
             lb.status_name = status
             lb.bind("<<ListboxSelect>>", self._kanban_select)
@@ -435,29 +435,52 @@ class TaskApp(tk.Tk):
     def _kanban_select(self, event):
         lb = event.widget
         idx = lb.curselection()
-        if not idx: return
+        if not idx: 
+            return
+
         line = lb.get(idx[0])
         task_id = int(line.split("]")[0][1:])
         self.kanban_selected_id = task_id
         self.kanban_selected_status = lb.status_name
 
         cur = self.db.conn.cursor()
-        cur.execute("SELECT description, progress_log FROM tasks WHERE id=?", (task_id,))
+        cur.execute("SELECT description, progress_log, outlook_id FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone()
         desc = row["description"] or ""
         prog = row["progress_log"] or ""
+        outlook_id = row["outlook_id"]
 
-        if HAS_HTML and ("<html" in desc.lower() or "<body" in desc.lower()):
-            # Clean wrapper tags
-            clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            self.kanban_html.set_html(clean)
-        else:
+        # Reset description display
+        if outlook_id:
+            # Outlook imported task → read-only with HTML preview
             if HAS_HTML:
-                self.kanban_html.set_html(desc.replace("\n", "<br>"))
+                clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+                # Reduce font size if Windows
+                if os.name == "nt":
+                    self.kanban_html.set_html(f"<div style='font-size:10pt'>{clean}</div>")
+                else:
+                    self.kanban_html.set_html(clean)
+                try:
+                    self.kanban_html.config(state="disabled")
+                except:
+                    pass
             else:
                 self.kanban_html.delete("1.0", tk.END)
                 self.kanban_html.insert(tk.END, desc)
+                self.kanban_html.config(state="disabled")
+        else:
+            # Manual / CSV-imported task → editable
+            if HAS_HTML:
+                # Replace HTMLLabel with editable Text for manual tasks
+                self.kanban_html.destroy()
+                self.kanban_html = tk.Text(self.kanban_html.master, wrap="word", height=15, width=50)
+                self.kanban_html.pack(fill=tk.BOTH, expand=True)
 
+            self.kanban_html.delete("1.0", tk.END)
+            self.kanban_html.insert(tk.END, desc)
+            self.kanban_html.config(state="normal")
+
+        # Update progress log
         self.kanban_progress.delete("1.0", tk.END)
         self.kanban_progress.insert(tk.END, prog)
 
