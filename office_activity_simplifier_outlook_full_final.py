@@ -537,7 +537,7 @@ class TaskApp(tk.Tk):
             try:
                 todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
                 for item in todo_folder.Items:
-                    if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
+                    if getattr(item, "Class", 0) == 43 and not item.Complete:  # TaskItem
                         due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         flagged.append({
                             "title": f"[Task] {item.Subject}",
