@@ -376,7 +376,11 @@ class TaskApp(tk.Tk):
             self.tree.delete(row)
 
         for r in self.db.fetch():
-            desc = (r["description"] or "").replace("\n", " ")[:80] + "..." if r["description"] else ""
+            desc = r["description"] or ""
+            # Clean HTML for preview
+            desc = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+            desc = desc.replace("\n", " ")[:80] + "..." if desc else ""
+
             if self.settings.get("show_description", False):
                 values = [r["id"], r["title"], desc, r["due_date"] or "—", r["priority"], r["status"]]
             else:
@@ -423,7 +427,9 @@ class TaskApp(tk.Tk):
         prog = row["progress_log"] or ""
 
         if HAS_HTML and ("<html" in desc.lower() or "<body" in desc.lower()):
-            self.kanban_html.set_html(desc)
+            # Clean wrapper tags
+            clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+            self.kanban_html.set_html(clean)
         else:
             if HAS_HTML:
                 self.kanban_html.set_html(desc.replace("\n", "<br>"))
@@ -492,6 +498,33 @@ class TaskApp(tk.Tk):
         self.db.update_progress(self.kanban_selected_id, new_log)
         self._populate_kanban()
 
+
+    def _get_flagged_from_folder(self, folder, flagged):
+        """Recursively fetch flagged mails from a folder + subfolders"""
+        try:
+            items = folder.Items
+            items.Sort("[ReceivedTime]", True)  # must sort before Restrict()
+            flagged_items = items.Restrict("[FlagStatus] = 2")
+
+            for item in flagged_items:
+                if getattr(item, "Class", 0) == 43:  # MailItem
+                    due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                    desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+                    flagged.append({
+                        "title": f"[Mail] {item.Subject}",
+                        "description": desc,
+                        "due_date": due,
+                        "priority": "Medium",
+                        "status": "Pending",
+                        "outlook_id": item.EntryID
+                    })
+
+            # recurse into subfolders
+            for sub in folder.Folders:
+                self._get_flagged_from_folder(sub, flagged)
+
+        except Exception:
+            pass
     # -------------------- Outlook --------------------
     def _get_flagged_emails(self):
         if not HAS_OUTLOOK:
@@ -500,10 +533,11 @@ class TaskApp(tk.Tk):
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
 
-            # --- 1. Tasks from To-Do List ---
+            # --- Tasks from To-Do List ---
             try:
                 todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
-                for item in todo_folder.Items:
+                items = todo_folder.Items
+                for item in items:
                     try:
                         if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
                             due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
@@ -520,24 +554,10 @@ class TaskApp(tk.Tk):
             except Exception as e:
                 print("To-Do List fetch error:", e)
 
-            # --- 2. Flagged Emails from Inbox ---
+            # --- Flagged Emails from Inbox (and subfolders) ---
             try:
                 inbox = outlook.GetDefaultFolder(6)  # Inbox
-                for item in inbox.Items:
-                    try:
-                        if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:  # MailItem flagged
-                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                            desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
-                            flagged.append({
-                                "title": f"[Mail] {item.Subject}",
-                                "description": desc,
-                                "due_date": due,
-                                "priority": "Medium",
-                                "status": "Pending",
-                                "outlook_id": item.EntryID
-                            })
-                    except Exception:
-                        continue
+                self._get_flagged_from_folder(inbox, flagged)
             except Exception as e:
                 print("Inbox flagged mail fetch error:", e)
 
@@ -564,29 +584,44 @@ class TaskApp(tk.Tk):
         self.after(minutes*60*1000, self._refresh_outlook_flags)
 
     def _sync_outlook_task(self, task_id, data, action="update"):
-        if not HAS_OUTLOOK: return
+        if not HAS_OUTLOOK:
+            return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
             cur = self.db.conn.cursor()
             cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
             row = cur.fetchone()
-            if not row or not row["outlook_id"]: return
+            if not row or not row["outlook_id"]:
+                return
             entryid = row["outlook_id"]
 
-            todo_folder = outlook.GetDefaultFolder(28)
-            items = todo_folder.Items
+            # Search in Tasks + Inbox
             item = None
-            for i in items:
-                if i.EntryID == entryid: 
-                    item = i
-                    break
-            if not item: return
+            try:
+                todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+                for i in todo_folder.Items:
+                    if i.EntryID == entryid:
+                        item = i
+                        break
+            except Exception:
+                pass
+
+            if not item:
+                try:
+                    inbox = outlook.GetDefaultFolder(6)
+                    item = inbox.Items.Find(f"[EntryID] = '{entryid}'")
+                except Exception:
+                    pass
+
+            if not item:
+                return
 
             if action == "done" or (action == "update" and data.get("status") == "Done"):
-                if getattr(item, "Class", 0) == 48:   # TaskItem
+                if getattr(item, "Class", 0) == 48:  # TaskItem
                     item.MarkComplete()
-                elif getattr(item, "Class", 0) == 43: # MailItem
-                    item.FlagStatus = 1
+                elif getattr(item, "Class", 0) == 43:  # MailItem
+                    item.FlagStatus = 1  # clear flag
+                    item.Categories = "Completed"  # optional visual marker
                 item.Save()
             elif action == "delete":
                 item.Delete()
