@@ -10,7 +10,8 @@ except ImportError:
     HAS_OUTLOOK = False
 
 try:
-    from plyer import notification
+    from win10toast import ToastNotifier
+    toaster = ToastNotifier()
     HAS_NOTIFY = True
 except ImportError:
     HAS_NOTIFY = False
@@ -175,12 +176,12 @@ class TaskApp(tk.Tk):
 
         self._check_reminders()
 
-    # -------------------- UI --------------------
+    # -------------------- Build UI --------------------
     def _build_ui(self):
         toolbar = ttk.Frame(self, padding=8)
         toolbar.pack(fill=tk.X)
         ttk.Button(toolbar, text="Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=6)
@@ -188,9 +189,9 @@ class TaskApp(tk.Tk):
         ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=6)
 
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # Task List
+        # ---------------- Task List Tab ----------------
         list_tab = ttk.Frame(self.notebook)
         self.notebook.add(list_tab, text="Task List")
 
@@ -204,98 +205,88 @@ class TaskApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
         form = ttk.LabelFrame(list_tab, text="Task Details", padding=10)
-        form.pack(fill=tk.X, padx=8, pady=(0, 8))
+        form.pack(fill=tk.X, padx=8, pady=(0,8))
 
         self.title_var = tk.StringVar()
         self.due_var = tk.StringVar()
         self.priority_var = tk.StringVar(value="Medium")
         self.status_var = tk.StringVar(value="Pending")
 
-        ttk.Label(form, text="Title *").grid(row=0, column=0, sticky="w")
+        ttk.Label(form, text="Title *").grid(row=0,column=0,sticky="w")
         self.title_entry = ttk.Entry(form, textvariable=self.title_var, width=50)
-        self.title_entry.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        self.title_entry.grid(row=0,column=1,sticky="w",padx=6,pady=4)
 
-        ttk.Label(form, text="Due Date (YYYY-MM-DD)").grid(row=0, column=2, sticky="w")
+        ttk.Label(form, text="Due Date (YYYY-MM-DD)").grid(row=0,column=2,sticky="w")
         self.due_entry = ttk.Entry(form, textvariable=self.due_var, width=16)
-        self.due_entry.grid(row=0, column=3, sticky="w", padx=6, pady=4)
+        self.due_entry.grid(row=0,column=3,sticky="w",padx=6,pady=4)
 
-        ttk.Label(form, text="Priority").grid(row=1, column=0, sticky="w")
+        ttk.Label(form, text="Priority").grid(row=1,column=0,sticky="w")
         self.priority_combo = ttk.Combobox(form, textvariable=self.priority_var, values=PRIORITIES, state="readonly", width=12)
-        self.priority_combo.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self.priority_combo.grid(row=1,column=1,sticky="w",padx=6,pady=4)
 
-        ttk.Label(form, text="Status").grid(row=1, column=2, sticky="w")
+        ttk.Label(form, text="Status").grid(row=1,column=2,sticky="w")
         self.status_combo = ttk.Combobox(form, textvariable=self.status_var, values=STATUSES, state="readonly", width=12)
-        self.status_combo.grid(row=1, column=3, sticky="w", padx=6, pady=4)
+        self.status_combo.grid(row=1,column=3,sticky="w",padx=6,pady=4)
 
-        ttk.Label(form, text="Description").grid(row=2, column=0, sticky="nw")
+        ttk.Label(form, text="Description").grid(row=2,column=0,sticky="nw")
         self.desc_text = tk.Text(form, height=4, width=80)
-        self.desc_text.grid(row=2, column=1, columnspan=3, sticky="we", padx=6, pady=4)
+        self.desc_text.grid(row=2,column=1,columnspan=3,sticky="we",padx=6,pady=4)
 
         btns = ttk.Frame(list_tab)
-        btns.pack(fill=tk.X, padx=8, pady=(0, 10))
-        ttk.Button(btns, text="Add New", command=self._add_task).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Update Selected", command=self._update_task).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Delete Selected", command=self._delete_task).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Clear Form", command=self._clear_form).pack(side=tk.LEFT, padx=6)
+        btns.pack(fill=tk.X,padx=8,pady=6)
+        ttk.Button(btns,text="Add New",command=self._add_task).pack(side=tk.LEFT)
+        ttk.Button(btns,text="Update Selected",command=self._update_task).pack(side=tk.LEFT,padx=6)
+        ttk.Button(btns,text="Mark Done",command=self._mark_done).pack(side=tk.LEFT,padx=6)
+        ttk.Button(btns,text="Delete Selected",command=self._delete_task).pack(side=tk.LEFT,padx=6)
+        ttk.Button(btns,text="Clear Form",command=self._clear_form).pack(side=tk.LEFT,padx=6)
 
-        # -------------------- Kanban --------------------
+        # ---------------- Kanban Tab ----------------
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.kanban_tab, text="Kanban Board")
 
-        frame = ttk.Frame(self.kanban_tab); frame.pack(fill=tk.BOTH, expand=True)
+        frame = ttk.Frame(self.kanban_tab); frame.pack(fill=tk.BOTH,expand=True)
         self.kanban_lists = {}
-        frame.rowconfigure(0, weight=1)
+        for idx,status in enumerate(STATUSES):
+            col=ttk.Frame(frame,padding=6,borderwidth=1,relief="groove")
+            col.grid(row=0,column=idx,sticky="nsew",padx=6)
+            frame.columnconfigure(idx,weight=2)
+            ttk.Label(col,text=status,font=("",12,"bold")).pack()
+            lb=tk.Listbox(col,height=30,width=50)
+            lb.pack(fill=tk.BOTH,expand=True)
+            lb.bind("<<ListboxSelect>>",self._kanban_select)
+            lb.bind("<ButtonPress-1>",self._on_drag_start)
+            lb.bind("<ButtonRelease-1>",self._on_drag_stop)
+            lb.status_name=status
+            self.kanban_lists[status]=lb
 
-        for idx, status in enumerate(STATUSES):
-            col = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
-            col.grid(row=0, column=idx, sticky="nsew", padx=6)
-            frame.columnconfigure(idx, weight=3)
-            ttk.Label(col, text=status, font=("", 12, "bold")).grid(row=0, column=0, sticky="ew")
-            lb = tk.Listbox(col, width=60, height=30)
-            lb.grid(row=1, column=0, sticky="nsew")
-            col.rowconfigure(1, weight=1)
-            col.columnconfigure(0, weight=1)
-            lb.bind("<<ListboxSelect>>", self._kanban_select)
-            lb.bind("<ButtonPress-1>", self._on_drag_start)
-            lb.bind("<ButtonRelease-1>", self._on_drag_stop)
-            lb.status_name = status
-            self.kanban_lists[status] = lb
+        # Right side panel
+        desc_frame=ttk.Frame(frame,padding=6,borderwidth=1,relief="groove")
+        desc_frame.grid(row=0,column=len(STATUSES),sticky="nsew",padx=6)
+        frame.columnconfigure(len(STATUSES),weight=1)
 
-        # Right-side description + progress
-        desc_frame = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
-        desc_frame.grid(row=0, column=len(STATUSES), sticky="nsew", padx=6)
-        frame.columnconfigure(len(STATUSES), weight=2)
+        ttk.Label(desc_frame,text="Task Description (editable)").pack(anchor="w")
+        self.kanban_desc=tk.Text(desc_frame,height=10,wrap="word",width=50)
+        self.kanban_desc.pack(fill=tk.BOTH,expand=True)
 
-        ttk.Label(desc_frame, text="Task Description (editable)").pack(anchor="w")
-        self.kanban_desc = tk.Text(desc_frame, height=15, wrap="word", width=60)
-        self.kanban_desc.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=6)
+        ttk.Label(desc_frame,text="Progress / Remarks (latest on top)").pack(anchor="w")
+        self.kanban_progress=tk.Text(desc_frame,height=10,wrap="word",width=50)
+        self.kanban_progress.pack(fill=tk.BOTH,expand=True)
 
-        ttk.Label(desc_frame, text="Task Progress (remarks)").pack(anchor="w", pady=(10,0))
-        self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=60)
-        self.kanban_progress.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(desc_frame, text="Update Progress", command=self._update_progress).pack(pady=6)
+        ttk.Button(desc_frame,text="Save Description",command=self._save_kanban_desc).pack(pady=4)
+        ttk.Button(desc_frame,text="Update Progress",command=self._update_progress).pack(pady=4)
 
-        # Action buttons
-        action_frame = ttk.Frame(self.kanban_tab, padding=10)
-        action_frame.pack(fill=tk.X, pady=5)
+        action_frame=ttk.Frame(self.kanban_tab,padding=6)
+        action_frame.pack(fill=tk.X)
+        self.btn_edit=ttk.Button(action_frame,text="Edit",command=self._edit_selected_kanban,state="disabled"); self.btn_edit.pack(side=tk.LEFT,padx=4)
+        self.btn_delete=ttk.Button(action_frame,text="Delete",command=self._delete_selected_kanban,state="disabled"); self.btn_delete.pack(side=tk.LEFT,padx=4)
+        self.btn_done=ttk.Button(action_frame,text="Mark Done",command=self._mark_done_selected_kanban,state="disabled"); self.btn_done.pack(side=tk.LEFT,padx=4)
+        self.btn_prev=ttk.Button(action_frame,text="← Move Previous",command=self._move_prev_selected,state="disabled"); self.btn_prev.pack(side=tk.LEFT,padx=4)
+        self.btn_next=ttk.Button(action_frame,text="Move Next →",command=self._move_next_selected,state="disabled"); self.btn_next.pack(side=tk.LEFT,padx=4)
 
-        self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled")
-        self.btn_edit.pack(side=tk.LEFT, padx=5)
-        self.btn_delete = ttk.Button(action_frame, text="Delete", command=self._delete_selected_kanban, state="disabled")
-        self.btn_delete.pack(side=tk.LEFT, padx=5)
-        self.btn_done = ttk.Button(action_frame, text="Mark Done", command=self._mark_done_selected_kanban, state="disabled")
-        self.btn_done.pack(side=tk.LEFT, padx=5)
-        self.btn_prev = ttk.Button(action_frame, text="← Move Previous", command=self._move_prev_selected, state="disabled")
-        self.btn_prev.pack(side=tk.LEFT, padx=5)
-        self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled")
-        self.btn_next.pack(side=tk.LEFT, padx=5)
+        self.statusbar = tk.Label(self,text="",anchor="w",relief="sunken")
+        self.statusbar.pack(side=tk.BOTTOM,fill=tk.X)
 
-        self.statusbar = tk.Label(self, text="", anchor="w", relief="sunken")
-        self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    # -------------------- CRUD Methods --------------------
+    # -------------------- CRUD --------------------
     def _validate_form(self):
         title = self.title_var.get().strip()
         if not title:
@@ -305,271 +296,271 @@ class TaskApp(tk.Tk):
         if due:
             try: datetime.strptime(due, "%Y-%m-%d")
             except ValueError:
-                messagebox.showwarning("Validation", "Due date must be YYYY-MM-DD.")
+                messagebox.showwarning("Validation","Due date must be YYYY-MM-DD.")
                 return None
-        return {
-            "title": title,
-            "desc": self.desc_text.get("1.0", tk.END).strip(),
-            "due": due if due else None,
-            "priority": self.priority_var.get(),
-            "status": self.status_var.get(),
-        }
+        return {"title":title,"desc":self.desc_text.get("1.0",tk.END).strip(),
+                "due":due if due else None,"priority":self.priority_var.get(),"status":self.status_var.get()}
 
     def _add_task(self):
-        d = self._validate_form()
+        d=self._validate_form()
         if not d: return
-        self.db.add(d["title"], d["desc"], d["due"], d["priority"], d["status"])
+        self.db.add(d["title"],d["desc"],d["due"],d["priority"],d["status"])
         self._populate(); self._populate_kanban(); self._clear_form()
 
     def _update_task(self):
-        sel = self.tree.selection()
+        sel=self.tree.selection()
         if not sel: return
-        task_id = int(self.tree.item(sel[0], "values")[0])
-        d = self._validate_form()
+        task_id=int(self.tree.item(sel[0],"values")[0])
+        d=self._validate_form()
         if not d: return
-        self.db.update(task_id, d["title"], d["desc"], d["due"], d["priority"], d["status"])
+        self.db.update(task_id,d["title"],d["desc"],d["due"],d["priority"],d["status"])
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {"status": d["status"]}, action="update")
 
     def _delete_task(self):
-        sel = self.tree.selection()
+        sel=self.tree.selection()
         if not sel: return
-        task_id = int(self.tree.item(sel[0], "values")[0])
+        task_id=int(self.tree.item(sel[0],"values")[0])
         if messagebox.askyesno("Confirm","Delete selected task?"):
-            self.db.delete(task_id); self._populate(); self._populate_kanban()
-            self._sync_outlook_task(task_id, {}, action="delete")
+            self.db.delete(task_id); self._populate(); self._populate_kanban(); self._clear_form()
 
     def _mark_done(self):
-        sel = self.tree.selection()
+        sel=self.tree.selection()
         if not sel: return
-        task_id = int(self.tree.item(sel[0], "values")[0])
+        task_id=int(self.tree.item(sel[0],"values")[0])
         self.db.mark_done(task_id); self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {"status":"Done"}, action="done")
 
-    def _on_select(self, event):
-        sel = self.tree.selection()
+    def _on_select(self,event):
+        sel=self.tree.selection()
         if not sel: return
-        vals = self.tree.item(sel[0], "values")
-        task_id = int(vals[0])
+        vals=self.tree.item(sel[0],"values")
+        task_id=int(vals[0])
         self.title_var.set(vals[1])
-        if self.settings.get("show_description", False):
+        if self.settings.get("show_description",False):
             self.due_var.set(vals[3]); self.priority_var.set(vals[4]); self.status_var.set(vals[5])
         else:
             self.due_var.set(vals[2]); self.priority_var.set(vals[3]); self.status_var.set(vals[4])
-        cur = self.db.conn.cursor(); cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
-        row = cur.fetchone()
-        self.desc_text.delete("1.0", tk.END); self.desc_text.insert(tk.END, row[0] if row else "")
+        cur=self.db.conn.cursor(); cur.execute("SELECT description FROM tasks WHERE id=?",(task_id,))
+        row=cur.fetchone()
+        self.desc_text.delete("1.0",tk.END); self.desc_text.insert(tk.END,row[0] if row else "")
 
     def _clear_form(self):
         self.title_var.set(""); self.due_var.set("")
         self.priority_var.set("Medium"); self.status_var.set("Pending")
-        self.desc_text.delete("1.0", tk.END)
+        self.desc_text.delete("1.0",tk.END)
 
     def _populate(self):
         for row in self.tree.get_children(): self.tree.delete(row)
         for r in self.db.fetch():
-            desc = (r["description"] or "").replace("\n"," ")[:80]+"..." if r["description"] else ""
-            values=[r["id"], r["title"]]
-            if self.settings.get("show_description", False): values.append(desc)
-            values += [r["due_date"] or "—", r["priority"], r["status"]]
-            self.tree.insert("", tk.END, values=values)
-
-        overdue = len(self.db.fetch_overdue())
-        today = len(self.db.fetch_due_today())
-        pending = len(self.db.fetch_by_status("Pending"))
+            desc=(r["description"] or "").replace("\n"," ")[:80]+"..." if r["description"] else ""
+            values=[r["id"],r["title"]]
+            if self.settings.get("show_description",False): values.append(desc)
+            values+=[r["due_date"] or "—",r["priority"],r["status"]]
+            self.tree.insert("",tk.END,values=values)
+        overdue=len(self.db.fetch_overdue()); today=len(self.db.fetch_due_today()); pending=len(self.db.fetch_by_status("Pending"))
         self.statusbar.config(text=f"Overdue: {overdue} | Today: {today} | Pending: {pending}")
 
+    # -------------------- Kanban --------------------
     def _populate_kanban(self):
-        for lb in self.kanban_lists.values(): lb.delete(0, tk.END)
-        for status, lb in self.kanban_lists.items():
+        for lb in self.kanban_lists.values(): lb.delete(0,tk.END)
+        for status,lb in self.kanban_lists.items():
             for r in self.db.fetch_by_status(status):
-                display = f"[#{r['id']}] {r['title']}"
-                if r["due_date"]: display += f" | Due: {r['due_date']}"
-                if r["priority"]: display += f" | {r['priority']}"
-                idx = lb.size()
-                lb.insert(tk.END, display)
-                if r["priority"] == "High": lb.itemconfig(idx, fg="red")
-                elif r["priority"] == "Medium": lb.itemconfig(idx, fg="orange")
-                else: lb.itemconfig(idx, fg="green")
-                if r["due_date"] and r["status"] != "Done":
-                    try:
-                        if datetime.strptime(r["due_date"], "%Y-%m-%d").date() < date.today():
-                            lb.itemconfig(idx, fg="red", font=("TkDefaultFont", 10, "bold"))
-                    except: pass
+                display=f"[#{r['id']}] {r['title']}"
+                if r["due_date"]: display+=f" | Due: {r['due_date']}"
+                display+=f" | {r['priority']}"
+                lb.insert(tk.END,display)
 
-    # -------------------- Kanban Methods --------------------
-    def _kanban_select(self, event):
-        lb = event.widget; idx = lb.curselection()
+    def _kanban_select(self,event):
+        lb=event.widget; idx=lb.curselection()
         if not idx: return
-        line = lb.get(idx[0])
+        line=lb.get(idx[0])
         if not line.startswith("[#"): return
-        task_id = int(line.split("]")[0][2:])
-        self.kanban_selected_id = task_id
-        self.kanban_selected_status = lb.status_name
-        cur = self.db.conn.cursor(); cur.execute("SELECT description,progress_log FROM tasks WHERE id=?", (task_id,))
-        row = cur.fetchone()
-        self.kanban_desc.delete("1.0", tk.END); self.kanban_progress.delete("1.0", tk.END)
+        task_id=int(line.split("]")[0][2:])
+        self.kanban_selected_id=task_id; self.kanban_selected_status=lb.status_name
+        cur=self.db.conn.cursor(); cur.execute("SELECT description,progress_log FROM tasks WHERE id=?",(task_id,))
+        row=cur.fetchone()
+        self.kanban_desc.delete("1.0",tk.END); self.kanban_progress.delete("1.0",tk.END)
         if row:
-            if row[0]: self.kanban_desc.insert(tk.END, row[0])
-            if row[1]: self.kanban_progress.insert(tk.END, row[1])
-        self._enable_kanban_buttons(lb.status_name)
+            if row["description"]: self.kanban_desc.insert(tk.END,row["description"])
+            if row["progress_log"]: self.kanban_progress.insert(tk.END,row["progress_log"])
+
+        self.btn_edit.config(state="normal"); self.btn_delete.config(state="normal"); self.btn_done.config(state="normal")
+        idx_status=STATUSES.index(lb.status_name)
+        self.btn_prev.config(state="normal" if idx_status>0 else "disabled")
+        self.btn_next.config(state="normal" if idx_status<len(STATUSES)-1 else "disabled")
 
     def _save_kanban_desc(self):
         if not self.kanban_selected_id: return
-        new_desc = self.kanban_desc.get("1.0", tk.END).strip()
-        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
-        r = cur.fetchone()
+        new_desc=self.kanban_desc.get("1.0",tk.END).strip()
+        cur=self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?",(self.kanban_selected_id,))
+        r=cur.fetchone()
         if not r: return
-        self.db.update(self.kanban_selected_id, r["title"], new_desc, r["due_date"], r["priority"], r["status"])
+        self.db.update(self.kanban_selected_id,r["title"],new_desc,r["due_date"],r["priority"],r["status"])
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {"status": r["status"]}, action="update")
 
     def _update_progress(self):
         if not self.kanban_selected_id: return
-        new_progress = self.kanban_progress.get("1.0", tk.END).strip()
-        if not new_progress: return
-        cur = self.db.conn.cursor(); cur.execute("SELECT progress_log FROM tasks WHERE id=?", (self.kanban_selected_id,))
-        row = cur.fetchone()
-        existing = row[0] if row and row[0] else ""
-        now = date.today().isoformat()
-        new_entry = f"[{now}] {new_progress}\n"
-        updated_log = new_entry + existing
-        with self.db.conn:
-            self.db.conn.execute("UPDATE tasks SET progress_log=?, updated_at=? WHERE id=?", (updated_log, _now_iso(), self.kanban_selected_id))
-        self.kanban_progress.delete("1.0", tk.END); self.kanban_progress.insert(tk.END, updated_log)
-
-    def _enable_kanban_buttons(self, status):
-        self.btn_edit.config(state="normal")
-        self.btn_delete.config(state="normal")
-        self.btn_done.config(state="normal")
-        idx_status = STATUSES.index(status)
-        self.btn_prev.config(state="normal" if idx_status > 0 else "disabled")
-        self.btn_next.config(state="normal" if idx_status < len(STATUSES)-1 else "disabled")
+        new_entry=self.kanban_progress.get("1.0",tk.END).strip()
+        if not new_entry: return
+        today_str=f"[{date.today()}] "
+        cur=self.db.conn.cursor(); cur.execute("SELECT progress_log FROM tasks WHERE id=?",(self.kanban_selected_id,))
+        row=cur.fetchone()
+        prev=row["progress_log"] if row and row["progress_log"] else ""
+        updated=today_str+new_entry+"\n"+prev
+        cur=self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?",(self.kanban_selected_id,))
+        r=cur.fetchone()
+        if not r: return
+        self.db.conn.execute("UPDATE tasks SET progress_log=?,updated_at=? WHERE id=?",(updated,_now_iso(),self.kanban_selected_id))
+        self.db.conn.commit()
+        self.kanban_progress.delete("1.0",tk.END); self.kanban_progress.insert(tk.END,updated)
 
     def _edit_selected_kanban(self):
         if not self.kanban_selected_id: return
-        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
-        r = cur.fetchone()
+        cur=self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?",(self.kanban_selected_id,))
+        r=cur.fetchone()
         if r:
-            self.title_var.set(r["title"])
-            self.due_var.set(r["due_date"] or "")
-            self.priority_var.set(r["priority"])
-            self.status_var.set(r["status"])
-            self.desc_text.delete("1.0", tk.END); self.desc_text.insert(tk.END, r["description"] or "")
+            self.title_var.set(r["title"]); self.due_var.set(r["due_date"] or ""); self.priority_var.set(r["priority"])
+            self.status_var.set(r["status"]); self.desc_text.delete("1.0",tk.END); self.desc_text.insert(tk.END,r["description"] or "")
             self.notebook.select(0)
 
     def _delete_selected_kanban(self):
         if not self.kanban_selected_id: return
-        self.db.delete(self.kanban_selected_id)
-        self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {}, action="delete")
+        self.db.delete(self.kanban_selected_id); self._populate(); self._populate_kanban()
 
     def _mark_done_selected_kanban(self):
         if not self.kanban_selected_id: return
-        self.db.mark_done(self.kanban_selected_id)
-        self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {"status":"Done"}, action="done")
+        self.db.mark_done(self.kanban_selected_id); self._populate(); self._populate_kanban()
 
     def _move_prev_selected(self):
         if not self.kanban_selected_id: return
-        idx_status = STATUSES.index(self.kanban_selected_status)
-        if idx_status > 0:
-            self._move_task(self.kanban_selected_id, STATUSES[idx_status-1])
+        idx_status=STATUSES.index(self.kanban_selected_status)
+        if idx_status>0: self._move_task(self.kanban_selected_id,STATUSES[idx_status-1])
 
     def _move_next_selected(self):
         if not self.kanban_selected_id: return
-        idx_status = STATUSES.index(self.kanban_selected_status)
-        if idx_status < len(STATUSES)-1:
-            self._move_task(self.kanban_selected_id, STATUSES[idx_status+1])
+        idx_status=STATUSES.index(self.kanban_selected_status)
+        if idx_status<len(STATUSES)-1: self._move_task(self.kanban_selected_id,STATUSES[idx_status+1])
 
-    def _on_drag_start(self, event):
-        lb = event.widget
-        idx = lb.nearest(event.y)
-        if idx >= 0:
-            self.drag_data["task"] = lb.get(idx)
-            self.drag_data["source"] = lb
-
-    def _on_drag_stop(self, event):
-        if not self.drag_data["task"]: return
-        target_lb = event.widget
-        if isinstance(target_lb, tk.Listbox) and target_lb != self.drag_data["source"]:
-            line = self.drag_data["task"]
-            if line.startswith("[#"):
-                task_id = int(line.split("]")[0][2:])
-                self._move_task(task_id, target_lb.status_name)
-        self.drag_data = {"task": None, "source": None}
-
-    def _move_task(self, task_id, new_status):
-        cur = self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
-        r = cur.fetchone()
+    def _move_task(self,task_id,new_status):
+        cur=self.db.conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id=?",(task_id,)); r=cur.fetchone()
         if not r: return
-        self.db.update(task_id, r["title"], r["description"], r["due_date"], r["priority"], new_status)
+        self.db.update(task_id,r["title"],r["description"],r["due_date"],r["priority"],new_status)
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {"status": new_status}, action="update")
+
+    def _on_drag_start(self,event):
+        lb=event.widget; idx=lb.nearest(event.y)
+        if idx>=0: self.drag_data["task"]=lb.get(idx); self.drag_data["source"]=lb
+
+    def _on_drag_stop(self,event):
+        if not self.drag_data["task"]: return
+        target_lb=event.widget
+        if isinstance(target_lb,tk.Listbox) and target_lb!=self.drag_data["source"]:
+            line=self.drag_data["task"]
+            if line.startswith("[#"): task_id=int(line.split("]")[0][2:]); self._move_task(task_id,target_lb.status_name)
+        self.drag_data={"task":None,"source":None}
+
 
     # -------------------- Outlook Sync --------------------
     def _get_flagged_emails(self):
-        if not HAS_OUTLOOK: return []
+        if not HAS_OUTLOOK:
+            return []
         flagged = []
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+            todo_folder = outlook.GetDefaultFolder(28)  # olFolderToDo
             items = todo_folder.Items
             for item in items:
                 try:
-                    cls = getattr(item,"Class",0)
-                    if cls == 48: # TaskItem
+                    cls = getattr(item, "Class", 0)
+                    if cls == 48:  # TaskItem
                         if not item.Complete:
-                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
-                            flagged.append({"title": f"[Task] {item.Subject}","description": (getattr(item,"Body","") or "")[:500],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
-                    elif cls == 43: # MailItem
-                        if getattr(item,"FlagStatus",0) == 2:
-                            due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
-                            flagged.append({"title": f"[Mail] {item.Subject}","description": (getattr(item,"Body","") or "")[:500],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
-                except Exception as inner_e: pass
-        except Exception as e: print("Outlook fetch error:", e)
+                            due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
+                            flagged.append({
+                                "title": f"[Task] {item.Subject}",
+                                "description": (getattr(item, "Body", "") or "")[:500],
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
+                    elif cls == 43:  # MailItem
+                        if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
+                            if item.FlagRequest != "Complete":  # ensure not completed
+                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                                flagged.append({
+                                    "title": f"[Mail] {item.Subject}",
+                                    "description": (getattr(item, "Body", "") or "")[:500],
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": item.EntryID
+                                })
+                except Exception as inner_e:
+                    print("Item error:", inner_e)
+        except Exception as e:
+            print("Outlook fetch error:", e)
         return flagged
 
     def _import_outlook_flags(self):
         flagged = self._get_flagged_emails()
         if not flagged:
-            messagebox.showinfo("Outlook", "No active tasks or flagged emails found."); return
-        cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks"); existing=[r[0] for r in cur.fetchall() if r[0]]
-        new_items=[f for f in flagged if f["outlook_id"] not in existing]
-        if new_items:
-            self.db.bulk_add(new_items); self._populate(); self._populate_kanban()
-            messagebox.showinfo("Outlook", f"Imported {len(new_items)} tasks (skipped duplicates).")
-        else:
-            messagebox.showinfo("Outlook","No new tasks to import.")
+            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+            return
+        # avoid duplicates
+        cur = self.db.conn.cursor()
+        imported = 0
+        for task in flagged:
+            cur.execute("SELECT id FROM tasks WHERE outlook_id=?", (task["outlook_id"],))
+            if not cur.fetchone():
+                self.db.bulk_add([task])
+                imported += 1
+        self._populate()
+        self._populate_kanban()
+        messagebox.showinfo("Outlook", f"Imported {imported} new tasks.")
 
-    def _refresh_outlook_flags(self): self._import_outlook_flags()
+    def _refresh_outlook_flags(self):
+        self._import_outlook_flags()
 
-    def _schedule_outlook_refresh(self, minutes): self.after(minutes*60*1000, self._refresh_outlook_flags)
+    def _schedule_outlook_refresh(self, minutes):
+        self.after(minutes*60*1000, self._refresh_outlook_flags)
 
     def _sync_outlook_task(self, task_id, data, action="update"):
         if not HAS_OUTLOOK: return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
             row = cur.fetchone()
             if not row or not row["outlook_id"]: return
-            entryid=row["outlook_id"]
-            try: item=outlook.GetItemFromID(entryid)
-            except: return
-            if not item: return
-            if action in ["update","done"]:
-                if data.get("status")=="Done":
-                    if hasattr(item,"MarkComplete"): item.MarkComplete()
-                    elif hasattr(item,"FlagStatus"): item.FlagStatus=1
-                else:
-                    if hasattr(item,"FlagStatus"): item.FlagStatus=2
-                item.Save()
-            elif action=="delete": item.Delete()
-        except Exception as e: print("Outlook sync error:", e)
+            entryid = row["outlook_id"]
 
+            todo_folder = outlook.GetDefaultFolder(28)
+            items = todo_folder.Items
+            item = None
+            for i in items:
+                if i.EntryID == entryid:
+                    item = i
+                    break
+            if not item: return
+
+            if action == "update":
+                if hasattr(item, "Status"):
+                    if data.get("status") == "Done":
+                        item.MarkComplete()
+                    elif data.get("status") == "In-Progress":
+                        item.PercentComplete = 50
+                item.Save()
+            elif action == "delete":
+                item.Delete()
+            elif action == "done":
+                if hasattr(item, "MarkComplete"):
+                    item.MarkComplete()
+                item.Save()
+        except Exception as e:
+            print("Outlook sync error:", e)
+            
     # -------------------- CSV --------------------
     def _import_csv(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv")])
+        path=filedialog.askopenfilename(filetypes=[("CSV files","*.csv")])
         if not path: return
         rows=[]
         with open(path,newline="",encoding="utf-8-sig") as f:
@@ -577,20 +568,20 @@ class TaskApp(tk.Tk):
             for r in reader:
                 row={k.strip().lower(): (v.strip() if v else "") for k,v in r.items()}
                 if not row.get("title"): continue
-                rows.append({"title": row.get("title","Untitled Task"),"description": row.get("description",""),"due_date": row.get("due_date") or None,"priority": row.get("priority","Medium"),"status": row.get("status","Pending")})
-        if rows:
-            self.db.bulk_add(rows); self._populate(); self._populate_kanban()
-            messagebox.showinfo("CSV Import", f"Imported {len(rows)} tasks.")
+                rows.append({"title":row.get("title","Untitled Task"),"description":row.get("description",""),
+                             "due_date":row.get("due_date") or None,"priority":row.get("priority","Medium"),
+                             "status":row.get("status","Pending")})
+        if rows: self.db.bulk_add(rows); self._populate(); self._populate_kanban(); messagebox.showinfo("CSV Import",f"Imported {len(rows)} tasks.")
         else: messagebox.showwarning("CSV Import","No valid tasks found.")
 
     def _export_csv(self):
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
+        path=filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV files","*.csv")])
         if not path: return
         rows=self.db.fetch()
         with open(path,"w",newline="",encoding="utf-8") as f:
             writer=csv.writer(f); writer.writerow(["title","description","due_date","priority","status"])
             for r in rows: writer.writerow([r["title"],r["description"],r["due_date"],r["priority"],r["status"]])
-        messagebox.showinfo("CSV Export", f"Exported {len(rows)} tasks.")
+        messagebox.showinfo("CSV Export",f"Exported {len(rows)} tasks.")
 
     # -------------------- Settings --------------------
     def _open_settings(self):
@@ -600,29 +591,32 @@ class TaskApp(tk.Tk):
         tk.Entry(win,textvariable=refresh_var).grid(row=0,column=1)
         show_desc_var=tk.BooleanVar(value=self.settings.get("show_description",False))
         tk.Checkbutton(win,text="Show Description in Task List",variable=show_desc_var).grid(row=1,column=0,columnspan=2,sticky="w")
+
         def save_and_close():
             self.settings["outlook_refresh_minutes"]=refresh_var.get()
             self.settings["show_description"]=show_desc_var.get()
             save_settings(self.settings)
-            messagebox.showinfo("Settings","Saved. Restart app to apply fully."); win.destroy()
+            messagebox.showinfo("Settings","Saved. Restart app to apply fully.")
+            win.destroy()
         ttk.Button(win,text="Save",command=save_and_close).grid(row=2,column=0,columnspan=2,pady=6)
 
     # -------------------- Reminders --------------------
     def _check_reminders(self):
         due_today=self.db.fetch_due_today()
-        if due_today and HAS_NOTIFY: notification.notify(title="Tasks Due Today", message=f"{len(due_today)} tasks due today", timeout=5)
-        self.after(3600*1000, self._check_reminders)
+        if due_today and HAS_NOTIFY:
+            toaster.show_toast("Tasks Due Today",f"{len(due_today)} tasks due today",duration=5,threaded=True)
+        self.after(3600*1000,self._check_reminders)
 
     # -------------------- Popups --------------------
     def _show_overdue_popup(self):
         rows=self.db.fetch_overdue()
         msg="\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No overdue tasks."
-        messagebox.showinfo("Overdue Tasks", msg)
+        messagebox.showinfo("Overdue Tasks",msg)
 
     def _show_today_popup(self):
         rows=self.db.fetch_due_today()
         msg="\n".join([f"{r['title']} (Due {r['due_date']})" for r in rows]) or "No tasks due today."
-        messagebox.showinfo("Today's Tasks", msg)
+        messagebox.showinfo("Today's Tasks",msg)
 
 # -------------------- Main --------------------
 def main():
