@@ -1,35 +1,28 @@
-name: Office Activity Simplifier CI
+name: Python App
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
   pull_request:
-    branches:
-      - main
+    branches: [ "main" ]
 
 jobs:
   build:
-    runs-on: windows-latest  # use Windows because Outlook COM (pywin32) only works on Windows
+    runs-on: windows-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+    - uses: actions/checkout@v3
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'  # or 3.10 if you prefer
+        python-version: '3.10'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        if (Test-Path requirements.txt) {
-          pip install -r requirements.txt
-        } else {
-          pip install pywin32 tkhtmlview win10toast
-        }
+        pip install -r requirements.txt
 
-    - name: Run Application (Smoke Test)
+    - name: Run Script
       run: |
         python office_activity_simplifier_outlook_full_final.py
