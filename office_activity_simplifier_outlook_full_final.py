@@ -440,9 +440,23 @@ class TaskApp(tk.Tk):
                     if cls == 48 and not item.Complete:  # TaskItem
                         due = item.DueDate.strftime("%Y-%m-%d") if getattr(item,"DueDate",None) else None
                         flagged.append({"title": f"[Task] {item.Subject}","description": (getattr(item,"Body","") or "")[:1000],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
-                    elif cls == 43 and getattr(item,"FlagStatus",0) == 2:  # MailItem flagged
-                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item,"TaskDueDate",None) else None
-                        flagged.append({"title": f"[Mail] {item.Subject}","description": getattr(item,"HTMLBody","")[:3000],"due_date": due,"priority": "Medium","status": "Pending","outlook_id": item.EntryID})
+                    elif cls == 43:  # MailItem
+                        # Check if flagged and not complete
+                        if getattr(item, "FlagStatus", 0) == 2:  # olFlagMarked
+                            due = None
+                            try:
+                                if getattr(item, "TaskDueDate", None):
+                                    due = item.TaskDueDate.strftime("%Y-%m-%d")
+                            except:
+                                pass
+                            flagged.append({
+                                "title": f"[Mail] {item.Subject}",
+                                "description": getattr(item,"HTMLBody","")[:3000],  # ✅ HTML body
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": item.EntryID
+                            })
                 except: pass
         except Exception as e: print("Outlook fetch error:", e)
         return flagged
