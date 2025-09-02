@@ -142,6 +142,29 @@ class TaskDB:
         cur.execute("SELECT * FROM tasks WHERE status!='Done' AND due_date IS NOT NULL AND due_date < ?", (today,))
         return cur.fetchall()
     
+    def bulk_add(self, rows):
+        """Insert multiple tasks (used for Outlook/CSV imports)."""
+        now = _now_iso()
+        with self.conn:
+            for r in rows:
+                done_at = now if r.get("status") == "Done" else None
+                self.conn.execute(
+                    """INSERT INTO tasks(title, description, due_date, priority, status,
+                                        created_at, updated_at, done_at, outlook_id, progress_log)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        r.get("title"),
+                        r.get("description"),
+                        r.get("due_date"),
+                        r.get("priority", "Medium"),
+                        r.get("status", "Pending"),
+                        now,
+                        now,
+                        done_at,
+                        r.get("outlook_id"),
+                        r.get("progress_log", ""),
+                    ),
+                )
 
     # -------------------- App --------------------
 class TaskApp(tk.Tk):
@@ -470,29 +493,58 @@ class TaskApp(tk.Tk):
         self._populate_kanban()
 
     # -------------------- Outlook --------------------
-    def _get_flagged_emails(self):
-        if not HAS_OUTLOOK: return []
-        flagged = []
-        try:
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
-            items = todo_folder.Items
-            for item in items:
+        def _get_flagged_emails(self):
+            if not HAS_OUTLOOK:
+                return []
+            flagged = []
+            try:
+                outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+                # --- 1. Tasks from To-Do List ---
                 try:
-                    cls = getattr(item, "Class", 0)
-                    if cls == 48 and not item.Complete:  # TaskItem
-                        due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                        flagged.append({"title": f"[Task] {item.Subject}", "description": item.Body or "",
-                                        "due_date": due, "priority": "Medium", "status": "Pending", "outlook_id": item.EntryID})
-                    elif cls == 43 and getattr(item, "FlagStatus", 0) == 2:  # MailItem flagged
-                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                        desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
-                        flagged.append({"title": f"[Mail] {item.Subject}", "description": desc,
-                                        "due_date": due, "priority": "Medium", "status": "Pending", "outlook_id": item.EntryID})
-                except Exception: continue
-        except Exception as e:
-            print("Outlook fetch error:", e)
-        return flagged
+                    todo_folder = outlook.GetDefaultFolder(28)  # To-Do List
+                    for item in todo_folder.Items:
+                        try:
+                            if getattr(item, "Class", 0) == 48 and not item.Complete:  # TaskItem
+                                due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
+                                flagged.append({
+                                    "title": f"[Task] {item.Subject}",
+                                    "description": item.Body or "",
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": item.EntryID
+                                })
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print("To-Do List fetch error:", e)
+
+                # --- 2. Flagged Emails from Inbox ---
+                try:
+                    inbox = outlook.GetDefaultFolder(6)  # Inbox
+                    for item in inbox.Items:
+                        try:
+                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:  # MailItem flagged
+                                due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                                desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+                                flagged.append({
+                                    "title": f"[Mail] {item.Subject}",
+                                    "description": desc,
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": item.EntryID
+                                })
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print("Inbox flagged mail fetch error:", e)
+
+            except Exception as e:
+                print("Outlook fetch error:", e)
+            return flagged
+    
 
     def _import_outlook_flags(self):
         flagged = self._get_flagged_emails()
@@ -515,8 +567,9 @@ class TaskApp(tk.Tk):
         if not HAS_OUTLOOK: return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            cur = self.db.conn.cursor(); cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
-            row = cur.fetchone(); 
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+            row = cur.fetchone()
             if not row or not row["outlook_id"]: return
             entryid = row["outlook_id"]
 
@@ -524,20 +577,19 @@ class TaskApp(tk.Tk):
             items = todo_folder.Items
             item = None
             for i in items:
-                if i.EntryID == entryid: item = i; break
+                if i.EntryID == entryid: 
+                    item = i
+                    break
             if not item: return
 
-            if action == "done":
-                if getattr(item, "Class", 0) == 48: item.MarkComplete()
-                elif getattr(item, "Class", 0) == 43: item.FlagStatus = 1
+            if action == "done" or (action == "update" and data.get("status") == "Done"):
+                if getattr(item, "Class", 0) == 48:   # TaskItem
+                    item.MarkComplete()
+                elif getattr(item, "Class", 0) == 43: # MailItem
+                    item.FlagStatus = 1
                 item.Save()
             elif action == "delete":
                 item.Delete()
-            elif action == "update" and "status" in data:
-                if data["status"] == "Done":
-                    if getattr(item, "Class", 0) == 48: item.MarkComplete()
-                    elif getattr(item, "Class", 0) == 43: item.FlagStatus = 1
-                    item.Save()
         except Exception as e:
             print("Outlook sync error:", e)
 
@@ -564,14 +616,16 @@ class TaskApp(tk.Tk):
             writer = csv.writer(f); writer.writerow(["title","description","due_date","priority","status"])
             for r in rows: writer.writerow([r["title"], r["description"], r["due_date"], r["priority"], r["status"]])
         messagebox.showinfo("CSV Export", f"Exported {len(rows)} tasks.")
+    
     def _save_kanban_desc(self):
         if not self.kanban_selected_id:
             messagebox.showwarning("No Task", "Please select a task in Kanban first.")
             return
-        new_desc = ""
+
         if HAS_HTML:
-            # HTMLLabel is read-only, so fallback to a text input
-            new_desc = self.kanban_progress.get("1.0", tk.END).strip()
+            # HTMLLabel is display-only → fallback: keep description unchanged
+            messagebox.showinfo("Info", "HTML description cannot be edited directly. Use Task List tab to update.")
+            return
         else:
             new_desc = self.kanban_html.get("1.0", tk.END).strip()
 
