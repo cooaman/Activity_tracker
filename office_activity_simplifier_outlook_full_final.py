@@ -299,17 +299,21 @@ class TaskApp(tk.Tk):
         frame.columnconfigure(len(STATUSES), weight=1)
 
         # --- Task Description / Email ---
+        # ---- Description Section (always on top) ----
         ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
 
-        self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15) if HAS_HTML else None
-        self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
+        if HAS_HTML:
+            self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15)
+            self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
+        else:
+            self.kanban_html = tk.Text(desc_frame, wrap="word", height=15, width=50)
+            self.kanban_text = self.kanban_html
 
-        # Default → editable text
+        # Start with text box visible (manual task default)
         self.kanban_text.pack(fill=tk.BOTH, expand=True)
-
         ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=5)
 
-        # --- Progress Log ---
+        # ---- Progress Section (always below description) ----
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
         self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
         self.kanban_progress.pack(fill=tk.BOTH, expand=True)
@@ -451,16 +455,16 @@ class TaskApp(tk.Tk):
         outlook_id = row["outlook_id"]
 
         # ---- Description Display ----
+        # Outlook imported task → show HTML preview (read-only)
         if outlook_id and HAS_HTML:
-            # Outlook imported → show HTML (read-only)
             clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            if os.name == "nt":  # smaller font on Windows
-                clean = f"<div style='font-size:9pt'>{clean}</div>"
+            if os.name == "nt":  # reduce font size on Windows
+                clean = f"<div style='font-size:9pt; line-height:1.3'>{clean}</div>"
 
-            # Hide text box, show HTML
-            self.kanban_text.pack_forget()
+            self.kanban_text.pack_forget()  # hide text box
             self.kanban_html.set_html(clean)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True)
+            # ensure description always appears ABOVE progress log
+            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
 
         else:
             # Manual / CSV → editable Text
