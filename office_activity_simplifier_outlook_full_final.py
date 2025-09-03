@@ -610,36 +610,28 @@ class TaskApp(tk.Tk):
                 due_date = r['due_date']
                 prio = r['priority']
 
-                # --- Priority icons ---
-                if os.name == "nt":  # Windows → use text + color
-                    if prio == "High":
-                        icon, color = "●", "red"
-                    elif prio == "Medium":
-                        icon, color = "●", "orange"
-                    else:
-                        icon, color = "●", "green"
-                else:  # macOS/Linux → use emoji
-                    if prio == "High":
-                        icon, color = "🔴", "black"
-                    elif prio == "Medium":
-                        icon, color = "🟠", "black"
-                    else:
-                        icon, color = "🟢", "black"
+                # --- Priority labels (works on Windows & macOS) ---
+                if prio == "High":
+                    label, color = "[HIGH]", "red"
+                elif prio == "Medium":
+                    label, color = "[MED]", "orange"
+                else:
+                    label, color = "[LOW]", "green"
 
-                display = f"{icon} [{task_id}] {title}"
+                display = f"{label} [{task_id}] {title}"
 
                 idx = lb.size()
                 lb.insert(tk.END, display)
+                lb.itemconfig(idx, fg=color)
 
-                # --- Overdue & Today highlighting ---
+                # --- Overdue & Today highlighting (background only) ---
                 if due_date:
                     try:
                         due = datetime.strptime(due_date, "%Y-%m-%d").date()
-
                         if due < today:  # Overdue
-                            lb.itemconfig(idx, bg="#FFCCCC", fg="black")
+                            lb.itemconfig(idx, bg="#FFCCCC")
                         elif due == today:  # Due today
-                            lb.itemconfig(idx, bg="#FFFACD", fg="black")
+                            lb.itemconfig(idx, bg="#FFFACD")
                     except Exception:
                         pass
 
