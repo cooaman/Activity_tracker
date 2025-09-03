@@ -1,4 +1,6 @@
-pyinstaller
-pywin32
-tkhtmlview
-win10toast
+pyinstaller        # for packaging into an exe/app
+pywin32; platform_system == "Windows"   # Outlook integration
+win10toast; platform_system == "Windows" # Windows toast notifications
+tkhtmlview         # render HTML emails
+ttkbootstrap       # modern themes, dark mode support
+markdown           # future: rich-text / markdown descriptions
