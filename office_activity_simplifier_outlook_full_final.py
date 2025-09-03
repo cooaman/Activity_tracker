@@ -1,3 +1,6 @@
+
+import sys
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3, json, os, csv
@@ -69,14 +72,19 @@ class TaskDB:
                 updated_at TEXT,
                 done_at TEXT,
                 outlook_id TEXT,
-                progress_log TEXT
+                progress_log TEXT,
+                attachments TEXT
             );"""
         )
-        for col in ["outlook_id", "progress_log"]:
+
+        # Ensure schema migrations (if db already exists but lacks these columns)
+        for col in ["outlook_id", "progress_log", "attachments"]:
             try:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT;")
             except sqlite3.OperationalError:
+                # Column already exists → ignore
                 pass
+
         self.conn.commit()
 
     def add(self, title, description, due_date, priority, status="Pending", outlook_id=None):
@@ -168,6 +176,129 @@ class TaskDB:
 
     # -------------------- App --------------------
 class TaskApp(tk.Tk):
+
+
+    def _open_selected_kanban_attachments(self):
+        if not self.kanban_selected_id:
+            messagebox.showwarning("No Task", "Please select a task first.")
+            return
+
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT attachments FROM tasks WHERE id=?", (self.kanban_selected_id,))
+        row = cur.fetchone()
+        if not row or not row["attachments"]:
+            messagebox.showinfo("No Attachments", "No attachments found for this task.")
+            return
+
+        files = json.loads(row["attachments"])
+        for f in files:
+            try:
+                if os.name == "nt":  # Windows
+                    os.startfile(f)
+                elif sys.platform == "darwin":  # macOS
+                    os.system(f"open '{f}'")
+                else:  # Linux
+                    os.system(f"xdg-open '{f}'")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open {f}: {e}")
+
+
+    def _add_attachment(self):
+        path = filedialog.askopenfilename()
+        if not path:
+            return
+        os.makedirs("attachments", exist_ok=True)
+        fname = os.path.basename(path)
+        dest = os.path.join("attachments", fname)
+
+        # If duplicate filename, append timestamp
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(fname)
+            dest = os.path.join("attachments", f"{base}_{int(datetime.now().timestamp())}{ext}")
+
+        with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
+            fdst.write(fsrc.read())
+
+        # Update DB
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No Task", "Select a task first.")
+            return
+        task_id = int(self.tree.item(sel[0], "values")[0])
+
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone()
+        files = json.loads(row["attachments"] or "[]")
+        files.append(dest)
+        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(files), task_id))
+        self.db.conn.commit()
+
+        self.attachments_var.set(", ".join(os.path.basename(f) for f in files))
+        messagebox.showinfo("Attachment", f"File {os.path.basename(dest)} added.")
+
+
+    def _open_attachment(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No Task", "Select a task first.")
+            return
+        task_id = int(self.tree.item(sel[0], "values")[0])
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone()
+        if not row or not row["attachments"]:
+            messagebox.showinfo("No Attachments", "No attachments found for this task.")
+            return
+        files = json.loads(row["attachments"])
+        for f in files:
+            if os.name == "nt":  # Windows
+                os.startfile(f)
+            elif sys.platform == "darwin":  # macOS
+                os.system(f"open '{f}'")
+            else:  # Linux
+                os.system(f"xdg-open '{f}'")
+
+
+    def _on_kanban_drag_start(self, event):
+        lb = event.widget
+        idx = lb.nearest(event.y)
+        if idx >= 0:
+            self.drag_data = {
+                "listbox": lb,
+                "index": idx,
+                "task_line": lb.get(idx)
+        }
+
+    def _on_kanban_drag_motion(self, event):
+        lb = event.widget
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(lb.nearest(event.y))
+
+    def _on_kanban_drag_drop(self, event):
+        if not hasattr(self, "drag_data"):
+            return
+        src_lb = self.drag_data["listbox"]
+        line = self.drag_data["task_line"]
+
+        match = re.search(r"\[(\d+)\]", line)
+        if not match:
+            return
+        task_id = int(match.group(1))
+
+        src_lb.delete(self.drag_data["index"])
+
+        # Detect target listbox (drop column)
+        widget = event.widget.winfo_containing(event.x_root, event.y_root)
+        target_lb = widget if isinstance(widget, tk.Listbox) else None
+
+        if target_lb and hasattr(target_lb, "status_name"):
+            target_lb.insert(tk.END, line)
+            self._move_task(task_id, target_lb.status_name)
+
+        self.drag_data = None
+
+
     def __init__(self):
         super().__init__()
         self.title("Office Activity Simplifier")
@@ -242,6 +373,8 @@ class TaskApp(tk.Tk):
             self.tree.column("due", width=100, anchor="center")
             self.tree.column("priority", width=100, anchor="center")
             self.tree.column("status", width=100, anchor="center")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
 
         form = ttk.LabelFrame(list_tab, text="Task Details", padding=10)
         form.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -275,6 +408,7 @@ class TaskApp(tk.Tk):
         ttk.Button(btns, text="Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
 
         # -------------------- Kanban Board --------------------
+        # -------------------- Kanban Board --------------------
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.kanban_tab, text="Kanban Board")
 
@@ -286,11 +420,19 @@ class TaskApp(tk.Tk):
             col = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
             col.grid(row=0, column=idx, sticky="nsew", padx=6)
             frame.columnconfigure(idx, weight=2)
+
             ttk.Label(col, text=status, font=("", 12, "bold")).pack()
+
             lb = tk.Listbox(col, height=45, width=55, selectmode=tk.EXTENDED)
             lb.pack(fill=tk.BOTH, expand=True)
             lb.status_name = status
+
+            # Selection + Drag & Drop bindings
             lb.bind("<<ListboxSelect>>", self._kanban_select)
+            lb.bind("<ButtonPress-1>", self._on_kanban_drag_start)
+            lb.bind("<B1-Motion>", self._on_kanban_drag_motion)
+            lb.bind("<ButtonRelease-1>", self._on_kanban_drag_drop)
+
             self.kanban_lists[status] = lb
 
         # Right side details panel
@@ -324,6 +466,24 @@ class TaskApp(tk.Tk):
         self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
         self.kanban_progress.pack(fill=tk.BOTH, expand=True)
         ttk.Button(desc_frame, text="Update Progress", command=self._update_progress).pack(pady=5)
+
+        # ---- Attachments Section ----
+        ttk.Label(desc_frame, text="Attachments").pack(anchor="w", pady=(10, 0))
+        self.kanban_attachments_var = tk.StringVar()
+        self.kanban_attachments_label = ttk.Label(desc_frame, textvariable=self.kanban_attachments_var, wraplength=350)
+        self.kanban_attachments_label.pack(anchor="w", fill=tk.X, pady=2)
+
+        ttk.Button(desc_frame, text="Open Attachments", command=self._open_selected_kanban_attachments).pack(anchor="w", pady=2)
+
+
+        ttk.Label(form, text="Attachments").grid(row=3, column=0, sticky="w")
+        self.attachments_var = tk.StringVar()
+        self.attachments_label = ttk.Label(form, textvariable=self.attachments_var, wraplength=300)
+        self.attachments_label.grid(row=3, column=1, sticky="w")
+
+        ttk.Button(form, text="Add File", command=self._add_attachment).grid(row=3, column=2, padx=5)
+        ttk.Button(form, text="Open", command=self._open_attachment).grid(row=3, column=3, padx=5)
+
 
         # --- Action Buttons ---
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
@@ -392,12 +552,31 @@ class TaskApp(tk.Tk):
 
     def _on_select(self, event):
         sel = self.tree.selection()
-        if not sel: return
+        if not sel:
+            return
         vals = self.tree.item(sel[0], "values")
         task_id = int(vals[0])
-        self.title_var.set(vals[1]); self.due_var.set(vals[2]); self.priority_var.set(vals[3]); self.status_var.set(vals[4])
-        cur = self.db.conn.cursor(); cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
-        row = cur.fetchone(); self.desc_text.delete("1.0", tk.END); self.desc_text.insert(tk.END, row[0] if row else "")
+
+        # Fill form fields
+        self.title_var.set(vals[1])
+        self.due_var.set(vals[2] if len(vals) > 2 else "")
+        self.priority_var.set(vals[3] if len(vals) > 3 else "Medium")
+        self.status_var.set(vals[4] if len(vals) > 4 else "Pending")
+
+        # Fetch full description + attachments
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT description, attachments FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone()
+
+        self.desc_text.delete("1.0", tk.END)
+        if row and row["description"]:
+            self.desc_text.insert(tk.END, row["description"])
+
+        if row and row["attachments"]:
+            files = json.loads(row["attachments"])
+            self.attachments_var.set(", ".join(os.path.basename(f) for f in files))
+        else:
+            self.attachments_var.set("")
 
     
     
@@ -421,63 +600,87 @@ class TaskApp(tk.Tk):
     def _populate_kanban(self):
         for lb in self.kanban_lists.values():
             lb.delete(0, tk.END)
+
+        today = date.today()
+
         for status, lb in self.kanban_lists.items():
             for r in self.db.fetch_by_status(status):
-                display = f"[{r['id']}] {r['title']}"
+                task_id = r['id']
+                title = r['title']
+                due_date = r['due_date']
+                prio = r['priority']
+
+                # --- Priority icons ---
+                if prio == "High":
+                    icon = "🔴"
+                elif prio == "Medium":
+                    icon = "🟠"
+                else:
+                    icon = "🟢"
+
+                display = f"{icon} [{task_id}] {title}"
+
                 idx = lb.size()
                 lb.insert(tk.END, display)
 
-                if r["priority"] == "High":
-                    lb.itemconfig(idx, fg="red")
-                elif r["priority"] == "Medium":
-                    lb.itemconfig(idx, fg="orange")
-                else:
-                    lb.itemconfig(idx, fg="green")
-
-                if r["due_date"] and r["status"] != "Done":
+                # --- Overdue & Today highlighting ---
+                if due_date:
                     try:
-                        if datetime.strptime(r["due_date"], "%Y-%m-%d").date() < date.today():
-                            lb.itemconfig(idx, fg="red", font=("TkDefaultFont", 10, "bold"))
-                    except:
+                        due = datetime.strptime(due_date, "%Y-%m-%d").date()
+
+                        if due < today:  # Overdue
+                            lb.itemconfig(idx, bg="#FFCCCC", fg="black")
+                        elif due == today:  # Due today
+                            lb.itemconfig(idx, bg="#FFFACD", fg="black")
+                    except Exception:
                         pass
 
     # -------------------- Kanban Actions --------------------
-    def _kanban_select(self, event):
+    def  _kanban_select(self, event):
         lb = event.widget
         idx = lb.curselection()
         if not idx:
             return
 
         line = lb.get(idx[0])
-        task_id = int(line.split("]")[0][1:])
+        line = lb.get(idx[0])
+        match = re.search(r"\[(\d+)\]", line)
+        if not match:
+            return
+        task_id = int(match.group(1))
         self.kanban_selected_id = task_id
         self.kanban_selected_status = lb.status_name
 
         cur = self.db.conn.cursor()
         cur.execute("SELECT description, progress_log, outlook_id FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone()
+        if not row:
+            messagebox.showwarning("Error", "Task not found in database.")
+            return
+
         desc = row["description"] or ""
         prog = row["progress_log"] or ""
         outlook_id = row["outlook_id"]
 
-        # ---- Description Display ----
-        # Outlook imported task → show HTML preview (read-only)
-        # Outlook imported task → show HTML preview (read-only)
-        # ---- Description Display ----
+        # --- Description ---
         if outlook_id and HAS_HTML:
-            import re
-            clean = re.sub(r'<style.*?>.*?</style>', '', desc, flags=re.DOTALL | re.IGNORECASE)
-            clean = re.sub(r'<font.*?>', '', clean, flags=re.IGNORECASE)
-            clean = clean.replace("</font>", "")
-            if os.name == "nt":  # Windows
-                clean = f"<div style='font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3'>{clean}</div>"
-            else:  # macOS/Linux
-                clean = f"<div style='font-family:Arial; font-size:11px; line-height:1.3'>{clean}</div>"
+            clean = desc
+            clean = re.sub(r'<style.*?>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+            clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE).replace("</font>", "")
+            clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+            clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+            clean = re.sub(r'<span[^>]*>', '<span>', clean, flags=re.IGNORECASE)
+
+            if os.name == "nt":
+                wrapper_style = "font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3; color:#333;"
+            else:
+                wrapper_style = "font-family:Arial; font-size:11px; line-height:1.3; color:#333;"
+
+            clean = f"<div style='{wrapper_style}'>{clean}</div>"
 
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
             self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
-
         else:
             if HAS_HTML:
                 self.kanban_html.pack_forget()
@@ -485,18 +688,26 @@ class TaskApp(tk.Tk):
             self.kanban_text.insert(tk.END, desc)
             self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
 
-        # ---- Progress Log ----
+        # --- Progress Log ---
         self.kanban_progress.delete("1.0", tk.END)
         self.kanban_progress.insert(tk.END, prog)
 
-        # ---- Enable action buttons ----
+
+        # --- Attachments ---
+        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
+        row2 = cur.fetchone()
+        if row2 and row2["attachments"]:
+            files = json.loads(row2["attachments"])
+            self.kanban_attachments_var.set(", ".join(os.path.basename(f) for f in files))
+        else:
+            self.kanban_attachments_var.set("No attachments")
+
+        # --- Enable buttons ---
         self.btn_edit.config(state="normal")
         self.btn_delete.config(state="normal")
         self.btn_done.config(state="normal")
         self.btn_prev.config(state="normal" if self.kanban_selected_status != "Pending" else "disabled")
         self.btn_next.config(state="normal" if self.kanban_selected_status != "Done" else "disabled")
-
-
 
 
     def _edit_selected_kanban(self):
@@ -584,6 +795,17 @@ class TaskApp(tk.Tk):
 
             for item in flagged_items:
                 if getattr(item, "Class", 0) == 43:  # MailItem
+                    attachments = []
+                    try:
+                        if item.Attachments.Count > 0:
+                            os.makedirs("attachments", exist_ok=True)
+                            for att in item.Attachments:
+                                fname = os.path.join("attachments", att.FileName)
+                                att.SaveAsFile(fname)
+                                attachments.append(fname)
+                    except Exception as e:
+                        print("Attachment import error:", e)
+
                     due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
                     desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
                     flagged.append({
@@ -592,7 +814,8 @@ class TaskApp(tk.Tk):
                         "due_date": due,
                         "priority": "Medium",
                         "status": "Pending",
-                        "outlook_id": item.EntryID
+                        "outlook_id": item.EntryID,
+                        "attachments": json.dumps(attachments)
                     })
 
             # recurse into subfolders
