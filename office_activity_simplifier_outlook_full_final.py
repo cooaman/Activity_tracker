@@ -610,21 +610,30 @@ class TaskApp(tk.Tk):
                 due_date = r['due_date']
                 prio = r['priority']
 
-                # --- Priority labels (works on Windows & macOS) ---
-                if prio == "High":
-                    label, color = "[HIGH]", "red"
-                elif prio == "Medium":
-                    label, color = "[MED]", "orange"
-                else:
-                    label, color = "[LOW]", "green"
+                # --- Priority dots ---
+                if os.name == "nt":  # Windows → use colored ●
+                    icon = "●"
+                    if prio == "High":
+                        color = "red"
+                    elif prio == "Medium":
+                        color = "orange"
+                    else:
+                        color = "green"
+                else:  # macOS/Linux → use emoji dots
+                    if prio == "High":
+                        icon, color = "🔴", "black"
+                    elif prio == "Medium":
+                        icon, color = "🟠", "black"
+                    else:
+                        icon, color = "🟢", "black"
 
-                display = f"{label} [{task_id}] {title}"
+                display = f"{icon} [{task_id}] {title}"
 
                 idx = lb.size()
                 lb.insert(tk.END, display)
                 lb.itemconfig(idx, fg=color)
 
-                # --- Overdue & Today highlighting (background only) ---
+                # --- Overdue & Today highlighting ---
                 if due_date:
                     try:
                         due = datetime.strptime(due_date, "%Y-%m-%d").date()
@@ -663,14 +672,29 @@ class TaskApp(tk.Tk):
         outlook_id = row["outlook_id"]
 
         # --- Description ---
+        # --- Description ---
         if outlook_id and HAS_HTML:
-            clean = desc
-            clean = re.sub(r'<style.*?>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
-            clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE).replace("</font>", "")
-            clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean, flags=re.IGNORECASE)
-            clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean, flags=re.IGNORECASE)
-            clean = re.sub(r'<span[^>]*>', '<span>', clean, flags=re.IGNORECASE)
+            clean = desc or ""
 
+            # Strip <style> sections
+            clean = re.sub(r'<style.*?>.*?</style>', '', clean,
+                        flags=re.DOTALL | re.IGNORECASE)
+
+            # Strip <font ...> tags
+            clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE)
+            clean = clean.replace("</font>", "")
+
+            # Strip inline font-family and font-size
+            clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean,
+                        flags=re.IGNORECASE)
+            clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean,
+                        flags=re.IGNORECASE)
+
+            # Replace spans with plain spans
+            clean = re.sub(r'<span[^>]*>', '<span>', clean,
+                        flags=re.IGNORECASE)
+
+            # Final wrapper → enforce **our** font
             if os.name == "nt":
                 wrapper_style = "font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3; color:#333;"
             else:
