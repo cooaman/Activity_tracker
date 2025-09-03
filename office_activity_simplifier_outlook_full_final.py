@@ -611,12 +611,20 @@ class TaskApp(tk.Tk):
                 prio = r['priority']
 
                 # --- Priority icons ---
-                if prio == "High":
-                    icon = "🔴"
-                elif prio == "Medium":
-                    icon = "🟠"
-                else:
-                    icon = "🟢"
+                if os.name == "nt":  # Windows → use text + color
+                    if prio == "High":
+                        icon, color = "●", "red"
+                    elif prio == "Medium":
+                        icon, color = "●", "orange"
+                    else:
+                        icon, color = "●", "green"
+                else:  # macOS/Linux → use emoji
+                    if prio == "High":
+                        icon, color = "🔴", "black"
+                    elif prio == "Medium":
+                        icon, color = "🟠", "black"
+                    else:
+                        icon, color = "🟢", "black"
 
                 display = f"{icon} [{task_id}] {title}"
 
