@@ -456,23 +456,30 @@ class TaskApp(tk.Tk):
 
         # ---- Description Display ----
         # Outlook imported task → show HTML preview (read-only)
+        # Outlook imported task → show HTML preview (read-only)
         if outlook_id and HAS_HTML:
-            clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            if os.name == "nt":  # reduce font size on Windows
-                clean = f"<div style='font-size:9pt; line-height:1.3'>{clean}</div>"
+            import re
+            # Strip Outlook styles & enforce font
+            clean = re.sub(r'<style.*?>.*?</style>', '', desc, flags=re.DOTALL | re.IGNORECASE)
+            clean = re.sub(r'<font.*?>', '', clean, flags=re.IGNORECASE)
+            clean = clean.replace("</font>", "")
+            if os.name == "nt":  # Windows font
+                clean = f"<div style='font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3'>{clean}</div>"
+            else:  # Non-Windows font
+                clean = f"<div style='font-family:Arial; font-size:11px; line-height:1.3'>{clean}</div>"
 
-            self.kanban_text.pack_forget()  # hide text box
+            self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
-            # ensure description always appears ABOVE progress log
             self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
 
+        # Manual / CSV task → editable Text box
         else:
-            # Manual / CSV → editable Text
-            if HAS_HTML and self.kanban_html.winfo_ismapped():
+            if HAS_HTML:
                 self.kanban_html.pack_forget()
-            self.kanban_text.pack(fill=tk.BOTH, expand=True)
             self.kanban_text.delete("1.0", tk.END)
             self.kanban_text.insert(tk.END, desc)
+            # ensure description always ABOVE progress log
+            self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
 
         # ---- Progress Log ----
         self.kanban_progress.delete("1.0", tk.END)
