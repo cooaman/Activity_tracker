@@ -214,11 +214,9 @@ class TaskApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         # -------------------- Task List --------------------
-        # Task List
         list_tab = ttk.Frame(self.notebook)
         self.notebook.add(list_tab, text="Task List")
 
-        # Columns depend on settings
         if self.settings.get("show_description", False):
             cols = ["id", "title", "desc", "due", "priority", "status"]
         else:
@@ -229,20 +227,19 @@ class TaskApp(tk.Tk):
 
         for col in cols:
             self.tree.heading(col, text=col.title(),
-                      command=lambda _col=col: self._treeview_sort_column(_col, False))
+                    command=lambda _col=col: self._treeview_sort_column(_col, False))
 
-        # Apply widths
         if self.settings.get("show_description", False):
-            self.tree.column("id", width=50, anchor="center")  # ~5%
-            self.tree.column("title", width=350, anchor="w")   # ~35%
-            self.tree.column("desc", width=350, anchor="w")    # ~35%
+            self.tree.column("id", width=50, anchor="center")
+            self.tree.column("title", width=350, anchor="w")
+            self.tree.column("desc", width=350, anchor="w")
             self.tree.column("due", width=100, anchor="center")
             self.tree.column("priority", width=100, anchor="center")
             self.tree.column("status", width=100, anchor="center")
         else:
-            self.tree.column("id", width=80, anchor="center")   # ~10%
-            self.tree.column("title", width=480, anchor="w")    # ~60%
-            self.tree.column("due", width=100, anchor="center") # ~10%
+            self.tree.column("id", width=80, anchor="center")
+            self.tree.column("title", width=480, anchor="w")
+            self.tree.column("due", width=100, anchor="center")
             self.tree.column("priority", width=100, anchor="center")
             self.tree.column("status", width=100, anchor="center")
 
@@ -301,32 +298,24 @@ class TaskApp(tk.Tk):
         desc_frame.grid(row=0, column=len(STATUSES), sticky="nsew", padx=6)
         frame.columnconfigure(len(STATUSES), weight=1)
 
+        # --- Task Description / Email ---
         ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
 
-        if HAS_HTML:
-            # HTML for Outlook tasks (hidden by default until selected)
-            self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15)
-            # Text for manual/CSV tasks (hidden by default until selected)
-            self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
-        else:
-            # No HTML support → always fallback to Text
-            self.kanban_html = None
-            self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
+        self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15) if HAS_HTML else None
+        self.kanban_text = tk.Text(desc_frame, wrap="word", height=15, width=50)
 
-        # Don’t pack yet — pack() will be decided in _kanban_select()
+        # Default → editable text
+        self.kanban_text.pack(fill=tk.BOTH, expand=True)
+
         ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=5)
 
-        # --- Progress Log Section ---
+        # --- Progress Log ---
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
         self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
         self.kanban_progress.pack(fill=tk.BOTH, expand=True)
         ttk.Button(desc_frame, text="Update Progress", command=self._update_progress).pack(pady=5)
 
-        ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
-        self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
-        self.kanban_progress.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(desc_frame, text="Update Progress", command=self._update_progress).pack(pady=5)
-
+        # --- Action Buttons ---
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
         action_frame.pack(fill=tk.X)
         self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled"); self.btn_edit.pack(side=tk.LEFT, padx=5)
@@ -334,7 +323,6 @@ class TaskApp(tk.Tk):
         self.btn_done = ttk.Button(action_frame, text="Mark Done", command=self._mark_done_selected_kanban, state="disabled"); self.btn_done.pack(side=tk.LEFT, padx=5)
         self.btn_prev = ttk.Button(action_frame, text="← Move Previous", command=self._move_prev_selected, state="disabled"); self.btn_prev.pack(side=tk.LEFT, padx=5)
         self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled"); self.btn_next.pack(side=tk.LEFT, padx=5)
-
     # -------------------- CRUD --------------------
     def _validate_form(self):
         title = self.title_var.get().strip()
@@ -447,7 +435,7 @@ class TaskApp(tk.Tk):
     def _kanban_select(self, event):
         lb = event.widget
         idx = lb.curselection()
-        if not idx: 
+        if not idx:
             return
 
         line = lb.get(idx[0])
@@ -462,32 +450,39 @@ class TaskApp(tk.Tk):
         prog = row["progress_log"] or ""
         outlook_id = row["outlook_id"]
 
-        # Outlook imported task → show HTML preview (read-only)
+        # ---- Description Display ----
         if outlook_id and HAS_HTML:
+            # Outlook imported → show HTML (read-only)
             clean = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            if os.name == "nt":  # reduce font size on Windows
-                clean = f"<div style='font-size:8pt'>{clean}</div>"
+            if os.name == "nt":  # smaller font on Windows
+                clean = f"<div style='font-size:9pt'>{clean}</div>"
+
+            # Hide text box, show HTML
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
             self.kanban_html.pack(fill=tk.BOTH, expand=True)
 
-        # Manual / CSV task → editable Text box
         else:
-            if HAS_HTML:
+            # Manual / CSV → editable Text
+            if HAS_HTML and self.kanban_html.winfo_ismapped():
                 self.kanban_html.pack_forget()
             self.kanban_text.pack(fill=tk.BOTH, expand=True)
             self.kanban_text.delete("1.0", tk.END)
             self.kanban_text.insert(tk.END, desc)
 
-        # Update progress log
+        # ---- Progress Log ----
         self.kanban_progress.delete("1.0", tk.END)
         self.kanban_progress.insert(tk.END, prog)
 
+        # ---- Enable action buttons ----
         self.btn_edit.config(state="normal")
         self.btn_delete.config(state="normal")
         self.btn_done.config(state="normal")
         self.btn_prev.config(state="normal" if self.kanban_selected_status != "Pending" else "disabled")
         self.btn_next.config(state="normal" if self.kanban_selected_status != "Done" else "disabled")
+
+
+
 
     def _edit_selected_kanban(self):
         if not self.kanban_selected_id: return
