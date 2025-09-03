@@ -300,7 +300,7 @@ class TaskApp(tk.Tk):
 
         # --- Task Description / Email ---
         # ---- Description Section (always on top) ----
-        ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
+       # ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
 
         if HAS_HTML:
             self.kanban_html = HTMLLabel(desc_frame, html="", width=50, height=15)
@@ -310,8 +310,14 @@ class TaskApp(tk.Tk):
             self.kanban_text = self.kanban_html
 
         # Start with text box visible (manual task default)
+        # ---- Description Section (always on top) ----
+        ttk.Label(desc_frame, text="Task Description / Email").pack(anchor="w")
+
         self.kanban_text.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc).pack(pady=5)
+
+        # Save button should always come **after description**
+        self.btn_save_desc = ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc)
+        self.btn_save_desc.pack(pady=5, after=self.kanban_text)
 
         # ---- Progress Section (always below description) ----
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
@@ -459,14 +465,23 @@ class TaskApp(tk.Tk):
         # Outlook imported task → show HTML preview (read-only)
         if outlook_id and HAS_HTML:
             import re
-            # Strip Outlook styles & enforce font
+            # Remove Outlook styles, font tags, spans with inline font-size
             clean = re.sub(r'<style.*?>.*?</style>', '', desc, flags=re.DOTALL | re.IGNORECASE)
             clean = re.sub(r'<font.*?>', '', clean, flags=re.IGNORECASE)
             clean = clean.replace("</font>", "")
-            if os.name == "nt":  # Windows font
-                clean = f"<div style='font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3'>{clean}</div>"
-            else:  # Non-Windows font
-                clean = f"<div style='font-family:Arial; font-size:11px; line-height:1.3'>{clean}</div>"
+            clean = re.sub(r'style="[^"]*"', '', clean, flags=re.IGNORECASE)  # strip inline styles
+            clean = re.sub(r'<span[^>]*>', '', clean, flags=re.IGNORECASE)
+            clean = clean.replace("</span>", "")
+
+            # Force our own font
+            if os.name == "nt":  # Windows
+                clean = f"<div style='font-family:Segoe UI, Arial; font-size:8pt; line-height:1.2'>{clean}</div>"
+            else:  # macOS/Linux
+                clean = f"<div style='font-family:Arial; font-size:10px; line-height:1.2'>{clean}</div>"
+
+            self.kanban_text.pack_forget()
+            self.kanban_html.set_html(clean)
+            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
 
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
