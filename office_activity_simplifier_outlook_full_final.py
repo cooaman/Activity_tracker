@@ -463,38 +463,27 @@ class TaskApp(tk.Tk):
         # ---- Description Display ----
         # Outlook imported task → show HTML preview (read-only)
         # Outlook imported task → show HTML preview (read-only)
+        # ---- Description Display ----
         if outlook_id and HAS_HTML:
             import re
-            # Remove Outlook styles, font tags, spans with inline font-size
             clean = re.sub(r'<style.*?>.*?</style>', '', desc, flags=re.DOTALL | re.IGNORECASE)
             clean = re.sub(r'<font.*?>', '', clean, flags=re.IGNORECASE)
             clean = clean.replace("</font>", "")
-            clean = re.sub(r'style="[^"]*"', '', clean, flags=re.IGNORECASE)  # strip inline styles
-            clean = re.sub(r'<span[^>]*>', '', clean, flags=re.IGNORECASE)
-            clean = clean.replace("</span>", "")
-
-            # Force our own font
             if os.name == "nt":  # Windows
-                clean = f"<div style='font-family:Segoe UI, Arial; font-size:8pt; line-height:1.2'>{clean}</div>"
+                clean = f"<div style='font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3'>{clean}</div>"
             else:  # macOS/Linux
-                clean = f"<div style='font-family:Arial; font-size:10px; line-height:1.2'>{clean}</div>"
+                clean = f"<div style='font-family:Arial; font-size:11px; line-height:1.3'>{clean}</div>"
 
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
+            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
 
-            self.kanban_text.pack_forget()
-            self.kanban_html.set_html(clean)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
-
-        # Manual / CSV task → editable Text box
         else:
             if HAS_HTML:
                 self.kanban_html.pack_forget()
             self.kanban_text.delete("1.0", tk.END)
             self.kanban_text.insert(tk.END, desc)
-            # ensure description always ABOVE progress log
-            self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.kanban_progress)
+            self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
 
         # ---- Progress Log ----
         self.kanban_progress.delete("1.0", tk.END)
