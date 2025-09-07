@@ -5,14 +5,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3, json, os, csv
 from datetime import datetime, date, timedelta
-# Put these imports near top of file with other imports
-import traceback
-# keep existing `try: import win32com.client ...` logic as is
+import threading
+
 # Optional Windows-specific/outlook imports
 try:
     import win32com.client
     HAS_OUTLOOK = True
 except Exception:
+    win32com = None
     HAS_OUTLOOK = False
 
 # Safe import for win10toast: don't allow import-time pkg_errors to kill the app.
@@ -66,15 +66,15 @@ def _now_iso():
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
-            with open(SETTINGS_FILE, "r") as f:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
-    return {"outlook_refresh_minutes": 30, "show_description": False, "default_theme": "Light"}
+    return {"outlook_refresh_minutes": 30, "show_description": False}
 
 
 def save_settings(settings):
-    with open(SETTINGS_FILE, "w") as f:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f)
 
 
@@ -126,11 +126,11 @@ class _ToolTip:
 # -------------------- Database --------------------
 class TaskDB:
     def __init__(self, path=DB_FILE):
-        # Allow access from background threads
+        # allow cross-thread use for small app; we ensure UI updates run on main thread
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
-        # WAL for better concurrency
+        # WAL for slightly better concurrency
         try:
             self.conn.execute("PRAGMA journal_mode=WAL;")
         except Exception:
@@ -160,7 +160,7 @@ class TaskDB:
             );"""
         )
 
-        # Ensure schema migrations (if db already exists but lacks these columns)
+        # ensure schema migrations (silently ignore if column exists)
         for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_set_at", "reminder_sent_at"]:
             try:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT;")
@@ -276,27 +276,23 @@ else:
 
 class TaskApp(BaseWindow):
     def _init_styles(self):
-        """Minimal, non-invasive style initialization — restore native-looking buttons on Windows
-        and keep readable row heights. Attempts to neutralize ttkbootstrap color overrides while
-        remaining safe on macOS/Linux.
+        """Style initialization — prefer native-looking theme on Windows and avoid
+        aggressive color overrides that hide text. Keep conservative fonts and row heights.
         """
         style = ttk.Style()
-
-        # Try to leave the platform theme as-is, but on Windows prefer a native theme
-        # (vista/winnative/xpnative) if available. This helps with button colors and entry rendering.
         try:
             available = style.theme_names()
         except Exception:
             available = []
 
-        preferred_windows = ["vista", "winnative", "xpnative", "clam"]
         chosen = None
         if os.name == "nt":
+            preferred_windows = ["vista", "winnative", "xpnative", "clam"]
             for t in preferred_windows:
                 if t in available:
                     chosen = t
                     break
-        # Fallback: use current theme or first available
+
         if not chosen:
             try:
                 chosen = style.theme_use()
@@ -307,28 +303,26 @@ class TaskApp(BaseWindow):
             if chosen:
                 style.theme_use(chosen)
         except Exception:
-            # if theme switch fails, continue with whatever's available
             pass
 
-        # Fonts — keep these conservative so platform-native widgets still look right
         default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
         heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
         try:
             style.configure(".", font=default_font)
             style.configure("Treeview.Heading", font=heading_font)
             style.configure("TLabel", padding=2)
-            # Keep button padding but avoid forcing background colors that override native look.
+            # Avoid forcing background color; ensure buttons have readable text.
             style.configure("TButton", padding=6, relief="raised")
-            style.map("TButton",
-                      foreground=[("disabled", style.lookup("TButton", "foreground")),
-                                  ("!disabled", style.lookup("TButton", "foreground"))],
-                      background=[("disabled", style.lookup("TButton", "background")),
-                                  ("!disabled", style.lookup("TButton", "background"))])
+            # Force readable foreground for TButton explicitly (safe)
+            try:
+                style.configure("TButton", foreground="#000000")
+            except Exception:
+                pass
             style.configure("Treeview", rowheight=22)
         except Exception:
             pass
 
-        # Provide safe defaults for row tag colors (used by _populate)
+        # Tag colors for Treeview rows (safe defaults)
         self.tree_tag_defaults = {
             "priority_high": "#FFD6D6",
             "priority_medium": "#FFF5CC",
@@ -337,18 +331,17 @@ class TaskApp(BaseWindow):
             "evenrow": "#F6F6F6"
         }
 
-        # on Windows attempt to neutralize ttkbootstrap style palette if present
+        # If ttkbootstrap is present, try to avoid overwriting button backgrounds on Windows
         if os.name == "nt" and HAS_BOOTSTRAP:
             try:
-                # tb may have set global palette; try nudging ttk to use system colors for buttons/entries
                 style.configure("TButton", background=None)
                 style.configure("TEntry", fieldbackground=None)
             except Exception:
                 pass
 
-        # Apply background to main window to match current theme palette (non-invasive)
+        # Apply main window background from theme dictionary (safe fallback)
         try:
-            self.configure(bg=self._themes[self._current_theme]["bg"])
+            self.configure(bg=self._themes.get(self._current_theme, {}).get("bg", "#f7f7f7"))
         except Exception:
             pass
 
@@ -394,7 +387,7 @@ class TaskApp(BaseWindow):
         return f"{seconds}s"
 
     def _refresh_reminder_display(self):
-        """Update the 'reminder' cell in the Task List Treeview with live countdowns."""
+        """Update the 'reminder' column live."""
         try:
             cur = self.db.conn.cursor()
             for iid in self.tree.get_children():
@@ -453,20 +446,14 @@ class TaskApp(BaseWindow):
         finally:
             self.after(1000, self._refresh_reminder_display)
 
-    # --------------- Reminder helpers ----------------
+    # Reminder concurrency fix: track active popups to avoid duplicates
     def _schedule_task_reminder_checker(self):
-        """
-        Schedule the periodic reminder check (every few seconds).
-        Keeps rescheduling even if an error occurs so a single failure won't stop reminders.
-        """
         try:
             self._check_task_reminders()
         except Exception as e:
-            # log but keep loop alive
             print("Unhandled error during reminder check (caught):", e)
         finally:
             try:
-                # 5-second granularity for stopwatch-style reminders
                 self.after(5 * 1000, self._schedule_task_reminder_checker)
             except Exception as e:
                 print("Failed to schedule next reminder check:", e)
@@ -474,8 +461,7 @@ class TaskApp(BaseWindow):
     def _check_task_reminders(self):
         """
         Query DB for tasks whose stopwatch-style reminder target has passed.
-        Do NOT mark reminder_sent_at here. Marking happens when user dismisses/closes.
-        Avoid scheduling multiple popups for the same task by checking the in-memory set.
+        Use in-memory set self._active_reminder_popups to avoid duplicate popups.
         """
         try:
             cur = self.db.conn.cursor()
@@ -494,7 +480,7 @@ class TaskApp(BaseWindow):
                 except Exception:
                     continue
 
-                # If we already have a popup for this task open or scheduled, skip it.
+                # skip if popup already active for this task
                 if task_id in self._active_reminder_popups:
                     continue
 
@@ -517,19 +503,19 @@ class TaskApp(BaseWindow):
                         sent = None
 
                 if now_dt >= target and (sent is None or sent < target):
-                    # Mark as scheduled so other checks won't schedule again.
-                    self._active_reminder_popups.add(task_id)
-                    # schedule popup on UI thread immediately
+                    # mark as active and schedule popup on UI thread
+                    try:
+                        self._active_reminder_popups.add(task_id)
+                    except Exception:
+                        pass
                     try:
                         self.after(0, lambda _id=task_id, _t=r["title"], _d=r["description"]: self._show_reminder_popup(_id, _t, _d))
                     except Exception as e:
-                        # If scheduling fails, remove from active set so it can be retried later
+                        print("Failed to schedule reminder popup on UI thread:", e)
                         try:
                             self._active_reminder_popups.discard(task_id)
                         except Exception:
                             pass
-                        print("Failed to schedule reminder popup on UI thread:", e)
-                    # DO NOT mark reminder_sent_at here
         except Exception as e:
             print("Reminder check error:", e)
 
@@ -540,10 +526,11 @@ class TaskApp(BaseWindow):
 
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
+        # size and placement
         win.geometry("700x300")
         win.transient(self)
 
-        # Bring to front safely
+        # bring to front reliably
         try:
             win.lift()
             win.attributes("-topmost", True)
@@ -557,10 +544,6 @@ class TaskApp(BaseWindow):
             pass
 
         def _cleanup_and_close(mark_sent=False):
-            """
-            Common cleanup: optionally set reminder_sent_at (when dismissed), then remove
-            this task from active popups and destroy the popup window.
-            """
             try:
                 if mark_sent:
                     now_iso = datetime.now().isoformat(timespec="seconds")
@@ -569,7 +552,6 @@ class TaskApp(BaseWindow):
                         self.db.conn.commit()
                     except Exception as e:
                         print("Error setting reminder_sent_at:", e)
-                # remove from active popups so the task can be rescheduled later if snoozed
                 try:
                     self._active_reminder_popups.discard(task_id)
                 except Exception:
@@ -580,7 +562,6 @@ class TaskApp(BaseWindow):
                 except Exception:
                     pass
 
-        # treat window close as dismiss (same as pressing Dismiss)
         win.protocol("WM_DELETE_WINDOW", lambda: _cleanup_and_close(mark_sent=True))
 
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
@@ -595,7 +576,6 @@ class TaskApp(BaseWindow):
         btnf.pack(fill=tk.X, padx=12, pady=8)
 
         def open_task():
-            # close popup (do not mark sent) and open editor
             _cleanup_and_close(mark_sent=False)
             try:
                 self._open_edit_window(task_id)
@@ -603,10 +583,8 @@ class TaskApp(BaseWindow):
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
-            # When snoozing, restart countdown from now and clear reminder_sent_at so it can fire again.
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
-                # store integer minutes; reminder_sent_at cleared (NULL)
                 self.db.conn.execute(
                     "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?",
                     (int(minutes), new_set, task_id)
@@ -614,18 +592,24 @@ class TaskApp(BaseWindow):
                 self.db.conn.commit()
             except Exception as e:
                 print("Snooze update error:", e)
-            # remove from active set and close popup so snooze can re-fire later
             _cleanup_and_close(mark_sent=False)
 
         def dismiss():
-            # Mark as reminded now and close
             _cleanup_and_close(mark_sent=True)
 
-        ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
+        # Use tk.Button for these to avoid theme color hiding text on Windows
+        if os.name == "nt":
+            tk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
+            tk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
+            tk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
+            tk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
+            tk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
+        else:
+            ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
         try:
             win.lift()
@@ -679,13 +663,10 @@ class TaskApp(BaseWindow):
 
         win = tk.Toplevel(self)
         win.transient(self)
-        # NOTE: do NOT call grab_set() here — non-modal windows are more robust on Windows & macOS.
         win.title("Edit Task" if task_id else "Add Task")
-        # make sure window is large enough on Windows scaling; set minsize so fields won't be clipped
         win.geometry("720x600")
         win.minsize(600, 440)
 
-        # Ensure window appears on top and layout runs so widgets are visible immediately
         try:
             win.lift()
             win.attributes("-topmost", True)
@@ -710,7 +691,7 @@ class TaskApp(BaseWindow):
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        # Use grid with column weights so the right column grows and displays entries reliably
+        # grid with weights so right column expands
         frm.columnconfigure(0, weight=0)
         frm.columnconfigure(1, weight=1)
 
@@ -741,7 +722,7 @@ class TaskApp(BaseWindow):
         desc_text = tk.Text(frm, height=10, width=60, wrap="word")
         desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0))
 
-        # Load existing values if editing
+        # load existing values if editing
         if task_id:
             cur = self.db.conn.cursor()
             cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -783,8 +764,12 @@ class TaskApp(BaseWindow):
             if os.path.exists(dest):
                 base, ext = os.path.splitext(fname)
                 dest = os.path.join("attachments", f"{base}_{int(datetime.now().timestamp())}{ext}")
-            with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
-                fdst.write(fsrc.read())
+            try:
+                with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
+                    fdst.write(fsrc.read())
+            except Exception as e:
+                messagebox.showerror("Attachment Error", f"Could not copy attachment: {e}", parent=win)
+                return
 
             if task_id:
                 cur = self.db.conn.cursor()
@@ -822,8 +807,13 @@ class TaskApp(BaseWindow):
 
         btns_attach = ttk.Frame(attachments_frame)
         btns_attach.pack(anchor="w", pady=(6,0))
-        ttk.Button(btns_attach, text="Add File", command=add_file_to_attachments).pack(side=tk.LEFT)
-        ttk.Button(btns_attach, text="Open", command=open_attachments).pack(side=tk.LEFT, padx=6)
+        # Use tk.Button on Windows for reliable visible text
+        if os.name == "nt":
+            tk.Button(btns_attach, text="Add File", command=add_file_to_attachments).pack(side=tk.LEFT)
+            tk.Button(btns_attach, text="Open", command=open_attachments).pack(side=tk.LEFT, padx=6)
+        else:
+            ttk.Button(btns_attach, text="Add File", command=add_file_to_attachments).pack(side=tk.LEFT)
+            ttk.Button(btns_attach, text="Open", command=open_attachments).pack(side=tk.LEFT, padx=6)
 
         def save():
             title = title_var.get().strip()
@@ -858,14 +848,16 @@ class TaskApp(BaseWindow):
             else:
                 self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
                             reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-                # update attachments for the new task if any
+                # attach staged attachments after add
                 try:
                     cur = self.db.conn.cursor()
                     cur.execute("SELECT last_insert_rowid() as id")
-                    new_id = cur.fetchone()["id"]
-                    if staged_attachments:
-                        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
-                        self.db.conn.commit()
+                    new_row = cur.fetchone()
+                    if new_row:
+                        new_id = new_row["id"] if "id" in new_row.keys() else new_row[0]
+                        if staged_attachments:
+                            self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
+                            self.db.conn.commit()
                 except Exception:
                     pass
 
@@ -878,10 +870,13 @@ class TaskApp(BaseWindow):
 
         btn_frame = ttk.Frame(frm)
         btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
-        ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
+        if os.name == "nt":
+            tk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
+            tk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
+        else:
+            ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
 
-        # Force a final geometry/layout pass so controls render correctly on Windows with scaling
         try:
             win.update_idletasks()
         except Exception:
@@ -923,8 +918,12 @@ class TaskApp(BaseWindow):
             base, ext = os.path.splitext(fname)
             dest = os.path.join("attachments", f"{base}_{int(datetime.now().timestamp())}{ext}")
 
-        with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
-            fdst.write(fsrc.read())
+        try:
+            with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
+                fdst.write(fsrc.read())
+        except Exception as e:
+            messagebox.showerror("Attachment Error", f"Could not copy attachment: {e}")
+            return
 
         sel = self.tree.selection()
         if not sel:
@@ -1022,7 +1021,7 @@ class TaskApp(BaseWindow):
         self.drag_data = None
 
     def __init__(self):
-        # ensure themes are available before styles run
+        # define themes and current theme *before* _init_styles is called
         self._themes = {
             "Light": {
                 "bg": "#f7f7f7",
@@ -1037,17 +1036,8 @@ class TaskApp(BaseWindow):
                 "kanban_bg": "#3a3a3a",
                 "text": "#ffffff",
                 "muted": "#cccccc"
-            },
-            "Blue": {
-                "bg": "#eaf3ff",
-                "panel": "#ffffff",
-                "kanban_bg": "#f0f7ff",
-                "text": "#0a2a66",
-                "muted": "#556b9a"
             }
         }
-
-        # set current theme before any UI code reads it
         self._current_theme = "Light"
 
         # if using ttkbootstrap, the constructor signature differs a bit:
@@ -1061,8 +1051,8 @@ class TaskApp(BaseWindow):
         self.db = TaskDB()
         self.settings = load_settings()
 
-        # apply saved default theme
-        self._current_theme = self.settings.get("default_theme", self._current_theme)
+        # active reminder popups tracker
+        self._active_reminder_popups = set()
 
         self._init_styles()
 
@@ -1071,8 +1061,6 @@ class TaskApp(BaseWindow):
         self.kanban_item_map = {status: [] for status in STATUSES}
 
         self.attachments_var = tk.StringVar(value="")
-
-        self._active_reminder_popups = set()
 
         self._build_ui()
 
@@ -1084,7 +1072,8 @@ class TaskApp(BaseWindow):
         self._refresh_reminder_display()
 
         if HAS_OUTLOOK:
-            self._schedule_outlook_refresh(self.settings.get("outlook_refresh_minutes", 30))
+            # schedule outlook refresh in background after startup delay
+            self.after(2000, lambda: self._schedule_outlook_refresh(self.settings.get("outlook_refresh_minutes", 30)))
 
         self._check_reminders()
 
@@ -1103,22 +1092,31 @@ class TaskApp(BaseWindow):
         toolbar = ttk.Frame(self, padding=8)
         toolbar.pack(fill=tk.X)
 
-        # toolbar buttons with small icons (unicode) for readability on Windows
-        ttk.Button(toolbar, text="📥 Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="🔄 Refresh Outlook", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="📁 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="📅 Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="⚠️ Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="⚙️ Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
+        # toolbar buttons — use tk.Button on Windows to avoid hidden text from aggressive ttk themes
+        if os.name == "nt":
+            tk.Button(toolbar, text="📥 Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="🔄 Refresh Outlook", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="📁 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="📅 Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="⚠️ Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="⚙️ Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
+        else:
+            ttk.Button(toolbar, text="📥 Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="🔄 Refresh Outlook", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="📁 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="📅 Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="⚠️ Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="⚙️ Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
 
         ttk.Label(toolbar, text="Theme:").pack(side=tk.RIGHT, padx=(6,4))
-        self.theme_var = tk.StringVar(value=getattr(self, "_current_theme", "Light"))
+        self.theme_var = tk.StringVar(value=self._current_theme)
         theme_cb = ttk.Combobox(toolbar, textvariable=self.theme_var, values=list(self._themes.keys()), width=10, state="readonly")
         theme_cb.pack(side=tk.RIGHT, padx=(0,8))
         theme_cb.bind("<<ComboboxSelected>>", lambda e: self._set_theme(self.theme_var.get()))
 
-        # Main notebook
+        # Notebook
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
@@ -1187,11 +1185,11 @@ class TaskApp(BaseWindow):
             self.tree.column("reminder", width=120, anchor="center")
 
         try:
-            self.tree.tag_configure("priority_high", background="#FFD6D6")
-            self.tree.tag_configure("priority_medium", background="#FFF5CC")
-            self.tree.tag_configure("priority_low", background="#E6FFEA")
-            self.tree.tag_configure("oddrow", background="#FFFFFF")
-            self.tree.tag_configure("evenrow", background="#F6F6F6")
+            self.tree.tag_configure("priority_high", background=self.tree_tag_defaults["priority_high"])
+            self.tree.tag_configure("priority_medium", background=self.tree_tag_defaults["priority_medium"])
+            self.tree.tag_configure("priority_low", background=self.tree_tag_defaults["priority_low"])
+            self.tree.tag_configure("oddrow", background=self.tree_tag_defaults["oddrow"])
+            self.tree.tag_configure("evenrow", background=self.tree_tag_defaults["evenrow"])
         except Exception:
             pass
 
@@ -1200,16 +1198,20 @@ class TaskApp(BaseWindow):
 
         btns = ttk.Frame(list_tab)
         btns.pack(fill=tk.X, padx=8, pady=5)
-        btn_add = ttk.Button(btns, text="➕ Add", command=lambda: self._open_edit_window(None)); btn_add.pack(side=tk.LEFT)
-        btn_edit = ttk.Button(btns, text="✏️ Edit", command=lambda: self._open_edit_window(self._selected_tree_task_id() or None)); btn_edit.pack(side=tk.LEFT, padx=5)
-        btn_done = ttk.Button(btns, text="✅ Mark Done", command=self._mark_done); btn_done.pack(side=tk.LEFT, padx=5)
-        btn_del = ttk.Button(btns, text="🗑️ Delete", command=self._delete_task); btn_del.pack(side=tk.LEFT, padx=5)
+        # Add primary CRUD buttons; use tk.Button on Windows for visibility
+        if os.name == "nt":
+            tk.Button(btns, text="➕ Add", command=lambda: self._open_edit_window(None)).pack(side=tk.LEFT)
+            tk.Button(btns, text="✏️ Edit", command=lambda: self._open_edit_window(self._selected_tree_task_id() or None)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btns, text="✅ Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=5)
+            tk.Button(btns, text="🗑️ Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
+        else:
+            ttk.Button(btns, text="➕ Add", command=lambda: self._open_edit_window(None)).pack(side=tk.LEFT)
+            ttk.Button(btns, text="✏️ Edit", command=lambda: self._open_edit_window(self._selected_tree_task_id() or None)).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btns, text="✅ Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btns, text="🗑️ Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
 
         # tooltips
-        _ToolTip(btn_add, "Add a new task")
-        _ToolTip(btn_edit, "Edit selected task")
-        _ToolTip(btn_done, "Mark selected task as done")
-        _ToolTip(btn_del, "Delete selected task(s)")
+        _ToolTip(btns, "Toolbar with actions; select a task in the list to edit/delete")
 
         # Kanban tab
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
@@ -1591,259 +1593,142 @@ class TaskApp(BaseWindow):
         self.kanban_progress.insert(tk.END, new_log)
         self._populate_kanban()
 
-    # -------------------- Outlook / CSV / Sync (unchanged) --------------------
+    # -------------------- Outlook / CSV / Sync --------------------
     def _get_flagged_from_folder(self, folder, flagged):
         try:
             items = folder.Items
-            items.Sort("[ReceivedTime]", True)
-            flagged_items = items.Restrict("[FlagStatus] = 2")
+            # sort by ReceivedTime desc
+            try:
+                items.Sort("[ReceivedTime]", True)
+            except Exception:
+                pass
+            # restrict flagged mails where FlagStatus = 2 (flagged)
+            try:
+                flagged_items = items.Restrict("[FlagStatus] = 2")
+            except Exception:
+                flagged_items = items
             for item in flagged_items:
+                # MailItem class = 43
                 if getattr(item, "Class", 0) == 43:
                     attachments = []
                     try:
-                        if item.Attachments.Count > 0:
+                        if getattr(item, "Attachments", None) and item.Attachments.Count > 0:
                             os.makedirs("attachments", exist_ok=True)
                             for att in item.Attachments:
-                                fname = os.path.join("attachments", att.FileName)
-                                att.SaveAsFile(fname)
-                                attachments.append(fname)
+                                try:
+                                    fname = os.path.join("attachments", att.FileName)
+                                    # SaveAsFile available on Attachment object
+                                    att.SaveAsFile(fname)
+                                    attachments.append(fname)
+                                except Exception:
+                                    pass
                     except Exception as e:
                         print("Attachment import error:", e)
-                    due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                    due = None
+                    try:
+                        if getattr(item, "TaskDueDate", None):
+                            due = item.TaskDueDate.strftime("%Y-%m-%d")
+                    except Exception:
+                        due = None
                     desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
                     flagged.append({
-                        "title": f"[Mail] {item.Subject}",
+                        "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
                         "description": desc,
                         "due_date": due,
                         "priority": "Medium",
                         "status": "Pending",
-                        "outlook_id": item.EntryID,
+                        "outlook_id": getattr(item, "EntryID", None),
                         "attachments": json.dumps(attachments)
                     })
-            for sub in folder.Folders:
-                self._get_flagged_from_folder(sub, flagged)
+            # recurse into subfolders if present
+            try:
+                for sub in folder.Folders:
+                    self._get_flagged_from_folder(sub, flagged)
+            except Exception:
+                pass
         except Exception:
             pass
 
     def _get_flagged_emails(self):
-        """
-        Try to fetch flagged Outlook items. This function must be called on a thread
-        that has COM initialized (pythoncom.CoInitialize).
-        Returns: list of dict items or raises an exception with diagnostics.
-        """
         if not HAS_OUTLOOK:
-            raise RuntimeError("win32com.client not available (pywin32 not installed)")
-
-        try:
-            # Top-level COM dispatch; assume caller has initialized COM on this thread.
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        except Exception as e:
-            raise RuntimeError(f"Failed to dispatch Outlook.Application COM object: {e}")
-
+            print("Outlook not available (pywin32 not installed or running on non-Windows).")
+            return []
         flagged = []
         try:
-            # To-Do folder (tasks) — default folder 28
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            # try Tasks folder first (folder 28)
             try:
                 todo_folder = outlook.GetDefaultFolder(28)
-                for item in list(todo_folder.Items):
-                    try:
-                        if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
+                for item in todo_folder.Items:
+                    if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
+                        due = None
+                        try:
+                            if getattr(item, "DueDate", None):
+                                due = item.DueDate.strftime("%Y-%m-%d")
+                        except Exception:
                             due = None
-                            try:
-                                due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                            except Exception:
-                                due = None
-                            flagged.append({
-                                "title": f"[OM] {getattr(item, 'Subject', '(no subject)')}",
-                                "description": getattr(item, "Body", "") or "",
-                                "due_date": due,
-                                "priority": "Medium",
-                                "status": "Pending",
-                                "outlook_id": getattr(item, "EntryID", None)
-                            })
-                    except Exception:
-                        # continue for other items
-                        continue
+                        flagged.append({
+                            "title": f"[OM] {getattr(item, 'Subject', '(no subject)')}",
+                            "description": getattr(item, "Body", "") or "",
+                            "due_date": due,
+                            "priority": "Medium",
+                            "status": "Pending",
+                            "outlook_id": getattr(item, "EntryID", None)
+                        })
             except Exception as e:
-                # do not fail the whole operation if tasks fetch fails
-                print("Warning: reading To-Do folder failed:", e)
-
-            # Inbox flagged mails and other folders
+                print("To-Do List fetch error:", e)
+            # search Inbox and subfolders for flagged items
             try:
                 inbox = outlook.GetDefaultFolder(6)
-                # recursive helper to walk folders
-                def _walk_folder(folder):
-                    try:
-                        items = list(folder.Items)
-                    except Exception:
-                        return
-                    for item in items:
-                        try:
-                            # Mail class is 43; check FlagStatus for flagged messages
-                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
-                                attachments = []
-                                try:
-                                    if getattr(item, "Attachments", None):
-                                        if getattr(item.Attachments, "Count", 0) > 0:
-                                            os.makedirs("attachments", exist_ok=True)
-                                            for att in item.Attachments:
-                                                fname = os.path.join("attachments", att.FileName)
-                                                try:
-                                                    att.SaveAsFile(fname)
-                                                    attachments.append(fname)
-                                                except Exception:
-                                                    # ignore individual attachment save errors
-                                                    pass
-                                except Exception:
-                                    pass
-                                due = None
-                                try:
-                                    due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
-                                except Exception:
-                                    due = None
-                                desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "") or ""
-                                flagged.append({
-                                    "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
-                                    "description": desc,
-                                    "due_date": due,
-                                    "priority": "Medium",
-                                    "status": "Pending",
-                                    "outlook_id": getattr(item, "EntryID", None),
-                                    "attachments": json.dumps(attachments) if attachments else None
-                                })
-                        except Exception:
-                            continue
-                    # subfolders
-                    try:
-                        for sub in folder.Folders:
-                            _walk_folder(sub)
-                    except Exception:
-                        pass
-
-                _walk_folder(inbox)
+                self._get_flagged_from_folder(inbox, flagged)
             except Exception as e:
-                print("Warning: scanning Inbox failed:", e)
-
-            # Search folders like "For Follow Up"
+                print("Inbox flagged mail fetch error:", e)
+            # try search folders root
             try:
                 search_root = outlook.GetDefaultFolder(23)
-                try:
-                    for folder in list(search_root.Folders):
-                        try:
-                            if getattr(folder, "Name", "").lower() == "for follow up":
-                                # walk this folder too
-                                def _walk_flagged(f):
-                                    try:
-                                        items = list(f.Items)
-                                    except Exception:
-                                        return
-                                    for item in items:
-                                        try:
-                                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
-                                                flagged.append({
-                                                    "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
-                                                    "description": getattr(item, "Body", "") or "",
-                                                    "due_date": None,
-                                                    "priority": "Medium",
-                                                    "status": "Pending",
-                                                    "outlook_id": getattr(item, "EntryID", None)
-                                                })
-                                        except Exception:
-                                            continue
-                                    try:
-                                        for sub in f.Folders:
-                                            _walk_flagged(sub)
-                                    except Exception:
-                                        pass
-                                _walk_flagged(folder)
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            except Exception:
+                for folder in search_root.Folders:
+                    if folder.Name.lower() == "for follow up":
+                        self._get_flagged_from_folder(folder, flagged)
+            except Exception as e:
+                # not all outlook setups have folder 23 etc.
                 pass
-
         except Exception as e:
-            raise RuntimeError("Unexpected error while reading Outlook folders: " + str(e))
-
+            print("Outlook fetch error:", e)
         return flagged
 
-    import threading
-
     def _import_outlook_flags(self):
-        """
-        Wrapper that runs the blocking Outlook COM work in a background thread.
-        It initializes COM on the worker thread (pythoncom.CoInitialize) which is required for pywin32.
-        """
-        if not HAS_OUTLOOK:
-            messagebox.showwarning("Outlook Import", "Outlook integration is not available. Ensure pywin32 is installed and you're running on Windows with Outlook.")
-            return
-
-        import threading
-        try:
-            import pythoncom
-        except Exception:
-            pythoncom = None
-
+        """Run Outlook import in a background thread to avoid freezing UI."""
         def _worker():
-            # Each thread that uses COM must initialize it
+            new_count = 0
             try:
-                if pythoncom:
-                    pythoncom.CoInitialize()
-            except Exception as e:
-                print("pythoncom.CoInitialize() failed on worker thread:", e)
-
-            new_items = []
-            try:
-                flagged = []
-                try:
-                    flagged = self._get_flagged_emails()
-                except Exception as e:
-                    # capture stack for diagnostics
-                    tb = traceback.format_exc()
-                    print("Error fetching flagged emails:", e)
-                    print(tb)
-                    # schedule to inform the user on UI thread
-                    def _err_msg():
-                        messagebox.showerror("Outlook Import Error", f"Error fetching flagged Outlook items:\n{e}\n\nSee console for details.")
-                    try:
-                        self.after(0, _err_msg)
-                    except Exception:
-                        pass
-                    return
-
+                flagged = self._get_flagged_emails()
                 if flagged:
-                    try:
-                        cur = self.db.conn.cursor()
-                        for f in flagged:
-                            # skip existing by outlook_id when present
-                            out_id = f.get("outlook_id")
-                            if out_id:
-                                exists = cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (out_id,)).fetchone()
-                                if exists:
-                                    continue
+                    cur = self.db.conn.cursor()
+                    # filter out items already imported (by outlook_id)
+                    new_items = []
+                    for f in flagged:
+                        if not f.get("outlook_id"):
                             new_items.append(f)
-                        if new_items:
-                            self.db.bulk_add(new_items)
-                    except Exception as e:
-                        print("DB error while adding outlook tasks:", e)
-                # done - schedule UI update
-                def _on_done():
+                            continue
+                        exists = cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (f["outlook_id"],)).fetchone()
+                        if not exists:
+                            new_items.append(f)
                     if new_items:
-                        self._populate(); self._populate_kanban()
-                        messagebox.showinfo("Outlook Import", f"Imported {len(new_items)} new tasks.")
-                    else:
-                        messagebox.showinfo("Outlook Import", "No new flagged Outlook items found.")
-                try:
-                    self.after(0, _on_done)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    if pythoncom:
-                        pythoncom.CoUninitialize()
-                except Exception:
-                    pass
+                        self.db.bulk_add(new_items)
+                        new_count = len(new_items)
+            except Exception as e:
+                print("Background outlook import error:", e)
+
+            def _on_done():
+                if new_count:
+                    self._populate(); self._populate_kanban()
+                    messagebox.showinfo("Outlook", f"Imported {new_count} new tasks.")
+                else:
+                    messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+            try:
+                self.after(0, _on_done)
+            except Exception:
+                pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1851,7 +1736,10 @@ class TaskApp(BaseWindow):
         self._import_outlook_flags()
 
     def _schedule_outlook_refresh(self, minutes):
-        self.after(minutes*60*1000, self._refresh_outlook_flags)
+        try:
+            self.after(minutes*60*1000, self._refresh_outlook_flags)
+        except Exception:
+            pass
 
     def _sync_outlook_task(self, task_id, data, action="update"):
         if not HAS_OUTLOOK:
@@ -1865,10 +1753,11 @@ class TaskApp(BaseWindow):
                 return
             entryid = row["outlook_id"]
             item = None
+            # try Tasks folder
             try:
                 todo_folder = outlook.GetDefaultFolder(28)
                 for i in todo_folder.Items:
-                    if i.EntryID == entryid:
+                    if getattr(i, "EntryID", None) == entryid:
                         item = i
                         break
             except Exception:
@@ -1876,7 +1765,14 @@ class TaskApp(BaseWindow):
             if not item:
                 try:
                     inbox = outlook.GetDefaultFolder(6)
-                    item = inbox.Items.Find(f"[EntryID] = '{entryid}'")
+                    # Items.Find works with DASL or property comparisons; fallback to iteration
+                    try:
+                        item = inbox.Items.Find(f"[EntryID] = '{entryid}'")
+                    except Exception:
+                        for m in inbox.Items:
+                            if getattr(m, "EntryID", None) == entryid:
+                                item = m
+                                break
                 except Exception:
                     pass
             if not item:
@@ -1898,7 +1794,6 @@ class TaskApp(BaseWindow):
         path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv")])
         if not path: return
 
-        import threading
         def _worker():
             rows = []
             try:
@@ -1919,7 +1814,10 @@ class TaskApp(BaseWindow):
                     messagebox.showinfo("CSV Import", f"Imported {len(rows)} tasks.")
                 else:
                     messagebox.showinfo("CSV Import", "No tasks imported.")
-            self.after(0, _on_done)
+            try:
+                self.after(0, _on_done)
+            except Exception:
+                pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1927,10 +1825,13 @@ class TaskApp(BaseWindow):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
         if not path: return
         rows = self.db.fetch()
-        with open(path,"w",newline="",encoding="utf-8") as f:
-            writer = csv.writer(f); writer.writerow(["title","description","due_date","priority","status"])
-            for r in rows: writer.writerow([r["title"], r["description"], r["due_date"], r["priority"], r["status"]])
-        messagebox.showinfo("CSV Export", f"Exported {len(rows)} tasks.")
+        try:
+            with open(path,"w",newline="",encoding="utf-8") as f:
+                writer = csv.writer(f); writer.writerow(["title","description","due_date","priority","status"])
+                for r in rows: writer.writerow([r["title"], r["description"], r["due_date"], r["priority"], r["status"]])
+            messagebox.showinfo("CSV Export", f"Exported {len(rows)} tasks.")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not export CSV: {e}")
 
     def _save_kanban_desc(self):
         if not self.kanban_selected_id:
@@ -1993,6 +1894,7 @@ class TaskApp(BaseWindow):
             tree.insert("", tk.END, values=(r["title"], r["due_date"], r["priority"], r["status"]))
         tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+    
     # Settings
     def _open_settings(self):
         win = tk.Toplevel(self)
