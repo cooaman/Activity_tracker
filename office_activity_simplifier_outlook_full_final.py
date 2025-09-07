@@ -430,19 +430,20 @@ class TaskApp(tk.Tk):
 
     ####
     def _show_reminder_popup(self, task_id, title, description):
-        """Attractive focused reminder popup with actions. Uses safe toast wrapper."""
+        """Focused reminder popup with safe, defensive snooze/dismiss DB updates."""
         # On Windows, show a toast too (safe wrapper)
         if HAS_NOTIFY:
             _safe_show_toast(f"Reminder: {title}", description or "Task due soon")
 
-        # Create a focused popup
+        # Create popup
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
-        win.geometry("640x280")  # Increased width & height slightly
+        win.geometry("640x320")
         win.transient(self)
-        win.attributes("-topmost", True)
+        # try to keep on top & focused, but don't crash if attributes not supported
         try:
-            win.grab_set()
+            win.attributes("-topmost", True)
+            win.lift()
         except Exception:
             pass
 
@@ -450,53 +451,85 @@ class TaskApp(tk.Tk):
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
         header.pack(padx=12, pady=(12, 6), anchor="w")
 
-        # description area (scrollable if long)
-        txt = tk.Text(win, height=6, wrap="word", padx=8, pady=4)
+        # description area (read-only)
+        txt = tk.Text(win, height=8, wrap="word", padx=8, pady=4)
         txt.insert("1.0", description or "(no description)")
         txt.config(state="disabled")
         txt.pack(fill=tk.BOTH, expand=False, padx=12, pady=(0,8))
 
-        # Buttons frame
         btnf = ttk.Frame(win)
         btnf.pack(fill=tk.X, padx=12, pady=8)
 
         def open_task():
-            win.destroy()
+            try:
+                win.destroy()
+            except Exception:
+                pass
             try:
                 self._open_edit_window(task_id)
             except Exception as e:
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
+            # Defensive conversion & DB update; do not let exceptions escape
+            try:
+                minutes_int = int(minutes)
+            except Exception:
+                messagebox.showerror("Snooze Error", "Invalid snooze minutes value.")
+                return
+
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
-                self.db.conn.execute(
-                    "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=? WHERE id=?",
-                    (int(minutes), new_set, None, task_id)
-                )
-                self.db.conn.commit()
+                # use context manager so commit happens (and exceptions are raised here)
+                with self.db.conn:
+                    # set reminder_minutes and reminder_set_at, clear reminder_sent_at (NULL)
+                    self.db.conn.execute(
+                        "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=? WHERE id=?",
+                        (minutes_int, new_set, None, task_id)
+                    )
             except Exception as e:
+                # log and show non-blocking error so app does not crash
                 print("Snooze update error:", e)
-            win.destroy()
+                try:
+                    messagebox.showerror("Snooze Error", f"Could not snooze reminder: {e}")
+                except Exception:
+                    pass
+                return
+
+            # close popup after successful snooze
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
         def dismiss():
             now_iso = datetime.now().isoformat(timespec="seconds")
             try:
-                self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
-                self.db.conn.commit()
+                with self.db.conn:
+                    self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
             except Exception as e:
                 print("Dismiss update error:", e)
-            win.destroy()
+                try:
+                    messagebox.showerror("Dismiss Error", f"Could not dismiss reminder: {e}")
+                except Exception:
+                    pass
+                # still attempt to close the window
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
-        # Buttons laid out with padding so they don’t wrap
+        # Buttons — use ttk but layout is flexible
         ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
-        # visual highlight
-        win.lift()
+        try:
+            win.focus_force()
+        except Exception:
+            pass
 
     # -------------------- UI / CRUD / Kanban --------------------
     def _save_inline_from_form(self):
