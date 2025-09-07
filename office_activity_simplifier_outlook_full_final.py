@@ -5,7 +5,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3, json, os, csv
 from datetime import datetime, date, timedelta
-
+# Put these imports near top of file with other imports
+import traceback
+# keep existing `try: import win32com.client ...` logic as is
 # Optional Windows-specific/outlook imports
 try:
     import win32com.client
@@ -473,6 +475,7 @@ class TaskApp(BaseWindow):
         """
         Query DB for tasks whose stopwatch-style reminder target has passed.
         Do NOT mark reminder_sent_at here. Marking happens when user dismisses/closes.
+        Avoid scheduling multiple popups for the same task by checking the in-memory set.
         """
         try:
             cur = self.db.conn.cursor()
@@ -486,6 +489,15 @@ class TaskApp(BaseWindow):
             now_dt = datetime.now()
 
             for r in rows:
+                try:
+                    task_id = int(r["id"])
+                except Exception:
+                    continue
+
+                # If we already have a popup for this task open or scheduled, skip it.
+                if task_id in self._active_reminder_popups:
+                    continue
+
                 try:
                     rm_min = int(r["reminder_minutes"])
                 except Exception:
@@ -505,10 +517,17 @@ class TaskApp(BaseWindow):
                         sent = None
 
                 if now_dt >= target and (sent is None or sent < target):
+                    # Mark as scheduled so other checks won't schedule again.
+                    self._active_reminder_popups.add(task_id)
                     # schedule popup on UI thread immediately
                     try:
-                        self.after(0, lambda _id=r["id"], _t=r["title"], _d=r["description"]: self._show_reminder_popup(_id, _t, _d))
+                        self.after(0, lambda _id=task_id, _t=r["title"], _d=r["description"]: self._show_reminder_popup(_id, _t, _d))
                     except Exception as e:
+                        # If scheduling fails, remove from active set so it can be retried later
+                        try:
+                            self._active_reminder_popups.discard(task_id)
+                        except Exception:
+                            pass
                         print("Failed to schedule reminder popup on UI thread:", e)
                     # DO NOT mark reminder_sent_at here
         except Exception as e:
@@ -537,20 +556,32 @@ class TaskApp(BaseWindow):
         except Exception:
             pass
 
-        def _mark_sent_and_close():
-            now_iso = datetime.now().isoformat(timespec="seconds")
+        def _cleanup_and_close(mark_sent=False):
+            """
+            Common cleanup: optionally set reminder_sent_at (when dismissed), then remove
+            this task from active popups and destroy the popup window.
+            """
             try:
-                self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
-                self.db.conn.commit()
-            except Exception as e:
-                print("Error setting reminder_sent_at:", e)
-            try:
-                win.destroy()
-            except Exception:
-                pass
+                if mark_sent:
+                    now_iso = datetime.now().isoformat(timespec="seconds")
+                    try:
+                        self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
+                        self.db.conn.commit()
+                    except Exception as e:
+                        print("Error setting reminder_sent_at:", e)
+                # remove from active popups so the task can be rescheduled later if snoozed
+                try:
+                    self._active_reminder_popups.discard(task_id)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
 
         # treat window close as dismiss (same as pressing Dismiss)
-        win.protocol("WM_DELETE_WINDOW", _mark_sent_and_close)
+        win.protocol("WM_DELETE_WINDOW", lambda: _cleanup_and_close(mark_sent=True))
 
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
         header.pack(padx=12, pady=(12, 6), anchor="w")
@@ -564,18 +595,18 @@ class TaskApp(BaseWindow):
         btnf.pack(fill=tk.X, padx=12, pady=8)
 
         def open_task():
-            try:
-                win.destroy()
-            except Exception:
-                pass
+            # close popup (do not mark sent) and open editor
+            _cleanup_and_close(mark_sent=False)
             try:
                 self._open_edit_window(task_id)
             except Exception as e:
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
+            # When snoozing, restart countdown from now and clear reminder_sent_at so it can fire again.
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
+                # store integer minutes; reminder_sent_at cleared (NULL)
                 self.db.conn.execute(
                     "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?",
                     (int(minutes), new_set, task_id)
@@ -583,13 +614,12 @@ class TaskApp(BaseWindow):
                 self.db.conn.commit()
             except Exception as e:
                 print("Snooze update error:", e)
-            try:
-                win.destroy()
-            except Exception:
-                pass
+            # remove from active set and close popup so snooze can re-fire later
+            _cleanup_and_close(mark_sent=False)
 
         def dismiss():
-            _mark_sent_and_close()
+            # Mark as reminded now and close
+            _cleanup_and_close(mark_sent=True)
 
         ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
@@ -1041,6 +1071,8 @@ class TaskApp(BaseWindow):
         self.kanban_item_map = {status: [] for status in STATUSES}
 
         self.attachments_var = tk.StringVar(value="")
+
+        self._active_reminder_popups = set()
 
         self._build_ui()
 
@@ -1594,71 +1626,224 @@ class TaskApp(BaseWindow):
             pass
 
     def _get_flagged_emails(self):
+        """
+        Try to fetch flagged Outlook items. This function must be called on a thread
+        that has COM initialized (pythoncom.CoInitialize).
+        Returns: list of dict items or raises an exception with diagnostics.
+        """
         if not HAS_OUTLOOK:
-            return []
+            raise RuntimeError("win32com.client not available (pywin32 not installed)")
+
+        try:
+            # Top-level COM dispatch; assume caller has initialized COM on this thread.
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        except Exception as e:
+            raise RuntimeError(f"Failed to dispatch Outlook.Application COM object: {e}")
+
         flagged = []
         try:
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            # To-Do folder (tasks) — default folder 28
             try:
                 todo_folder = outlook.GetDefaultFolder(28)
-                for item in todo_folder.Items:
-                    if getattr(item, "Class", 0) == 43 and getattr(item,"FlagStatus",0) == 2:
-                        due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
-                        flagged.append({
-                            "title": f"[OM] {item.Subject}",
-                            "description": item.Body or "",
-                            "due_date": due,
-                            "priority": "Medium",
-                            "status": "Pending",
-                            "outlook_id": item.EntryID
-                        })
+                for item in list(todo_folder.Items):
+                    try:
+                        if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
+                            due = None
+                            try:
+                                due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
+                            except Exception:
+                                due = None
+                            flagged.append({
+                                "title": f"[OM] {getattr(item, 'Subject', '(no subject)')}",
+                                "description": getattr(item, "Body", "") or "",
+                                "due_date": due,
+                                "priority": "Medium",
+                                "status": "Pending",
+                                "outlook_id": getattr(item, "EntryID", None)
+                            })
+                    except Exception:
+                        # continue for other items
+                        continue
             except Exception as e:
-                print("To-Do List fetch error:", e)
+                # do not fail the whole operation if tasks fetch fails
+                print("Warning: reading To-Do folder failed:", e)
+
+            # Inbox flagged mails and other folders
             try:
                 inbox = outlook.GetDefaultFolder(6)
-                self._get_flagged_from_folder(inbox, flagged)
+                # recursive helper to walk folders
+                def _walk_folder(folder):
+                    try:
+                        items = list(folder.Items)
+                    except Exception:
+                        return
+                    for item in items:
+                        try:
+                            # Mail class is 43; check FlagStatus for flagged messages
+                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
+                                attachments = []
+                                try:
+                                    if getattr(item, "Attachments", None):
+                                        if getattr(item.Attachments, "Count", 0) > 0:
+                                            os.makedirs("attachments", exist_ok=True)
+                                            for att in item.Attachments:
+                                                fname = os.path.join("attachments", att.FileName)
+                                                try:
+                                                    att.SaveAsFile(fname)
+                                                    attachments.append(fname)
+                                                except Exception:
+                                                    # ignore individual attachment save errors
+                                                    pass
+                                except Exception:
+                                    pass
+                                due = None
+                                try:
+                                    due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                                except Exception:
+                                    due = None
+                                desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "") or ""
+                                flagged.append({
+                                    "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
+                                    "description": desc,
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending",
+                                    "outlook_id": getattr(item, "EntryID", None),
+                                    "attachments": json.dumps(attachments) if attachments else None
+                                })
+                        except Exception:
+                            continue
+                    # subfolders
+                    try:
+                        for sub in folder.Folders:
+                            _walk_folder(sub)
+                    except Exception:
+                        pass
+
+                _walk_folder(inbox)
             except Exception as e:
-                print("Inbox flagged mail fetch error:", e)
+                print("Warning: scanning Inbox failed:", e)
+
+            # Search folders like "For Follow Up"
             try:
                 search_root = outlook.GetDefaultFolder(23)
-                for folder in search_root.Folders:
-                    if folder.Name.lower() == "for follow up":
-                        self._get_flagged_from_folder(folder, flagged)
-            except Exception as e:
-                print("Search folder fetch error:", e)
+                try:
+                    for folder in list(search_root.Folders):
+                        try:
+                            if getattr(folder, "Name", "").lower() == "for follow up":
+                                # walk this folder too
+                                def _walk_flagged(f):
+                                    try:
+                                        items = list(f.Items)
+                                    except Exception:
+                                        return
+                                    for item in items:
+                                        try:
+                                            if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
+                                                flagged.append({
+                                                    "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
+                                                    "description": getattr(item, "Body", "") or "",
+                                                    "due_date": None,
+                                                    "priority": "Medium",
+                                                    "status": "Pending",
+                                                    "outlook_id": getattr(item, "EntryID", None)
+                                                })
+                                        except Exception:
+                                            continue
+                                    try:
+                                        for sub in f.Folders:
+                                            _walk_flagged(sub)
+                                    except Exception:
+                                        pass
+                                _walk_flagged(folder)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         except Exception as e:
-            print("Outlook fetch error:", e)
+            raise RuntimeError("Unexpected error while reading Outlook folders: " + str(e))
+
         return flagged
 
     import threading
 
     def _import_outlook_flags(self):
-        """Run Outlook import in a background thread to avoid freezing UI."""
-        def _worker():
-            # original import logic (safe to call from background thread, but DB/FS ok)
-            new_count = 0
-            try:
-                flagged = self._get_flagged_emails()
-                if flagged:
-                    cur = self.db.conn.cursor()
-                    new_items = [f for f in flagged if not cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (f["outlook_id"],)).fetchone()]
-                    if new_items:
-                        self.db.bulk_add(new_items)
-                        new_count = len(new_items)
-            except Exception as e:
-                print("Background outlook import error:", e)
+        """
+        Wrapper that runs the blocking Outlook COM work in a background thread.
+        It initializes COM on the worker thread (pythoncom.CoInitialize) which is required for pywin32.
+        """
+        if not HAS_OUTLOOK:
+            messagebox.showwarning("Outlook Import", "Outlook integration is not available. Ensure pywin32 is installed and you're running on Windows with Outlook.")
+            return
 
-            # schedule UI updates on main thread
-            def _on_done():
-                if new_count:
-                    self._populate(); self._populate_kanban()
-                    messagebox.showinfo("Outlook", f"Imported {new_count} new tasks.")
-                else:
-                    messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+        import threading
+        try:
+            import pythoncom
+        except Exception:
+            pythoncom = None
+
+        def _worker():
+            # Each thread that uses COM must initialize it
             try:
-                self.after(0, _on_done)
-            except Exception:
-                pass
+                if pythoncom:
+                    pythoncom.CoInitialize()
+            except Exception as e:
+                print("pythoncom.CoInitialize() failed on worker thread:", e)
+
+            new_items = []
+            try:
+                flagged = []
+                try:
+                    flagged = self._get_flagged_emails()
+                except Exception as e:
+                    # capture stack for diagnostics
+                    tb = traceback.format_exc()
+                    print("Error fetching flagged emails:", e)
+                    print(tb)
+                    # schedule to inform the user on UI thread
+                    def _err_msg():
+                        messagebox.showerror("Outlook Import Error", f"Error fetching flagged Outlook items:\n{e}\n\nSee console for details.")
+                    try:
+                        self.after(0, _err_msg)
+                    except Exception:
+                        pass
+                    return
+
+                if flagged:
+                    try:
+                        cur = self.db.conn.cursor()
+                        for f in flagged:
+                            # skip existing by outlook_id when present
+                            out_id = f.get("outlook_id")
+                            if out_id:
+                                exists = cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (out_id,)).fetchone()
+                                if exists:
+                                    continue
+                            new_items.append(f)
+                        if new_items:
+                            self.db.bulk_add(new_items)
+                    except Exception as e:
+                        print("DB error while adding outlook tasks:", e)
+                # done - schedule UI update
+                def _on_done():
+                    if new_items:
+                        self._populate(); self._populate_kanban()
+                        messagebox.showinfo("Outlook Import", f"Imported {len(new_items)} new tasks.")
+                    else:
+                        messagebox.showinfo("Outlook Import", "No new flagged Outlook items found.")
+                try:
+                    self.after(0, _on_done)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if pythoncom:
+                        pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
