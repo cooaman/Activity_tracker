@@ -12,11 +12,20 @@ try:
 except ImportError:
     HAS_OUTLOOK = False
 
+# Safe import for win10toast: don't allow import-time pkg_resources errors to kill the app.
 try:
-    from win10toast import ToastNotifier
-    toaster = ToastNotifier()
-    HAS_NOTIFY = True
-except ImportError:
+    # attempt to import normally; use importlib to avoid packaging-time issues
+    import importlib
+    _win10toast = importlib.import_module("win10toast")
+    def _create_toaster():
+        try:
+            return _win10toast.ToastNotifier()
+        except Exception:
+            return None
+    toaster = _create_toaster()
+    HAS_NOTIFY = toaster is not None
+except Exception:
+    toaster = None
     HAS_NOTIFY = False
 
 try:
@@ -58,7 +67,20 @@ def save_settings(settings):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f)
 
-
+def _safe_show_toast(title, msg, duration=5):
+    """
+    Show a Windows toast if available. Catch and swallow all exceptions
+    so toast library errors don't crash the app's callbacks.
+    """
+    global toaster, HAS_NOTIFY
+    if not HAS_NOTIFY or toaster is None:
+        return
+    try:
+        # keep message length reasonable
+        toaster.show_toast(title, (msg or "")[:200], duration=duration, threaded=True)
+    except Exception as e:
+        # print for debugging but do not raise — toast failures must not stop the program
+        print("Toast error (ignored):", e)
 # -------------------- Database --------------------
 class TaskDB:
     def __init__(self, path=DB_FILE):
@@ -200,8 +222,75 @@ class TaskDB:
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
 
+    def _init_styles(self):
+        """Initialize simple theme palettes and default style tweaks."""
+        style = ttk.Style()
+        # font tweaks
+        default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
+        heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
+        try:
+            style.configure(".", font=default_font)
+            style.configure("Treeview.Heading", font=heading_font)
+            style.configure("TButton", padding=6)
+            style.configure("TLabel", padding=2)
+        except Exception:
+            pass
+
+        # theme palettes
+        self._themes = {
+            "Light": {
+                "bg": "#f7f7f7",
+                "panel": "#ffffff",
+                "kanban_bg": "#f0f0f0",
+                "text": "#222222",
+                "muted": "#666666"
+            },
+            "Dark": {
+                "bg": "#2b2b2b",
+                "panel": "#333333",
+                "kanban_bg": "#3a3a3a",
+                "text": "#ffffff",
+                "muted": "#cccccc"
+            }
+        }
+        self._current_theme = "Light"
+        try:
+            self.configure(bg=self._themes[self._current_theme]["bg"])
+        except Exception:
+            pass
+
+    def _set_theme(self, theme_name):
+        if theme_name not in self._themes:
+            return
+        self._current_theme = theme_name
+        palette = self._themes[theme_name]
+        try:
+            self.configure(bg=palette["bg"])
+        except Exception:
+            pass
+
+        # adjust tree tags for readability
+        if getattr(self, "tree", None):
+            try:
+                if theme_name == "Dark":
+                    self.tree.tag_configure("priority_high", background="#4a1a1a")
+                    self.tree.tag_configure("priority_medium", background="#4a3b1a")
+                    self.tree.tag_configure("priority_low", background="#1a4a2a")
+                    self.tree.tag_configure("oddrow", background="#2f2f2f")
+                    self.tree.tag_configure("evenrow", background="#353535")
+                else:
+                    self.tree.tag_configure("priority_high", background="#FFD6D6")
+                    self.tree.tag_configure("priority_medium", background="#FFF5CC")
+                    self.tree.tag_configure("priority_low", background="#E6FFEA")
+                    self.tree.tag_configure("oddrow", background="#FFFFFF")
+                    self.tree.tag_configure("evenrow", background="#F6F6F6")
+            except Exception:
+                pass
+        # refresh
+        self._populate()
+
     def _format_timedelta(self, td):
-        """Format a timedelta to human friendly string: H:MM:SS or Xm if > 60 min."""
+        """Format a timedelta to human friendly string: H:MM or Xm Ys or Now."""
         total_seconds = int(td.total_seconds())
         if total_seconds <= 0:
             return "Now"
@@ -250,7 +339,6 @@ class TaskApp(tk.Tk):
                             self.tree.set(iid, "reminder", display)
                             continue
 
-                        # if already fired and sent_at >= target -> show "Sent"
                         target = set_dt + timedelta(minutes=rm_int)
                         if sent_at:
                             try:
@@ -258,37 +346,43 @@ class TaskApp(tk.Tk):
                                 if sent_dt >= target:
                                     display = "Sent"
                                 else:
-                                    # sent earlier than target (weird) — compute remaining until target
                                     remaining = target - datetime.now()
                                     display = self._format_timedelta(remaining)
                             except Exception:
                                 remaining = target - datetime.now()
                                 display = self._format_timedelta(remaining)
                         else:
-                            # not sent: show remaining time until target
                             remaining = target - datetime.now()
                             display = self._format_timedelta(remaining)
-                # finally set tree cell
                 try:
                     self.tree.set(iid, "reminder", display)
                 except Exception:
-                    # some platforms require re-inserting; ignore silently
                     pass
-
-        except Exception as e:
-            # safe to ignore occasional DB race
-            # print("Reminder display update error:", e)
+        except Exception:
             pass
         finally:
-            # schedule next update in 1 second
             self.after(1000, self._refresh_reminder_display)
 
     # --------------- Reminder helpers ----------------
     def _schedule_task_reminder_checker(self):
-        """Schedule the periodic reminder check (every 60 seconds)."""
-        # run immediately and then schedule repeated calls
-        self._check_task_reminders()
-        self.after(5*1000, self._schedule_task_reminder_checker)
+        """
+        Schedule the periodic reminder check (every few seconds).
+        This wrapper ensures that even if _check_task_reminders raises an exception,
+        we still reschedule the next run (so a single failure won't stop future reminders).
+        """
+        try:
+            # call the real checker
+            self._check_task_reminders()
+        except Exception as e:
+            # log and continue; do NOT allow exception to stop the loop
+            print("Unhandled error during reminder check (caught):", e)
+        finally:
+            # always schedule the next invocation (5s granularity for stopwatch-style reminders)
+            try:
+                self.after(5 * 1000, self._schedule_task_reminder_checker)
+            except Exception as e:
+                # extremely defensive: if scheduling fails, print and move on
+                print("Failed to schedule next reminder check:", e)
 
     def _check_task_reminders(self):
         """Check DB for tasks that require reminders (stopwatch-style) and show popup if needed."""
@@ -331,23 +425,20 @@ class TaskApp(tk.Tk):
                     now_iso = datetime.now().isoformat(timespec="seconds")
                     self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, r["id"]))
                     self.db.conn.commit()
-
         except Exception as e:
             print("Reminder check error:", e)
 
+    ####
     def _show_reminder_popup(self, task_id, title, description):
-        """Attractive focused reminder popup with actions."""
-        # On Windows, show a toast too
+        """Attractive focused reminder popup with actions. Uses safe toast wrapper."""
+        # On Windows, show a toast too (safe wrapper)
         if HAS_NOTIFY:
-            try:
-                toaster.show_toast(f"Reminder: {title}", (description or "Task due soon")[:200], duration=5, threaded=True)
-            except Exception:
-                pass
+            _safe_show_toast(f"Reminder: {title}", description or "Task due soon")
 
         # Create a focused popup
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
-        win.geometry("520x260")
+        win.geometry("640x280")  # Increased width & height slightly
         win.transient(self)
         win.attributes("-topmost", True)
         try:
@@ -367,38 +458,45 @@ class TaskApp(tk.Tk):
 
         # Buttons frame
         btnf = ttk.Frame(win)
-        btnf.pack(fill=tk.X, padx=12, pady=6)
+        btnf.pack(fill=tk.X, padx=12, pady=8)
 
         def open_task():
             win.destroy()
-            self._open_edit_window(task_id)
+            try:
+                self._open_edit_window(task_id)
+            except Exception as e:
+                print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
-            # restart countdown from now for `minutes`, clear reminder_sent_at
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
-                self.db.conn.execute("UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?", (minutes, new_set, task_id))
+                self.db.conn.execute(
+                    "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=? WHERE id=?",
+                    (int(minutes), new_set, None, task_id)
+                )
                 self.db.conn.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                print("Snooze update error:", e)
             win.destroy()
 
         def dismiss():
-            # mark as reminded now
             now_iso = datetime.now().isoformat(timespec="seconds")
-            self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
-            self.db.conn.commit()
+            try:
+                self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
+                self.db.conn.commit()
+            except Exception as e:
+                print("Dismiss update error:", e)
             win.destroy()
 
-        ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT)
+        # Buttons laid out with padding so they don’t wrap
+        ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT)
+        ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
-        # visual highlight (optional)
+        # visual highlight
         win.lift()
-
 
     # -------------------- UI / CRUD / Kanban --------------------
     def _save_inline_from_form(self):
@@ -801,6 +899,9 @@ class TaskApp(tk.Tk):
         self.db = TaskDB()
         self.settings = load_settings()
 
+        # init style & theme
+        self._init_styles()
+
         self.kanban_selected_id = None
         self.kanban_selected_status = None
         # mapping: status -> list of task_ids in same order as items in the listbox
@@ -825,14 +926,12 @@ class TaskApp(tk.Tk):
 
         # existing reminder check for due-today toast
         self._check_reminders()
-        # start task reminder checker (every 60s)
-        self._schedule_task_reminder_checker()
 
     def _treeview_sort_column(self, col, reverse):
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
         try:
             l.sort(key=lambda t: datetime.strptime(t[0], "%Y-%m-%d"), reverse=reverse)
-        except:
+        except Exception:
             l.sort(reverse=reverse)
         for index, (val, k) in enumerate(l):
             self.tree.move(k, "", index)
@@ -847,9 +946,16 @@ class TaskApp(tk.Tk):
         ttk.Button(toolbar, text="Refresh Outlook", command=self._refresh_outlook_flags).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
         ttk.Button(toolbar, text="Show Overdue", command=self._show_overdue_popup).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="Show Today", command=self._show_today_popup).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
+
+        # Theme selector (right side)
+        ttk.Label(toolbar, text="Theme:").pack(side=tk.RIGHT, padx=(6,4))
+        self.theme_var = tk.StringVar(value=self._current_theme)
+        theme_cb = ttk.Combobox(toolbar, textvariable=self.theme_var, values=list(self._themes.keys()), width=10, state="readonly")
+        theme_cb.pack(side=tk.RIGHT, padx=(0,8))
+        theme_cb.bind("<<ComboboxSelected>>", lambda e: self._set_theme(self.theme_var.get()))
 
         # Main notebook
         self.notebook = ttk.Notebook(self)
@@ -865,36 +971,41 @@ class TaskApp(tk.Tk):
         else:
             cols = ["id", "title", "due", "priority", "status", "reminder"]
 
-        self.tree = ttk.Treeview(list_tab, columns=cols, show="headings")
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        
-                # ---- Filter bar for Task List (insert here, before creating the Treeview) ----
+        # ---- Filter bar for Task List (placed above the Treeview) ----
         filter_frame = ttk.Frame(list_tab, padding=(6,4))
-        filter_frame.pack(fill=tk.X, padx=6, pady=(0,4))
+        filter_frame.pack(fill=tk.X, padx=6, pady=(6,4))
 
         ttk.Label(filter_frame, text="Search:").pack(side=tk.LEFT, padx=(0,4))
         self.filter_text_var = tk.StringVar(value="")
-        ttk.Entry(filter_frame, textvariable=self.filter_text_var, width=30).pack(side=tk.LEFT)
+        search_entry = ttk.Entry(filter_frame, textvariable=self.filter_text_var, width=30)
+        search_entry.pack(side=tk.LEFT)
+        search_entry.bind("<KeyRelease>", lambda e: self._apply_filters())
 
         ttk.Label(filter_frame, text="Priority:").pack(side=tk.LEFT, padx=(12,4))
         self.filter_priority_var = tk.StringVar(value="All")
         pri_vals = ["All"] + PRIORITIES
-        ttk.Combobox(filter_frame, textvariable=self.filter_priority_var, values=pri_vals, width=10, state="readonly").pack(side=tk.LEFT)
+        pri_cb = ttk.Combobox(filter_frame, textvariable=self.filter_priority_var, values=pri_vals, width=10, state="readonly")
+        pri_cb.pack(side=tk.LEFT)
+        pri_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
 
         ttk.Label(filter_frame, text="Status:").pack(side=tk.LEFT, padx=(12,4))
         self.filter_status_var = tk.StringVar(value="All")
         stat_vals = ["All"] + STATUSES
-        ttk.Combobox(filter_frame, textvariable=self.filter_status_var, values=stat_vals, width=12, state="readonly").pack(side=tk.LEFT)
+        stat_cb = ttk.Combobox(filter_frame, textvariable=self.filter_status_var, values=stat_vals, width=12, state="readonly")
+        stat_cb.pack(side=tk.LEFT)
+        stat_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
 
         ttk.Label(filter_frame, text="Due on (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12,4))
         self.filter_due_var = tk.StringVar(value="")
-        ttk.Entry(filter_frame, textvariable=self.filter_due_var, width=12).pack(side=tk.LEFT)
+        due_entry = ttk.Entry(filter_frame, textvariable=self.filter_due_var, width=12)
+        due_entry.pack(side=tk.LEFT)
 
         ttk.Button(filter_frame, text="Apply", command=self._apply_filters).pack(side=tk.LEFT, padx=(12,4))
         ttk.Button(filter_frame, text="Clear", command=self._clear_filters).pack(side=tk.LEFT)
 
-
-
+        # Now create Treeview
+        self.tree = ttk.Treeview(list_tab, columns=cols, show="headings")
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         for col in cols:
             # Title-case header
@@ -908,14 +1019,24 @@ class TaskApp(tk.Tk):
             self.tree.column("due", width=100, anchor="center")
             self.tree.column("priority", width=90, anchor="center")
             self.tree.column("status", width=90, anchor="center")
-            self.tree.column("reminder", width=100, anchor="center")
+            self.tree.column("reminder", width=120, anchor="center")
         else:
             self.tree.column("id", width=60, anchor="center")
-            self.tree.column("title", width=420, anchor="w")
-            self.tree.column("due", width=100, anchor="center")
-            self.tree.column("priority", width=90, anchor="center")
-            self.tree.column("status", width=90, anchor="center")
-            self.tree.column("reminder", width=100, anchor="center")
+            self.tree.column("title", width=480, anchor="w")
+            self.tree.column("due", width=120, anchor="center")
+            self.tree.column("priority", width=100, anchor="center")
+            self.tree.column("status", width=100, anchor="center")
+            self.tree.column("reminder", width=120, anchor="center")
+
+        # configure tags for priorities & alternate rows
+        try:
+            self.tree.tag_configure("priority_high", background="#FFD6D6")   # light red
+            self.tree.tag_configure("priority_medium", background="#FFF5CC") # light amber
+            self.tree.tag_configure("priority_low", background="#E6FFEA")    # light green
+            self.tree.tag_configure("oddrow", background="#FFFFFF")
+            self.tree.tag_configure("evenrow", background="#F6F6F6")
+        except Exception:
+            pass
 
         # selection and double-click to open editor
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -1073,7 +1194,6 @@ class TaskApp(tk.Tk):
             except Exception:
                 self.attachments_var.set("")
 
-
     def _apply_filters(self):
         """Apply current filter controls to the Task List."""
         # basic validation for date format (if filled)
@@ -1084,6 +1204,7 @@ class TaskApp(tk.Tk):
             except ValueError:
                 messagebox.showwarning("Filter", "Due Date filter must be YYYY-MM-DD")
                 return
+        # perform populate which handles filtering
         self._populate()
 
     def _clear_filters(self):
@@ -1097,7 +1218,6 @@ class TaskApp(tk.Tk):
         if hasattr(self, "filter_due_var"):
             self.filter_due_var.set("")
         self._populate()
-
 
     # -------------------- Populate --------------------
     def _populate(self):
@@ -1133,13 +1253,13 @@ class TaskApp(tk.Tk):
             # due date exact match if specified
             if fdue:
                 try:
-                    # normalize both sides to YYYY-MM-DD
                     if (r["due_date"] or "") != fdue:
                         return False
                 except Exception:
                     return False
             return True
 
+        insert_index = 0
         for r in rows:
             if not row_matches(r):
                 continue
@@ -1174,7 +1294,24 @@ class TaskApp(tk.Tk):
                     r["status"],
                     reminder_display
                 ]
-            self.tree.insert("", tk.END, values=values)
+
+            # determine tags
+            tags = []
+            pr = (r["priority"] or "").lower()
+            if pr == "high":
+                tags.append("priority_high")
+            elif pr == "medium":
+                tags.append("priority_medium")
+            else:
+                tags.append("priority_low")
+            tags.append("evenrow" if insert_index % 2 == 0 else "oddrow")
+
+            try:
+                self.tree.insert("", tk.END, values=values, tags=tags)
+            except Exception:
+                # fallback: insert without tags
+                self.tree.insert("", tk.END, values=values)
+            insert_index += 1
 
     def _populate_kanban(self):
         # clear listboxes and maps
@@ -1644,7 +1781,7 @@ class TaskApp(tk.Tk):
     def _check_reminders(self):
         due_today = self.db.fetch_due_today()
         if due_today and HAS_NOTIFY:
-            toaster.show_toast("Tasks Due Today", f"{len(due_today)} tasks due today", duration=5)
+            _safe_show_toast("Tasks Due Today", f"{len(due_today)} tasks due today")
         self.after(3600*1000, self._check_reminders)
 
 
