@@ -266,24 +266,31 @@ else:
 
 class TaskApp(BaseWindow):
     def _init_styles(self):
-        """Initialize simple theme palettes and default style tweaks."""
-        # if using ttkbootstrap, style object is from tb.Style
+        """Initialize theme, fonts and button styles (Option 1: custom default button)."""
+        style = ttk.Style()
+
+        # Prefer a theme that allows predictable styling across platforms
         try:
-            style = ttk.Style() if not HAS_BOOTSTRAP else tb.Style()
+            style.theme_use("clam")
         except Exception:
-            style = ttk.Style()
-        # font tweaks
+            # If clam not available, fall back to default
+            try:
+                style.theme_use(style.theme_names()[0])
+            except Exception:
+                pass
+
+        # Fonts
         default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
         heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
+
+        # Base UI font and heading font
         try:
             style.configure(".", font=default_font)
             style.configure("Treeview.Heading", font=heading_font)
-            style.configure("TButton", padding=6)
-            style.configure("TLabel", padding=2)
         except Exception:
             pass
 
-        # theme palettes
+        # Define colors for themes (you already had these; keep them)
         self._themes = {
             "Light": {
                 "bg": "#f7f7f7",
@@ -300,12 +307,76 @@ class TaskApp(BaseWindow):
                 "muted": "#cccccc"
             }
         }
+        self._current_theme = getattr(self, "_current_theme", "Light")
 
-        # default theme
-        self._current_theme = "Light"
+        # -- Button styling: override TButton so all ttk.Buttons pick this up --
+        # This produces a neutral, flat, light-gray button with subtle hover feedback.
         try:
-            self.configure(bg=self._themes[self._current_theme]["bg"])
+            # Primary look for normal buttons
+            style.configure(
+                "TButton",
+                padding=6,
+                relief="flat",
+                background="#f0f0f0",   # normal background (light)
+                foreground="#000000",
+                borderwidth=0,
+            )
+
+            # Hover / active / pressed mappings
+            style.map(
+                "TButton",
+                background=[
+                    ("active", "#e6e6e6"),
+                    ("pressed", "#dcdcdc"),
+                    ("disabled", "#f0f0f0")
+                ],
+                foreground=[
+                    ("disabled", "#9a9a9a")
+                ]
+            )
+
+            # Also create a Custom.TButton alias for explicit use if needed
+            style.configure(
+                "Custom.TButton",
+                padding=6,
+                relief="flat",
+                background="#f0f0f0",
+                foreground="#000000",
+                borderwidth=0,
+            )
+            style.map(
+                "Custom.TButton",
+                background=[("active", "#e6e6e6"), ("pressed", "#dcdcdc")],
+                foreground=[("disabled", "#9a9a9a")]
+            )
+        except Exception as e:
+            # If button styling fails for any reason, don't crash — just continue.
+            print("Button style init warning:", e)
+
+        # Tweak label and tree fonts/padding a little
+        try:
+            style.configure("TLabel", padding=2)
+            style.configure("Treeview", rowheight=22)
         except Exception:
+            pass
+
+        # Tag colors for Treeview rows (used by _set_theme/_populate)
+        try:
+            if getattr(self, "_current_theme", "Light") == "Dark":
+                style.configure("Treeview", background="#2f2f2f", fieldbackground="#2f2f2f", foreground="#ffffff")
+            else:
+                style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#000000")
+        except Exception:
+            pass
+
+        # Configure tree tags (used in _populate)
+        try:
+            # light theme tags
+            style.configure("Treeview.priority_high", background="#FFD6D6")
+            style.configure("Treeview.priority_medium", background="#FFF5CC")
+            style.configure("Treeview.priority_low", background="#E6FFEA")
+        except Exception:
+            # fallback — some ttk backends ignore widget-specific tag styles; you'll still get tag_configure() calls in _set_theme/_populate
             pass
 
     def _set_theme(self, theme_name):
@@ -412,31 +483,40 @@ class TaskApp(BaseWindow):
     # --------------- Reminder helpers ----------------
     def _schedule_task_reminder_checker(self):
         """
-        Ensure the periodic checker continues even if an error occurs.
+        Schedule the periodic reminder check (every few seconds).
+        Keeps rescheduling even if an error occurs so a single failure won't stop reminders.
         """
         try:
             self._check_task_reminders()
         except Exception as e:
+            # log but keep loop alive
             print("Unhandled error during reminder check (caught):", e)
         finally:
             try:
+                # 5-second granularity for stopwatch-style reminders
                 self.after(5 * 1000, self._schedule_task_reminder_checker)
             except Exception as e:
                 print("Failed to schedule next reminder check:", e)
 
     def _check_task_reminders(self):
-        """Check DB for tasks that require reminders (stopwatch-style) and show popup if needed."""
+        """
+        Query DB for tasks whose stopwatch-style reminder target has passed.
+        IMPORTANT: Do NOT mark 'reminder_sent_at' here. Marking must happen on user action (Dismiss),
+        otherwise snooze won't work correctly (user snoozes but record already marked sent).
+        """
         try:
             cur = self.db.conn.cursor()
             cur.execute("""
                 SELECT id, title, description, reminder_minutes, reminder_set_at, reminder_sent_at
                 FROM tasks
                 WHERE reminder_minutes IS NOT NULL AND reminder_minutes != '' AND reminder_set_at IS NOT NULL
-                  AND status != 'Done'
+                AND status != 'Done'
             """)
             rows = cur.fetchall()
             now_dt = datetime.now()
+
             for r in rows:
+                # parse minutes and set time
                 try:
                     rm_min = int(r["reminder_minutes"])
                 except Exception:
@@ -448,6 +528,7 @@ class TaskApp(BaseWindow):
 
                 target = set_at + timedelta(minutes=rm_min)
 
+                # if we have reminder_sent_at, parse it
                 sent = None
                 if r["reminder_sent_at"]:
                     try:
@@ -455,29 +536,66 @@ class TaskApp(BaseWindow):
                     except Exception:
                         sent = None
 
+                # Only show if current time >= target and we have NOT already recorded a send at/after target
                 if now_dt >= target and (sent is None or sent < target):
-                    self._show_reminder_popup(r["id"], r["title"], r["description"])
-                    now_iso = datetime.now().isoformat(timespec="seconds")
-                    self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, r["id"]))
-                    self.db.conn.commit()
+                    # Use after(0, ...) to ensure popup is created on the Tk event loop (UI thread)
+                    try:
+                        self.after(0, lambda _id=r["id"], _t=r["title"], _d=r["description"]: self._show_reminder_popup(_id, _t, _d))
+                    except Exception as e:
+                        print("Failed to schedule reminder popup on UI thread:", e)
+
+                    # NOTE: do not update reminder_sent_at here — only update when the user dismisses the popup.
         except Exception as e:
             print("Reminder check error:", e)
 
     def _show_reminder_popup(self, task_id, title, description):
-        """Reminder popup. Wider window so buttons fit on Windows."""
+        """
+        Improved cross-platform reminder popup:
+        - Avoid modal grab_set() which can freeze UI on some platforms.
+        - Bring window to front robustly (lift + focus_force + toggle -topmost).
+        - Mark reminder_sent_at only when user dismisses, not when popup is shown.
+        """
+
+        # Windows toast (safe wrapper) — non-blocking
         if HAS_NOTIFY:
             _safe_show_toast(f"Reminder: {title}", description or "Task due soon")
 
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
-        # slightly larger so buttons don't wrap on Windows
+        # slightly larger so buttons don't wrap
         win.geometry("700x300")
         win.transient(self)
-        win.attributes("-topmost", True)
+
+        # Do not call grab_set() — keep popup non-modal so UI remains responsive.
         try:
-            win.grab_set()
+            # try to raise and focus the popup in a way that works across platforms
+            win.lift()
+            win.attributes("-topmost", True)
+            win.update()
+            # small toggle may help macOS bring to front
+            try:
+                win.attributes("-topmost", False)
+            except Exception:
+                pass
+            win.focus_force()
         except Exception:
             pass
+
+        # ensure closing via window manager triggers the same cleanup as Dismiss
+        def _on_close():
+            # treat closing as dismiss: mark reminder_sent_at
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            try:
+                self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
+                self.db.conn.commit()
+            except Exception as e:
+                print("Error marking reminder_sent_at on close:", e)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
         header.pack(padx=12, pady=(12, 6), anchor="w")
@@ -491,40 +609,58 @@ class TaskApp(BaseWindow):
         btnf.pack(fill=tk.X, padx=12, pady=8)
 
         def open_task():
-            win.destroy()
+            try:
+                win.destroy()
+            except Exception:
+                pass
             try:
                 self._open_edit_window(task_id)
             except Exception as e:
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
+            # When snoozing, restart countdown from now and clear reminder_sent_at so it can fire again.
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
+                # store integer minutes; reminder_sent_at cleared (NULL)
                 self.db.conn.execute(
-                    "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=? WHERE id=?",
-                    (int(minutes), new_set, None, task_id)
+                    "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?",
+                    (int(minutes), new_set, task_id)
                 )
                 self.db.conn.commit()
             except Exception as e:
                 print("Snooze update error:", e)
-            win.destroy()
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
         def dismiss():
+            # Mark as reminded now (so it won't re-fire)
             now_iso = datetime.now().isoformat(timespec="seconds")
             try:
                 self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
                 self.db.conn.commit()
             except Exception as e:
                 print("Dismiss update error:", e)
-            win.destroy()
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
-        ttk.Button(btnf, text="📝 Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="⏱ Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="⏱ Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="⏱ Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text="❌ Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
+        # Buttons laid out to avoid wrapping
+        ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
-        win.lift()
+        # final lift/focus to ensure visible
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
 
     # -------------------- UI / CRUD / Kanban --------------------
     def _save_inline_from_form(self):
