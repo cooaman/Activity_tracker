@@ -68,7 +68,7 @@ def load_settings():
                 return json.load(f)
         except Exception:
             pass
-    return {"outlook_refresh_minutes": 30, "show_description": False}
+    return {"outlook_refresh_minutes": 30, "show_description": False, "default_theme": "Light"}
 
 
 def save_settings(settings):
@@ -124,13 +124,11 @@ class _ToolTip:
 # -------------------- Database --------------------
 class TaskDB:
     def __init__(self, path=DB_FILE):
-        # Allow access from background threads (sqlite3 default forbids same-connection cross-thread use)
-        # This is simpler for small apps where you ensure DB calls are short and you marshal UI updates
-        # back to the main thread (which this app does).
+        # Allow access from background threads
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
-        # Slightly friendlier concurrency: enable WAL mode so readers don't block writers as much.
+        # WAL for better concurrency
         try:
             self.conn.execute("PRAGMA journal_mode=WAL;")
         except Exception:
@@ -276,15 +274,39 @@ else:
 
 class TaskApp(BaseWindow):
     def _init_styles(self):
-        """Minimal, non-invasive style initialization — restores native-looking buttons."""
+        """Minimal, non-invasive style initialization — restore native-looking buttons on Windows
+        and keep readable row heights. Attempts to neutralize ttkbootstrap color overrides while
+        remaining safe on macOS/Linux.
+        """
         style = ttk.Style()
 
-        # Try to leave the platform theme as-is so native button rendering is preserved.
+        # Try to leave the platform theme as-is, but on Windows prefer a native theme
+        # (vista/winnative/xpnative) if available. This helps with button colors and entry rendering.
         try:
-            # Don't forcibly change theme; use whatever is default for the system.
-            current = style.theme_use()
+            available = style.theme_names()
         except Exception:
-            current = None
+            available = []
+
+        preferred_windows = ["vista", "winnative", "xpnative", "clam"]
+        chosen = None
+        if os.name == "nt":
+            for t in preferred_windows:
+                if t in available:
+                    chosen = t
+                    break
+        # Fallback: use current theme or first available
+        if not chosen:
+            try:
+                chosen = style.theme_use()
+            except Exception:
+                chosen = available[0] if available else None
+
+        try:
+            if chosen:
+                style.theme_use(chosen)
+        except Exception:
+            # if theme switch fails, continue with whatever's available
+            pass
 
         # Fonts — keep these conservative so platform-native widgets still look right
         default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
@@ -293,48 +315,36 @@ class TaskApp(BaseWindow):
             style.configure(".", font=default_font)
             style.configure("Treeview.Heading", font=heading_font)
             style.configure("TLabel", padding=2)
-            style.configure("TButton", padding=6)  # keep a little padding but don't override colors
+            # Keep button padding but avoid forcing background colors that override native look.
+            style.configure("TButton", padding=6, relief="raised")
+            style.map("TButton",
+                      foreground=[("disabled", style.lookup("TButton", "foreground")),
+                                  ("!disabled", style.lookup("TButton", "foreground"))],
+                      background=[("disabled", style.lookup("TButton", "background")),
+                                  ("!disabled", style.lookup("TButton", "background"))])
             style.configure("Treeview", rowheight=22)
         except Exception:
-            # If any style config fails on a backend, ignore and continue with defaults.
             pass
 
-        # Theme palettes (kept from your previous design)
-        self._themes = {
-            "Light": {
-                "bg": "#f7f7f7",
-                "panel": "#ffffff",
-                "kanban_bg": "#f0f0f0",
-                "text": "#222222",
-                "muted": "#666666"
-            },
-            "Dark": {
-                "bg": "#2b2b2b",
-                "panel": "#333333",
-                "kanban_bg": "#3a3a3a",
-                "text": "#ffffff",
-                "muted": "#cccccc"
-            }
+        # Provide safe defaults for row tag colors (used by _populate)
+        self.tree_tag_defaults = {
+            "priority_high": "#FFD6D6",
+            "priority_medium": "#FFF5CC",
+            "priority_low": "#E6FFEA",
+            "oddrow": "#FFFFFF",
+            "evenrow": "#F6F6F6"
         }
-        # default to Light if not set yet
-        self._current_theme = getattr(self, "_current_theme", "Light")
 
-        # Configure tree tags for row highlighting — non-invasive colors that work across themes.
-        try:
-            # these are used later via tree.tag_configure as well
-            # keep these here but do not force widget-level color overrides that change button appearance
-            self.tree_tag_defaults = {
-                "priority_high": "#FFD6D6",
-                "priority_medium": "#FFF5CC",
-                "priority_low": "#E6FFEA",
-                "oddrow": "#FFFFFF",
-                "evenrow": "#F6F6F6"
-            }
-        except Exception:
-            # if tree doesn't exist yet, that's fine — _populate will still set tags
-            self.tree_tag_defaults = {}
+        # on Windows attempt to neutralize ttkbootstrap style palette if present
+        if os.name == "nt" and HAS_BOOTSTRAP:
+            try:
+                # tb may have set global palette; try nudging ttk to use system colors for buttons/entries
+                style.configure("TButton", background=None)
+                style.configure("TEntry", fieldbackground=None)
+            except Exception:
+                pass
 
-        # Apply background to main window to match current theme (safe)
+        # Apply background to main window to match current theme palette (non-invasive)
         try:
             self.configure(bg=self._themes[self._current_theme]["bg"])
         except Exception:
@@ -639,9 +649,24 @@ class TaskApp(BaseWindow):
 
         win = tk.Toplevel(self)
         win.transient(self)
-        # NOTE: do NOT call grab_set() — non-modal windows are more robust on Windows & macOS.
+        # NOTE: do NOT call grab_set() here — non-modal windows are more robust on Windows & macOS.
         win.title("Edit Task" if task_id else "Add Task")
-        win.geometry("680x560")
+        # make sure window is large enough on Windows scaling; set minsize so fields won't be clipped
+        win.geometry("720x600")
+        win.minsize(600, 440)
+
+        # Ensure window appears on top and layout runs so widgets are visible immediately
+        try:
+            win.lift()
+            win.attributes("-topmost", True)
+            win.update_idletasks()
+            try:
+                win.attributes("-topmost", False)
+            except Exception:
+                pass
+            win.focus_force()
+        except Exception:
+            pass
 
         title_var = tk.StringVar()
         due_var = tk.StringVar()
@@ -655,8 +680,12 @@ class TaskApp(BaseWindow):
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
 
+        # Use grid with column weights so the right column grows and displays entries reliably
+        frm.columnconfigure(0, weight=0)
+        frm.columnconfigure(1, weight=1)
+
         ttk.Label(frm, text="Title *").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=title_var, width=50).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=title_var, width=50).grid(row=0, column=1, sticky="we", padx=6, pady=4)
 
         ttk.Label(frm, text="Due Date (YYYY-MM-DD)").grid(row=1, column=0, sticky="w")
         if has_dateentry:
@@ -682,6 +711,7 @@ class TaskApp(BaseWindow):
         desc_text = tk.Text(frm, height=10, width=60, wrap="word")
         desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0))
 
+        # Load existing values if editing
         if task_id:
             cur = self.db.conn.cursor()
             cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -710,7 +740,7 @@ class TaskApp(BaseWindow):
         attachments_frame = ttk.Frame(frm)
         attachments_frame.grid(row=6, column=1, sticky="we", padx=6, pady=(10,0))
         attachments_list_var = tk.StringVar(value=", ".join(os.path.basename(p) for p in existing_attachments))
-        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=500)
+        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=520)
         attachments_label.pack(anchor="w", fill=tk.X)
 
         def add_file_to_attachments():
@@ -820,6 +850,12 @@ class TaskApp(BaseWindow):
         btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        # Force a final geometry/layout pass so controls render correctly on Windows with scaling
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
 
     def _open_selected_kanban_attachments(self):
         if not self.kanban_selected_id:
@@ -956,6 +992,34 @@ class TaskApp(BaseWindow):
         self.drag_data = None
 
     def __init__(self):
+        # ensure themes are available before styles run
+        self._themes = {
+            "Light": {
+                "bg": "#f7f7f7",
+                "panel": "#ffffff",
+                "kanban_bg": "#f0f0f0",
+                "text": "#222222",
+                "muted": "#666666"
+            },
+            "Dark": {
+                "bg": "#2b2b2b",
+                "panel": "#333333",
+                "kanban_bg": "#3a3a3a",
+                "text": "#ffffff",
+                "muted": "#cccccc"
+            },
+            "Blue": {
+                "bg": "#eaf3ff",
+                "panel": "#ffffff",
+                "kanban_bg": "#f0f7ff",
+                "text": "#0a2a66",
+                "muted": "#556b9a"
+            }
+        }
+
+        # set current theme before any UI code reads it
+        self._current_theme = "Light"
+
         # if using ttkbootstrap, the constructor signature differs a bit:
         if HAS_BOOTSTRAP:
             super().__init__(themename="flatly")
@@ -966,6 +1030,9 @@ class TaskApp(BaseWindow):
         self.geometry("1700x950")
         self.db = TaskDB()
         self.settings = load_settings()
+
+        # apply saved default theme
+        self._current_theme = self.settings.get("default_theme", self._current_theme)
 
         self._init_styles()
 
@@ -1014,7 +1081,7 @@ class TaskApp(BaseWindow):
         ttk.Button(toolbar, text="⚙️ Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=5)
 
         ttk.Label(toolbar, text="Theme:").pack(side=tk.RIGHT, padx=(6,4))
-        self.theme_var = tk.StringVar(value=self._current_theme)
+        self.theme_var = tk.StringVar(value=getattr(self, "_current_theme", "Light"))
         theme_cb = ttk.Combobox(toolbar, textvariable=self.theme_var, values=list(self._themes.keys()), width=10, state="readonly")
         theme_cb.pack(side=tk.RIGHT, padx=(0,8))
         theme_cb.bind("<<ComboboxSelected>>", lambda e: self._set_theme(self.theme_var.get()))
@@ -1745,7 +1812,7 @@ class TaskApp(BaseWindow):
     def _open_settings(self):
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("350x240")
+        win.geometry("380x260")
         tk.Label(win, text="Outlook Refresh Minutes").grid(row=0, column=0, sticky="w", padx=10, pady=5)
         refresh_var = tk.IntVar(value=self.settings.get("outlook_refresh_minutes", 30))
         tk.Entry(win, textvariable=refresh_var, width=10).grid(row=0, column=1, padx=10, pady=5)
@@ -1754,13 +1821,17 @@ class TaskApp(BaseWindow):
         ttk.Label(win, text="Default Theme:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
         default_theme_var = tk.StringVar(value=self._current_theme)
         ttk.Combobox(win, textvariable=default_theme_var, values=list(self._themes.keys()), state="readonly").grid(row=2, column=1, padx=10, pady=5)
+
         def save_and_close():
             self.settings["outlook_refresh_minutes"] = refresh_var.get()
             self.settings["show_description"] = show_desc_var.get()
-            self._set_theme(default_theme_var.get())
+            self.settings["default_theme"] = default_theme_var.get()
             save_settings(self.settings)
-            messagebox.showinfo("Settings", "Settings saved.\nRestart app to apply Task List layout changes.")
+            # apply immediately
+            self._set_theme(default_theme_var.get())
+            messagebox.showinfo("Settings", "Settings saved.")
             win.destroy()
+
         ttk.Button(win, text="Save", command=save_and_close).grid(row=3, column=0, columnspan=2, pady=15)
 
     def _check_reminders(self):
