@@ -266,31 +266,30 @@ else:
 
 class TaskApp(BaseWindow):
     def _init_styles(self):
-        """Initialize theme, fonts and button styles (Option 1: custom default button)."""
+        """Minimal, non-invasive style initialization — restores native-looking buttons."""
         style = ttk.Style()
 
-        # Prefer a theme that allows predictable styling across platforms
+        # Try to leave the platform theme as-is so native button rendering is preserved.
         try:
-            style.theme_use("clam")
+            # Don't forcibly change theme; use whatever is default for the system.
+            current = style.theme_use()
         except Exception:
-            # If clam not available, fall back to default
-            try:
-                style.theme_use(style.theme_names()[0])
-            except Exception:
-                pass
+            current = None
 
-        # Fonts
+        # Fonts — keep these conservative so platform-native widgets still look right
         default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
         heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
-
-        # Base UI font and heading font
         try:
             style.configure(".", font=default_font)
             style.configure("Treeview.Heading", font=heading_font)
+            style.configure("TLabel", padding=2)
+            style.configure("TButton", padding=6)  # keep a little padding but don't override colors
+            style.configure("Treeview", rowheight=22)
         except Exception:
+            # If any style config fails on a backend, ignore and continue with defaults.
             pass
 
-        # Define colors for themes (you already had these; keep them)
+        # Theme palettes (kept from your previous design)
         self._themes = {
             "Light": {
                 "bg": "#f7f7f7",
@@ -307,76 +306,28 @@ class TaskApp(BaseWindow):
                 "muted": "#cccccc"
             }
         }
+        # default to Light if not set yet
         self._current_theme = getattr(self, "_current_theme", "Light")
 
-        # -- Button styling: override TButton so all ttk.Buttons pick this up --
-        # This produces a neutral, flat, light-gray button with subtle hover feedback.
+        # Configure tree tags for row highlighting — non-invasive colors that work across themes.
         try:
-            # Primary look for normal buttons
-            style.configure(
-                "TButton",
-                padding=6,
-                relief="flat",
-                background="#f0f0f0",   # normal background (light)
-                foreground="#000000",
-                borderwidth=0,
-            )
-
-            # Hover / active / pressed mappings
-            style.map(
-                "TButton",
-                background=[
-                    ("active", "#e6e6e6"),
-                    ("pressed", "#dcdcdc"),
-                    ("disabled", "#f0f0f0")
-                ],
-                foreground=[
-                    ("disabled", "#9a9a9a")
-                ]
-            )
-
-            # Also create a Custom.TButton alias for explicit use if needed
-            style.configure(
-                "Custom.TButton",
-                padding=6,
-                relief="flat",
-                background="#f0f0f0",
-                foreground="#000000",
-                borderwidth=0,
-            )
-            style.map(
-                "Custom.TButton",
-                background=[("active", "#e6e6e6"), ("pressed", "#dcdcdc")],
-                foreground=[("disabled", "#9a9a9a")]
-            )
-        except Exception as e:
-            # If button styling fails for any reason, don't crash — just continue.
-            print("Button style init warning:", e)
-
-        # Tweak label and tree fonts/padding a little
-        try:
-            style.configure("TLabel", padding=2)
-            style.configure("Treeview", rowheight=22)
+            # these are used later via tree.tag_configure as well
+            # keep these here but do not force widget-level color overrides that change button appearance
+            self.tree_tag_defaults = {
+                "priority_high": "#FFD6D6",
+                "priority_medium": "#FFF5CC",
+                "priority_low": "#E6FFEA",
+                "oddrow": "#FFFFFF",
+                "evenrow": "#F6F6F6"
+            }
         except Exception:
-            pass
+            # if tree doesn't exist yet, that's fine — _populate will still set tags
+            self.tree_tag_defaults = {}
 
-        # Tag colors for Treeview rows (used by _set_theme/_populate)
+        # Apply background to main window to match current theme (safe)
         try:
-            if getattr(self, "_current_theme", "Light") == "Dark":
-                style.configure("Treeview", background="#2f2f2f", fieldbackground="#2f2f2f", foreground="#ffffff")
-            else:
-                style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#000000")
+            self.configure(bg=self._themes[self._current_theme]["bg"])
         except Exception:
-            pass
-
-        # Configure tree tags (used in _populate)
-        try:
-            # light theme tags
-            style.configure("Treeview.priority_high", background="#FFD6D6")
-            style.configure("Treeview.priority_medium", background="#FFF5CC")
-            style.configure("Treeview.priority_low", background="#E6FFEA")
-        except Exception:
-            # fallback — some ttk backends ignore widget-specific tag styles; you'll still get tag_configure() calls in _set_theme/_populate
             pass
 
     def _set_theme(self, theme_name):
