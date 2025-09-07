@@ -83,12 +83,13 @@ class TaskDB:
                 progress_log TEXT,
                 attachments TEXT,
                 reminder_minutes INTEGER,
+                reminder_set_at TEXT,
                 reminder_sent_at TEXT
             );"""
         )
 
         # Ensure schema migrations (if db already exists but lacks these columns)
-        for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_sent_at"]:
+        for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_set_at", "reminder_sent_at"]:
             try:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT;")
             except sqlite3.OperationalError:
@@ -97,22 +98,23 @@ class TaskDB:
 
         self.conn.commit()
 
-    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None):
+    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None, reminder_set_at=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
             self.conn.execute(
                 """INSERT INTO tasks(title, description, due_date, priority, status,
-                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_sent_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, None),
+                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, reminder_set_at, None),
             )
 
-    def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None):
+    def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None, reminder_set_at=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
-            if reminder_minutes is None:
+            # If caller passes reminder_* explicitly, update them; otherwise leave as-is
+            if reminder_minutes is None and reminder_set_at is None:
                 self.conn.execute(
                     """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
                        status=?, updated_at=?, done_at=? WHERE id=?""",
@@ -121,8 +123,8 @@ class TaskDB:
             else:
                 self.conn.execute(
                     """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
-                       status=?, updated_at=?, done_at=?, reminder_minutes=? WHERE id=?""",
-                    (title, description, due_date, priority, status, now, done_at, reminder_minutes, task_id),
+                       status=?, updated_at=?, done_at=?, reminder_minutes=?, reminder_set_at=? WHERE id=?""",
+                    (title, description, due_date, priority, status, now, done_at, reminder_minutes, reminder_set_at, task_id),
                 )
 
     def update_progress(self, task_id, progress_log):
@@ -175,8 +177,8 @@ class TaskDB:
                 done_at = now if r.get("status") == "Done" else None
                 self.conn.execute(
                     """INSERT INTO tasks(title, description, due_date, priority, status,
-                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_sent_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         r.get("title"),
                         r.get("description"),
@@ -190,6 +192,7 @@ class TaskDB:
                         r.get("progress_log", ""),
                         None,
                         None,
+                        None,
                     ),
                 )
 
@@ -197,45 +200,122 @@ class TaskDB:
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
 
+    def _format_timedelta(self, td):
+        """Format a timedelta to human friendly string: H:MM:SS or Xm if > 60 min."""
+        total_seconds = int(td.total_seconds())
+        if total_seconds <= 0:
+            return "Now"
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        if minutes >= 1:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    def _refresh_reminder_display(self):
+        """Update the 'reminder' cell in the Task List Treeview with live countdowns."""
+        try:
+            cur = self.db.conn.cursor()
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, "values")
+                if not vals:
+                    continue
+                try:
+                    task_id = int(vals[0])
+                except Exception:
+                    continue
+
+                cur.execute("SELECT reminder_minutes, reminder_set_at, reminder_sent_at FROM tasks WHERE id=?", (task_id,))
+                row = cur.fetchone()
+                display = "—"
+                if row:
+                    rm = row["reminder_minutes"]
+                    set_at = row["reminder_set_at"]
+                    sent_at = row["reminder_sent_at"]
+                    # If no rm or no set time -> show dash
+                    if rm is None or rm == "" or set_at is None:
+                        display = "—"
+                    else:
+                        try:
+                            rm_int = int(rm)
+                        except Exception:
+                            display = "—"
+                            self.tree.set(iid, "reminder", display)
+                            continue
+                        try:
+                            set_dt = datetime.fromisoformat(set_at)
+                        except Exception:
+                            display = "—"
+                            self.tree.set(iid, "reminder", display)
+                            continue
+
+                        # if already fired and sent_at >= target -> show "Sent"
+                        target = set_dt + timedelta(minutes=rm_int)
+                        if sent_at:
+                            try:
+                                sent_dt = datetime.fromisoformat(sent_at)
+                                if sent_dt >= target:
+                                    display = "Sent"
+                                else:
+                                    # sent earlier than target (weird) — compute remaining until target
+                                    remaining = target - datetime.now()
+                                    display = self._format_timedelta(remaining)
+                            except Exception:
+                                remaining = target - datetime.now()
+                                display = self._format_timedelta(remaining)
+                        else:
+                            # not sent: show remaining time until target
+                            remaining = target - datetime.now()
+                            display = self._format_timedelta(remaining)
+                # finally set tree cell
+                try:
+                    self.tree.set(iid, "reminder", display)
+                except Exception:
+                    # some platforms require re-inserting; ignore silently
+                    pass
+
+        except Exception as e:
+            # safe to ignore occasional DB race
+            # print("Reminder display update error:", e)
+            pass
+        finally:
+            # schedule next update in 1 second
+            self.after(1000, self._refresh_reminder_display)
+
     # --------------- Reminder helpers ----------------
     def _schedule_task_reminder_checker(self):
         """Schedule the periodic reminder check (every 60 seconds)."""
         # run immediately and then schedule repeated calls
         self._check_task_reminders()
-        self.after(60*1000, self._schedule_task_reminder_checker)
+        self.after(5*1000, self._schedule_task_reminder_checker)
 
     def _check_task_reminders(self):
-        """Check DB for tasks that require reminders and show popup if needed."""
+        """Check DB for tasks that require reminders (stopwatch-style) and show popup if needed."""
         try:
             cur = self.db.conn.cursor()
-            # Only consider tasks with due_date and reminder_minutes set, and not done
             cur.execute("""
-                SELECT id, title, description, due_date, reminder_minutes, reminder_sent_at
+                SELECT id, title, description, reminder_minutes, reminder_set_at, reminder_sent_at
                 FROM tasks
-                WHERE due_date IS NOT NULL AND reminder_minutes IS NOT NULL AND reminder_minutes != '' AND status != 'Done'
+                WHERE reminder_minutes IS NOT NULL AND reminder_minutes != '' AND reminder_set_at IS NOT NULL
+                  AND status != 'Done'
             """)
             rows = cur.fetchall()
             now_dt = datetime.now()
             for r in rows:
                 try:
-                    due = datetime.strptime(r["due_date"], "%Y-%m-%d")
+                    rm_min = int(r["reminder_minutes"])
                 except Exception:
                     continue
-                reminder_min = None
                 try:
-                    # reminder_minutes may be stored as text (migration); coerce to int
-                    reminder_min = int(r["reminder_minutes"])
+                    set_at = datetime.fromisoformat(r["reminder_set_at"])
                 except Exception:
-                    reminder_min = None
-
-                if reminder_min is None:
                     continue
 
-                # For date-only due_date assume due at 09:00 to avoid immediate triggers.
-                due_assumed = datetime(due.year, due.month, due.day, 9, 0, 0)
-                trigger_time = due_assumed - timedelta(minutes=reminder_min)
+                # target time = set_at + minutes
+                target = set_at + timedelta(minutes=rm_min)
 
-                # If reminder_sent_at exists and is later than trigger_time, skip (already reminded or snoozed)
+                # already sent? if reminder_sent_at exists and >= target, skip
                 sent = None
                 if r["reminder_sent_at"]:
                     try:
@@ -243,14 +323,15 @@ class TaskApp(tk.Tk):
                     except Exception:
                         sent = None
 
-                # If current time is past trigger and we haven't sent (sent is None or earlier than trigger), show reminder
-                if now_dt >= trigger_time and (sent is None or sent < trigger_time):
-                    # Show reminder popup (non-blocking)
+                # If current time >= target and we haven't already fired (or was snoozed earlier), fire
+                if now_dt >= target and (sent is None or sent < target):
+                    # show popup (non-blocking)
                     self._show_reminder_popup(r["id"], r["title"], r["description"])
-                    # mark reminder_sent_at to now so it doesn't re-fire immediately
+                    # mark reminder_sent_at to now
                     now_iso = datetime.now().isoformat(timespec="seconds")
                     self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, r["id"]))
                     self.db.conn.commit()
+
         except Exception as e:
             print("Reminder check error:", e)
 
@@ -293,10 +374,13 @@ class TaskApp(tk.Tk):
             self._open_edit_window(task_id)
 
         def _snooze(minutes):
-            # set reminder_sent_at to now + minutes so it will re-fire after snooze
-            new_time = (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
-            self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (new_time, task_id))
-            self.db.conn.commit()
+            # restart countdown from now for `minutes`, clear reminder_sent_at
+            new_set = datetime.now().isoformat(timespec="seconds")
+            try:
+                self.db.conn.execute("UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?", (minutes, new_set, task_id))
+                self.db.conn.commit()
+            except Exception:
+                pass
             win.destroy()
 
         def dismiss():
@@ -520,33 +604,36 @@ class TaskApp(tk.Tk):
             desc = desc_text.get("1.0", tk.END).strip()
             reminder_value = reminder_var.get().strip() or None
 
-            if task_id:
-                # update task and reminder
-                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                               reminder_minutes=(int(reminder_value) if reminder_value else None))
+            # convert empty string to None; store as integer when present
+            if reminder_value not in (None, "", "None"):
                 try:
-                    self.db.conn.execute("UPDATE tasks SET reminder_minutes=? WHERE id=?", (reminder_value, task_id))
-                    self.db.conn.commit()
+                    reminder_minutes_int = int(reminder_value)
                 except Exception:
-                    pass
+                    messagebox.showwarning("Validation", "Reminder must be an integer number of minutes or blank.", parent=win)
+                    return
+                reminder_set_at_iso = datetime.now().isoformat(timespec="seconds")
             else:
-                # create new -> add then update its reminder + attachments if staged
+                reminder_minutes_int = None
+                reminder_set_at_iso = None
+
+            if task_id:
+                # update task and reminder fields
+                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
+                               reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+            else:
+                # create new -> add with reminder values
                 self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
-                            reminder_minutes=(int(reminder_value) if reminder_value else None))
+                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+                # handle attachments (staged) and commit id -> same logic as you had
                 cur = self.db.conn.cursor()
                 cur.execute("SELECT last_insert_rowid() as id")
                 new_id = cur.fetchone()["id"]
-                try:
-                    if reminder_value is not None:
-                        self.db.conn.execute("UPDATE tasks SET reminder_minutes=? WHERE id=?", (reminder_value, new_id))
-                except Exception:
-                    pass
                 if staged_attachments:
                     try:
                         self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
                     except Exception:
                         pass
-                self.db.conn.commit()
+                # if we created with reminder_set_at already set we are good
 
             self._populate()
             self._populate_kanban()
@@ -728,6 +815,10 @@ class TaskApp(tk.Tk):
         # populate after a short delay
         self.after(100, self._populate)
         self.after(100, self._populate_kanban)
+
+        # start reminder checking + UI refresher
+        self._schedule_task_reminder_checker()   # every ~5s to fire popups
+        self._refresh_reminder_display()         # updates reminder countdown in task list every 1s
 
         if HAS_OUTLOOK:
             self._schedule_outlook_refresh(self.settings.get("outlook_refresh_minutes", 30))
