@@ -1,10 +1,10 @@
-# patched_office_activity_simplifier.py
+# office_activity_simplifier_outlook_full_final.py
 import sys
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3, json, os, csv
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 try:
     import win32com.client
@@ -25,8 +25,7 @@ try:
 except ImportError:
     HAS_HTML = False
 
-
-# after the tkhtmlview import block
+# optional calendar widget
 try:
     from tkcalendar import DateEntry
     HAS_DATEENTRY = True
@@ -82,12 +81,14 @@ class TaskDB:
                 done_at TEXT,
                 outlook_id TEXT,
                 progress_log TEXT,
-                attachments TEXT
+                attachments TEXT,
+                reminder_minutes INTEGER,
+                reminder_sent_at TEXT
             );"""
         )
 
         # Ensure schema migrations (if db already exists but lacks these columns)
-        for col in ["outlook_id", "progress_log", "attachments"]:
+        for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_sent_at"]:
             try:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT;")
             except sqlite3.OperationalError:
@@ -96,26 +97,33 @@ class TaskDB:
 
         self.conn.commit()
 
-    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None):
+    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
             self.conn.execute(
                 """INSERT INTO tasks(title, description, due_date, priority, status,
-                   created_at, updated_at, done_at, outlook_id, progress_log)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (title, description, due_date, priority, status, now, now, done_at, outlook_id, ""),
+                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_sent_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, None),
             )
 
-    def update(self, task_id, title, description, due_date, priority, status):
+    def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
-            self.conn.execute(
-                """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
-                   status=?, updated_at=?, done_at=? WHERE id=?""",
-                (title, description, due_date, priority, status, now, done_at, task_id),
-            )
+            if reminder_minutes is None:
+                self.conn.execute(
+                    """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
+                       status=?, updated_at=?, done_at=? WHERE id=?""",
+                    (title, description, due_date, priority, status, now, done_at, task_id),
+                )
+            else:
+                self.conn.execute(
+                    """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
+                       status=?, updated_at=?, done_at=?, reminder_minutes=? WHERE id=?""",
+                    (title, description, due_date, priority, status, now, done_at, reminder_minutes, task_id),
+                )
 
     def update_progress(self, task_id, progress_log):
         now = _now_iso()
@@ -167,8 +175,8 @@ class TaskDB:
                 done_at = now if r.get("status") == "Done" else None
                 self.conn.execute(
                     """INSERT INTO tasks(title, description, due_date, priority, status,
-                                        created_at, updated_at, done_at, outlook_id, progress_log)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_sent_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         r.get("title"),
                         r.get("description"),
@@ -180,43 +188,150 @@ class TaskDB:
                         done_at,
                         r.get("outlook_id"),
                         r.get("progress_log", ""),
+                        None,
+                        None,
                     ),
                 )
+
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
 
+    # --------------- Reminder helpers ----------------
+    def _schedule_task_reminder_checker(self):
+        """Schedule the periodic reminder check (every 60 seconds)."""
+        # run immediately and then schedule repeated calls
+        self._check_task_reminders()
+        self.after(60*1000, self._schedule_task_reminder_checker)
+
+    def _check_task_reminders(self):
+        """Check DB for tasks that require reminders and show popup if needed."""
+        try:
+            cur = self.db.conn.cursor()
+            # Only consider tasks with due_date and reminder_minutes set, and not done
+            cur.execute("""
+                SELECT id, title, description, due_date, reminder_minutes, reminder_sent_at
+                FROM tasks
+                WHERE due_date IS NOT NULL AND reminder_minutes IS NOT NULL AND reminder_minutes != '' AND status != 'Done'
+            """)
+            rows = cur.fetchall()
+            now_dt = datetime.now()
+            for r in rows:
+                try:
+                    due = datetime.strptime(r["due_date"], "%Y-%m-%d")
+                except Exception:
+                    continue
+                reminder_min = None
+                try:
+                    # reminder_minutes may be stored as text (migration); coerce to int
+                    reminder_min = int(r["reminder_minutes"])
+                except Exception:
+                    reminder_min = None
+
+                if reminder_min is None:
+                    continue
+
+                # For date-only due_date assume due at 09:00 to avoid immediate triggers.
+                due_assumed = datetime(due.year, due.month, due.day, 9, 0, 0)
+                trigger_time = due_assumed - timedelta(minutes=reminder_min)
+
+                # If reminder_sent_at exists and is later than trigger_time, skip (already reminded or snoozed)
+                sent = None
+                if r["reminder_sent_at"]:
+                    try:
+                        sent = datetime.fromisoformat(r["reminder_sent_at"])
+                    except Exception:
+                        sent = None
+
+                # If current time is past trigger and we haven't sent (sent is None or earlier than trigger), show reminder
+                if now_dt >= trigger_time and (sent is None or sent < trigger_time):
+                    # Show reminder popup (non-blocking)
+                    self._show_reminder_popup(r["id"], r["title"], r["description"])
+                    # mark reminder_sent_at to now so it doesn't re-fire immediately
+                    now_iso = datetime.now().isoformat(timespec="seconds")
+                    self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, r["id"]))
+                    self.db.conn.commit()
+        except Exception as e:
+            print("Reminder check error:", e)
+
+    def _show_reminder_popup(self, task_id, title, description):
+        """Attractive focused reminder popup with actions."""
+        # On Windows, show a toast too
+        if HAS_NOTIFY:
+            try:
+                toaster.show_toast(f"Reminder: {title}", (description or "Task due soon")[:200], duration=5, threaded=True)
+            except Exception:
+                pass
+
+        # Create a focused popup
+        win = tk.Toplevel(self)
+        win.title("🔔 Task Reminder")
+        win.geometry("520x260")
+        win.transient(self)
+        win.attributes("-topmost", True)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        # header
+        header = ttk.Label(win, text=title, font=("", 14, "bold"))
+        header.pack(padx=12, pady=(12, 6), anchor="w")
+
+        # description area (scrollable if long)
+        txt = tk.Text(win, height=6, wrap="word", padx=8, pady=4)
+        txt.insert("1.0", description or "(no description)")
+        txt.config(state="disabled")
+        txt.pack(fill=tk.BOTH, expand=False, padx=12, pady=(0,8))
+
+        # Buttons frame
+        btnf = ttk.Frame(win)
+        btnf.pack(fill=tk.X, padx=12, pady=6)
+
+        def open_task():
+            win.destroy()
+            self._open_edit_window(task_id)
+
+        def _snooze(minutes):
+            # set reminder_sent_at to now + minutes so it will re-fire after snooze
+            new_time = (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+            self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (new_time, task_id))
+            self.db.conn.commit()
+            win.destroy()
+
+        def dismiss():
+            # mark as reminded now
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
+            self.db.conn.commit()
+            win.destroy()
+
+        ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT)
+        ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT)
+
+        # visual highlight (optional)
+        win.lift()
+
+
+    # -------------------- UI / CRUD / Kanban --------------------
     def _save_inline_from_form(self):
-        """Save values from the inline form to the selected task (or create new if none selected)."""
+        """Compatibility inline save (kept minimal)."""
         sel = self.tree.selection()
-        # if selection present, update that task; otherwise create a new one
         if sel:
             try:
                 task_id = int(self.tree.item(sel[0], "values")[0])
             except Exception:
                 messagebox.showwarning("Save", "Could not determine selected task id.")
                 return
-            title = self.title_var.get().strip()
-            if not title:
-                messagebox.showwarning("Validation", "Title is required")
-                return
-            due = self.due_var.get().strip() or None
-            # validate date
-            if due:
-                try:
-                    datetime.strptime(due, "%Y-%m-%d")
-                except ValueError:
-                    messagebox.showwarning("Validation", "Date must be YYYY-MM-DD")
-                    return
-            desc = self.desc_text.get("1.0", tk.END).strip()
-            self.db.update(task_id, title, desc, due, self.priority_var.get(), self.status_var.get())
-            self._populate(); self._populate_kanban()
+            # inline fields may not exist in the simplified UI, so just reopen editor
+            self._open_edit_window(task_id)
         else:
-            # create new via popup to keep flow simple
             self._open_edit_window(None)
 
     def _on_task_double_click(self, event):
-        """Double-click handler for the Treeview (Task List)."""
         sel = self.tree.selection()
         if not sel:
             return
@@ -226,9 +341,7 @@ class TaskApp(tk.Tk):
             return
         self._open_edit_window(task_id)
 
-
     def _on_kanban_double_click(self, event):
-        """Double-click handler for Kanban Listbox items using the mapping."""
         lb = event.widget
         idx = lb.nearest(event.y)
         if idx < 0:
@@ -241,8 +354,11 @@ class TaskApp(tk.Tk):
         self._open_edit_window(task_id)
 
     def _open_edit_window(self, task_id=None):
-        """Open popup for adding/editing a task. Uses tkcalendar.DateEntry if available."""
-        # Try to import DateEntry locally so the rest of the app doesn't require tkcalendar
+        """
+        Open popup for adding/editing a task.
+        Adds a Reminder control (dropdown) to pick minutes before due (or None).
+        """
+        # local DateEntry import (if available)
         try:
             from tkcalendar import DateEntry
             has_dateentry = True
@@ -254,19 +370,18 @@ class TaskApp(tk.Tk):
         win.transient(self)
         win.grab_set()
         win.title("Edit Task" if task_id else "Add Task")
-        win.geometry("680x520")
+        win.geometry("680x560")
 
         # Variables
         title_var = tk.StringVar()
         due_var = tk.StringVar()
         priority_var = tk.StringVar(value="Medium")
         status_var = tk.StringVar(value="Pending")
+        reminder_var = tk.StringVar(value="")  # will store minutes as string or "" for none
 
-        # attachments staging: list of full file paths that will be saved to attachments/
         staged_attachments = []
         existing_attachments = []
 
-        # Layout frame
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
 
@@ -274,7 +389,6 @@ class TaskApp(tk.Tk):
         ttk.Entry(frm, textvariable=title_var, width=50).grid(row=0, column=1, sticky="w", padx=6, pady=4)
 
         ttk.Label(frm, text="Due Date (YYYY-MM-DD)").grid(row=1, column=0, sticky="w")
-        # Use DateEntry if available, otherwise fallback to ttk.Entry
         if has_dateentry:
             due_widget = DateEntry(frm, date_pattern="yyyy-mm-dd", textvariable=due_var, width=20)
             due_widget.grid(row=1, column=1, sticky="w", padx=6, pady=4)
@@ -283,20 +397,24 @@ class TaskApp(tk.Tk):
             due_widget.grid(row=1, column=1, sticky="w", padx=6, pady=4)
 
         ttk.Label(frm, text="Priority").grid(row=2, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=priority_var, values=PRIORITIES, state="readonly", width=12).grid(
-            row=2, column=1, sticky="w", padx=6, pady=4
-        )
+        ttk.Combobox(frm, textvariable=priority_var, values=PRIORITIES, state="readonly", width=12).grid(row=2, column=1, sticky="w", padx=6, pady=4)
 
         ttk.Label(frm, text="Status").grid(row=3, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=status_var, values=STATUSES, state="readonly", width=12).grid(
-            row=3, column=1, sticky="w", padx=6, pady=4
-        )
+        ttk.Combobox(frm, textvariable=status_var, values=STATUSES, state="readonly", width=12).grid(row=3, column=1, sticky="w", padx=6, pady=4)
 
-        ttk.Label(frm, text="Description").grid(row=4, column=0, sticky="nw", pady=(6,0))
+        # Reminder control (combo)
+        ttk.Label(frm, text="Reminder (minutes before due)").grid(row=4, column=0, sticky="w")
+        # preset choices plus custom entry allowed
+        reminder_choices = ["", "5", "10", "30", "60", "120", "1440"]  # 1440 = 1 day
+        reminder_cb = ttk.Combobox(frm, textvariable=reminder_var, values=reminder_choices, width=18)
+        reminder_cb.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        reminder_cb.set("")  # default none
+
+        ttk.Label(frm, text="Description").grid(row=5, column=0, sticky="nw", pady=(6,0))
         desc_text = tk.Text(frm, height=10, width=60, wrap="word")
-        desc_text.grid(row=4, column=1, sticky="we", padx=6, pady=(6,0))
+        desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0))
 
-        # Load existing task values (and attachments) if editing
+        # Load existing values if editing
         if task_id:
             cur = self.db.conn.cursor()
             cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -307,17 +425,28 @@ class TaskApp(tk.Tk):
                 priority_var.set(r["priority"] or "Medium")
                 status_var.set(r["status"] or "Pending")
                 desc_text.insert(tk.END, r["description"] or "")
-                if r["attachments"]:
+
+                # attachments
+                if "attachments" in r.keys() and r["attachments"]:
                     try:
                         existing_attachments = json.loads(r["attachments"])
                     except Exception:
                         existing_attachments = []
 
-        # Attachments area inside editor
-        ttk.Label(frm, text="Attachments").grid(row=5, column=0, sticky="nw", pady=(10,0))
-        attachments_frame = ttk.Frame(frm)
-        attachments_frame.grid(row=5, column=1, sticky="we", padx=6, pady=(10,0))
+                # load reminder value if present
+                try:
+                    rm = r["reminder_minutes"]
+                    if rm not in (None, "", "None"):
+                        reminder_var.set(str(rm))
+                    else:
+                        reminder_var.set("")
+                except Exception:
+                    reminder_var.set("")
 
+        # Attachments UI (same as earlier)
+        ttk.Label(frm, text="Attachments").grid(row=6, column=0, sticky="nw", pady=(10,0))
+        attachments_frame = ttk.Frame(frm)
+        attachments_frame.grid(row=6, column=1, sticky="we", padx=6, pady=(10,0))
         attachments_list_var = tk.StringVar(value=", ".join(os.path.basename(p) for p in existing_attachments))
         attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=500)
         attachments_label.pack(anchor="w", fill=tk.X)
@@ -336,11 +465,15 @@ class TaskApp(tk.Tk):
                 fdst.write(fsrc.read())
 
             if task_id:
-                # update DB immediately for existing task
                 cur = self.db.conn.cursor()
                 cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
                 row = cur.fetchone()
-                files = json.loads(row["attachments"] or "[]") if row else []
+                files = []
+                if row and row["attachments"]:
+                    try:
+                        files = json.loads(row["attachments"])
+                    except Exception:
+                        files = []
                 files.append(dest)
                 self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(files), task_id))
                 self.db.conn.commit()
@@ -385,24 +518,42 @@ class TaskApp(tk.Tk):
                     return
 
             desc = desc_text.get("1.0", tk.END).strip()
+            reminder_value = reminder_var.get().strip() or None
 
             if task_id:
-                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get())
-            else:
-                self.db.add(title, desc, due or None, priority_var.get(), status_var.get())
-                if staged_attachments:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT last_insert_rowid() as id")
-                    new_id = cur.fetchone()["id"]
-                    self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
+                # update task and reminder
+                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
+                               reminder_minutes=(int(reminder_value) if reminder_value else None))
+                try:
+                    self.db.conn.execute("UPDATE tasks SET reminder_minutes=? WHERE id=?", (reminder_value, task_id))
                     self.db.conn.commit()
+                except Exception:
+                    pass
+            else:
+                # create new -> add then update its reminder + attachments if staged
+                self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
+                            reminder_minutes=(int(reminder_value) if reminder_value else None))
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT last_insert_rowid() as id")
+                new_id = cur.fetchone()["id"]
+                try:
+                    if reminder_value is not None:
+                        self.db.conn.execute("UPDATE tasks SET reminder_minutes=? WHERE id=?", (reminder_value, new_id))
+                except Exception:
+                    pass
+                if staged_attachments:
+                    try:
+                        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
+                    except Exception:
+                        pass
+                self.db.conn.commit()
 
             self._populate()
             self._populate_kanban()
             win.destroy()
 
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=12)
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
 
@@ -430,7 +581,6 @@ class TaskApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Error", f"Could not open {f}: {e}")
 
-
     def _add_attachment(self):
         path = filedialog.askopenfilename()
         if not path:
@@ -457,15 +607,19 @@ class TaskApp(tk.Tk):
         cur = self.db.conn.cursor()
         cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone()
-        files = json.loads(row["attachments"] or "[]")
+        files = []
+        if row and row["attachments"]:
+            try:
+                files = json.loads(row["attachments"])
+            except Exception:
+                files = []
         files.append(dest)
         self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(files), task_id))
         self.db.conn.commit()
 
-        # Update attachments label
+        # Update attachments label (internal var)
         self.attachments_var.set(", ".join(os.path.basename(f) for f in files))
         messagebox.showinfo("Attachment", f"File {os.path.basename(dest)} added.")
-
 
     def _open_attachment(self):
         sel = self.tree.selection()
@@ -488,7 +642,6 @@ class TaskApp(tk.Tk):
             else:  # Linux
                 os.system(f"xdg-open '{f}'")
 
-
     def _on_kanban_drag_start(self, event):
         lb = event.widget
         idx = lb.nearest(event.y)
@@ -497,7 +650,7 @@ class TaskApp(tk.Tk):
                 "listbox": lb,
                 "index": idx,
                 "task_line": lb.get(idx)
-        }
+            }
 
     def _on_kanban_drag_motion(self, event):
         lb = event.widget
@@ -554,7 +707,6 @@ class TaskApp(tk.Tk):
 
         self.drag_data = None
 
-
     def __init__(self):
         super().__init__()
         self.title("Office Activity Simplifier")
@@ -580,8 +732,10 @@ class TaskApp(tk.Tk):
         if HAS_OUTLOOK:
             self._schedule_outlook_refresh(self.settings.get("outlook_refresh_minutes", 30))
 
+        # existing reminder check for due-today toast
         self._check_reminders()
-
+        # start task reminder checker (every 60s)
+        self._schedule_task_reminder_checker()
 
     def _treeview_sort_column(self, col, reverse):
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
@@ -592,9 +746,10 @@ class TaskApp(tk.Tk):
         for index, (val, k) in enumerate(l):
             self.tree.move(k, "", index)
         self.tree.heading(col, command=lambda: self._treeview_sort_column(col, not reverse))
-        
+
     # -------------------- UI --------------------
     def _build_ui(self):
+        """Build the main UI (Task List + Kanban). Includes a Reminder column in Task List."""
         toolbar = ttk.Frame(self, padding=8)
         toolbar.pack(fill=tk.X)
         ttk.Button(toolbar, text="Import Outlook Tasks", command=self._import_outlook_flags).pack(side=tk.LEFT, padx=5)
@@ -613,38 +768,41 @@ class TaskApp(tk.Tk):
         list_tab = ttk.Frame(self.notebook)
         self.notebook.add(list_tab, text="Task List")
 
+        # include 'reminder' column always
         if self.settings.get("show_description", False):
-            cols = ["id", "title", "desc", "due", "priority", "status"]
+            cols = ["id", "title", "desc", "due", "priority", "status", "reminder"]
         else:
-            cols = ["id", "title", "due", "priority", "status"]
+            cols = ["id", "title", "due", "priority", "status", "reminder"]
 
         self.tree = ttk.Treeview(list_tab, columns=cols, show="headings")
         self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         for col in cols:
-            self.tree.heading(col, text=col.title(),
-                    command=lambda _col=col: self._treeview_sort_column(_col, False))
+            # Title-case header
+            self.tree.heading(col, text=col.title(), command=lambda _col=col: self._treeview_sort_column(_col, False))
 
-        # column widths
+        # column widths tuned to include reminder column
         if self.settings.get("show_description", False):
             self.tree.column("id", width=50, anchor="center")
-            self.tree.column("title", width=350, anchor="w")
-            self.tree.column("desc", width=350, anchor="w")
+            self.tree.column("title", width=300, anchor="w")
+            self.tree.column("desc", width=300, anchor="w")
             self.tree.column("due", width=100, anchor="center")
-            self.tree.column("priority", width=100, anchor="center")
-            self.tree.column("status", width=100, anchor="center")
+            self.tree.column("priority", width=90, anchor="center")
+            self.tree.column("status", width=90, anchor="center")
+            self.tree.column("reminder", width=100, anchor="center")
         else:
-            self.tree.column("id", width=80, anchor="center")
-            self.tree.column("title", width=480, anchor="w")
+            self.tree.column("id", width=60, anchor="center")
+            self.tree.column("title", width=420, anchor="w")
             self.tree.column("due", width=100, anchor="center")
-            self.tree.column("priority", width=100, anchor="center")
-            self.tree.column("status", width=100, anchor="center")
+            self.tree.column("priority", width=90, anchor="center")
+            self.tree.column("status", width=90, anchor="center")
+            self.tree.column("reminder", width=100, anchor="center")
 
         # selection and double-click to open editor
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_task_double_click)
 
-        # Buttons: Add/Edit/Mark Done/Delete (Open editor for editing)
+        # Buttons: Add/Edit/Mark Done/Delete
         btns = ttk.Frame(list_tab)
         btns.pack(fill=tk.X, padx=8, pady=5)
         ttk.Button(btns, text="Add", command=lambda: self._open_edit_window(None)).pack(side=tk.LEFT)
@@ -652,8 +810,7 @@ class TaskApp(tk.Tk):
         ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=5)
         ttk.Button(btns, text="Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
 
-        # remove inline form: we will *not* show Task Details at bottom anymore
-        # keep the kanban tab
+        # -------------------- Kanban Board (unchanged) --------------------
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.kanban_tab, text="Kanban Board")
 
@@ -672,7 +829,6 @@ class TaskApp(tk.Tk):
             lb.pack(fill=tk.BOTH, expand=True)
             lb.status_name = status
 
-            # Selection + Drag & Drop bindings
             lb.bind("<<ListboxSelect>>", self._kanban_select)
             lb.bind("<ButtonPress-1>", self._on_kanban_drag_start)
             lb.bind("<B1-Motion>", self._on_kanban_drag_motion)
@@ -681,7 +837,7 @@ class TaskApp(tk.Tk):
 
             self.kanban_lists[status] = lb
 
-        # Right side details panel (kanban detail view)
+        # Right side details panel (kanban)
         desc_frame = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
         desc_frame.grid(row=0, column=len(STATUSES), sticky="nsew", padx=6)
         frame.columnconfigure(len(STATUSES), weight=1)
@@ -697,7 +853,7 @@ class TaskApp(tk.Tk):
         self.kanban_text.pack(fill=tk.BOTH, expand=True)
 
         self.btn_save_desc = ttk.Button(desc_frame, text="Save Description", command=self._save_kanban_desc)
-        self.btn_save_desc.pack(pady=5, after=self.kanban_text)
+        self.btn_save_desc.pack(pady=5)
 
         ttk.Label(desc_frame, text="Progress Log").pack(anchor="w")
         self.kanban_progress = tk.Text(desc_frame, height=8, wrap="word", width=50)
@@ -710,7 +866,6 @@ class TaskApp(tk.Tk):
         self.kanban_attachments_label.pack(anchor="w", fill=tk.X, pady=2)
         ttk.Button(desc_frame, text="Open Attachments", command=self._open_selected_kanban_attachments).pack(anchor="w", pady=2)
 
-        # Kanban action buttons
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
         action_frame.pack(fill=tk.X)
         self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled"); self.btn_edit.pack(side=tk.LEFT, padx=5)
@@ -719,7 +874,17 @@ class TaskApp(tk.Tk):
         self.btn_prev = ttk.Button(action_frame, text="← Move Previous", command=self._move_prev_selected, state="disabled"); self.btn_prev.pack(side=tk.LEFT, padx=5)
         self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled"); self.btn_next.pack(side=tk.LEFT, padx=5)
 
-    # -------------------- CRUD --------------------
+    # -------------------- CRUD helper used by Buttons --------------------
+    def _selected_tree_task_id(self):
+        """Return currently selected task id in tree, or None."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(self.tree.item(sel[0], "values")[0])
+        except Exception:
+            return None
+
     def _add_task(self):
         # now opens popup
         self._open_edit_window(None)
@@ -791,6 +956,7 @@ class TaskApp(tk.Tk):
 
     # -------------------- Populate --------------------
     def _populate(self):
+        """Populate the Treeview with tasks including reminder column."""
         for row in self.tree.get_children():
             self.tree.delete(row)
 
@@ -800,10 +966,29 @@ class TaskApp(tk.Tk):
             desc = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
             desc = desc.replace("\n", " ")[:80] + "..." if desc else ""
 
+            # sqlite3.Row supports keys() membership check
+            reminder_val = r["reminder_minutes"] if "reminder_minutes" in r.keys() else None
+            reminder_display = str(reminder_val) if reminder_val not in (None, "", "None") else "—"
+
             if self.settings.get("show_description", False):
-                values = [r["id"], r["title"], desc, r["due_date"] or "—", r["priority"], r["status"]]
+                values = [
+                    r["id"],
+                    r["title"],
+                    desc,
+                    r["due_date"] or "—",
+                    r["priority"],
+                    r["status"],
+                    reminder_display
+                ]
             else:
-                values = [r["id"], r["title"], r["due_date"] or "—", r["priority"], r["status"]]
+                values = [
+                    r["id"],
+                    r["title"],
+                    r["due_date"] or "—",
+                    r["priority"],
+                    r["status"],
+                    reminder_display
+                ]
             self.tree.insert("", tk.END, values=values)
 
     def _populate_kanban(self):
@@ -841,7 +1026,7 @@ class TaskApp(tk.Tk):
                         pass
 
     # -------------------- Kanban Actions --------------------
-    def  _kanban_select(self, event):
+    def _kanban_select(self, event):
         lb = event.widget
         idxs = lb.curselection()
         if not idxs:
@@ -887,13 +1072,16 @@ class TaskApp(tk.Tk):
 
             self.kanban_text.pack_forget()
             self.kanban_html.set_html(clean)
-            self.kanban_html.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
+            self.kanban_html.pack(fill=tk.BOTH, expand=True)
         else:
             if HAS_HTML:
-                self.kanban_html.pack_forget()
+                try:
+                    self.kanban_html.pack_forget()
+                except Exception:
+                    pass
             self.kanban_text.delete("1.0", tk.END)
             self.kanban_text.insert(tk.END, desc)
-            self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
+            self.kanban_text.pack(fill=tk.BOTH, expand=True)
 
         # progress log
         self.kanban_progress.delete("1.0", tk.END)
@@ -914,7 +1102,6 @@ class TaskApp(tk.Tk):
         self.btn_done.config(state="normal")
         self.btn_prev.config(state="normal" if self.kanban_selected_status != "Pending" else "disabled")
         self.btn_next.config(state="normal" if self.kanban_selected_status != "Done" else "disabled")
-
 
     def _edit_selected_kanban(self):
         if not self.kanban_selected_id:
@@ -992,7 +1179,7 @@ class TaskApp(tk.Tk):
         self.kanban_progress.insert(tk.END, new_log)
         self._populate_kanban()
 
-
+    # -------------------- Outlook --------------------
     def _get_flagged_from_folder(self, folder, flagged):
         """Recursively fetch flagged mails from a folder + subfolders"""
         try:
@@ -1031,7 +1218,7 @@ class TaskApp(tk.Tk):
 
         except Exception:
             pass
-    # -------------------- Outlook --------------------
+
     def _get_flagged_emails(self):
         if not HAS_OUTLOOK:
             return []
@@ -1076,7 +1263,6 @@ class TaskApp(tk.Tk):
             print("Outlook fetch error:", e)
 
         return flagged
-    
 
     def _import_outlook_flags(self):
         flagged = self._get_flagged_emails()
@@ -1188,7 +1374,6 @@ class TaskApp(tk.Tk):
         self._sync_outlook_task(self.kanban_selected_id, {"desc": new_desc}, action="update")
         messagebox.showinfo("Saved", "Description updated successfully.")
         
-
     def _show_overdue_popup(self):
         """Popup window showing overdue tasks in a table"""
         rows = self.db.fetch_overdue()
@@ -1217,7 +1402,6 @@ class TaskApp(tk.Tk):
 
         tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-
     def _show_today_popup(self):
         """Popup window showing today's tasks in a table"""
         rows = self.db.fetch_due_today()
@@ -1244,7 +1428,6 @@ class TaskApp(tk.Tk):
             tree.insert("", tk.END, values=(r["title"], r["due_date"], r["priority"], r["status"]))
 
         tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
 
     # -------------------- Settings --------------------
     def _open_settings(self):
@@ -1285,5 +1468,5 @@ def main():
     app = TaskApp()
     app.mainloop()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
