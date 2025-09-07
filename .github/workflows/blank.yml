@@ -26,7 +26,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --onefile --noconsole --name office_activity_simplifier_outlook_full_final office_activity_simplifier_outlook_full_final_windows.py
+        pyinstaller --onefile --noconsole --name office_activity_simplifier_outlook_full_final office_activity_simplifier_outlook_full_final.py
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
