@@ -279,22 +279,43 @@ class TaskApp(tk.Tk):
         if not hasattr(self, "drag_data"):
             return
         src_lb = self.drag_data["listbox"]
-        line = self.drag_data["task_line"]
+        src_status = src_lb.status_name
+        src_index = self.drag_data["index"]
 
-        match = re.search(r"\[(\d+)\]", line)
-        if not match:
+        # get task_id from mapping
+        try:
+            task_id = self.kanban_item_map[src_status][src_index]
+        except Exception:
+            self.drag_data = None
             return
-        task_id = int(match.group(1))
 
-        src_lb.delete(self.drag_data["index"])
+        # remove from source listbox and map
+        src_lb.delete(src_index)
+        del self.kanban_item_map[src_status][src_index]
 
         # Detect target listbox (drop column)
         widget = event.widget.winfo_containing(event.x_root, event.y_root)
         target_lb = widget if isinstance(widget, tk.Listbox) else None
 
         if target_lb and hasattr(target_lb, "status_name"):
-            target_lb.insert(tk.END, line)
-            self._move_task(task_id, target_lb.status_name)
+            target_status = target_lb.status_name
+            # append to target listbox and mapping
+            idx = target_lb.size()
+            # get task title to display
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT title FROM tasks WHERE id=?", (task_id,))
+            row = cur.fetchone()
+            display = row["title"] if row else "Untitled"
+            target_lb.insert(tk.END, display)
+            self.kanban_item_map[target_status].append(task_id)
+
+            # Move task in DB
+            self._move_task(task_id, target_status)
+
+        else:
+            # if dropped outside, re-insert back into source at end
+            src_lb.insert(tk.END, self.db.conn.cursor().execute("SELECT title FROM tasks WHERE id=?", (task_id,)).fetchone()["title"])
+            self.kanban_item_map[src_status].append(task_id)
 
         self.drag_data = None
 
@@ -308,7 +329,8 @@ class TaskApp(tk.Tk):
 
         self.kanban_selected_id = None
         self.kanban_selected_status = None
-
+        # mapping: status -> list of task_ids in same order as items in the listbox
+        self.kanban_item_map = {status: [] for status in STATUSES}
         self._build_ui()
         self.after(100, self._populate)
         self.after(100, self._populate_kanban)
@@ -598,8 +620,10 @@ class TaskApp(tk.Tk):
             self.tree.insert("", tk.END, values=values)
 
     def _populate_kanban(self):
-        for lb in self.kanban_lists.values():
+        # clear listboxes and maps
+        for status, lb in self.kanban_lists.items():
             lb.delete(0, tk.END)
+            self.kanban_item_map[status] = []
 
         today = date.today()
 
@@ -608,57 +632,44 @@ class TaskApp(tk.Tk):
                 task_id = r['id']
                 title = r['title']
                 due_date = r['due_date']
-                prio = r['priority']
 
-                # --- Priority dots ---
-                if os.name == "nt":  # Windows → use colored ●
-                    icon = "●"
-                    if prio == "High":
-                        color = "red"
-                    elif prio == "Medium":
-                        color = "orange"
-                    else:
-                        color = "green"
-                else:  # macOS/Linux → use emoji dots
-                    if prio == "High":
-                        icon, color = "🔴", "black"
-                    elif prio == "Medium":
-                        icon, color = "🟠", "black"
-                    else:
-                        icon, color = "🟢", "black"
-
-                display = f"{icon} [{task_id}] {title}"
+                # Display only the title — no S.No and no priority icon
+                display = f"{title}"
 
                 idx = lb.size()
                 lb.insert(tk.END, display)
-                lb.itemconfig(idx, fg=color)
 
-                # --- Overdue & Today highlighting ---
+                # keep mapping
+                self.kanban_item_map[status].append(task_id)
+
+                # --- Overdue & Today highlighting (row background) ---
                 if due_date:
                     try:
                         due = datetime.strptime(due_date, "%Y-%m-%d").date()
                         if due < today:  # Overdue
-                            lb.itemconfig(idx, bg="#FFCCCC")
+                            lb.itemconfig(idx, bg="#FFCCCC", fg="black")
                         elif due == today:  # Due today
-                            lb.itemconfig(idx, bg="#FFFACD")
+                            lb.itemconfig(idx, bg="#FFFACD", fg="black")
                     except Exception:
                         pass
 
     # -------------------- Kanban Actions --------------------
     def  _kanban_select(self, event):
         lb = event.widget
-        idx = lb.curselection()
-        if not idx:
+        idxs = lb.curselection()
+        if not idxs:
+            return
+        idx = idxs[0]
+
+        status = lb.status_name
+        try:
+            task_id = self.kanban_item_map[status][idx]
+        except Exception:
+            messagebox.showwarning("Error", "Could not resolve task id for selection.")
             return
 
-        line = lb.get(idx[0])
-        line = lb.get(idx[0])
-        match = re.search(r"\[(\d+)\]", line)
-        if not match:
-            return
-        task_id = int(match.group(1))
         self.kanban_selected_id = task_id
-        self.kanban_selected_status = lb.status_name
+        self.kanban_selected_status = status
 
         cur = self.db.conn.cursor()
         cur.execute("SELECT description, progress_log, outlook_id FROM tasks WHERE id=?", (task_id,))
@@ -671,30 +682,15 @@ class TaskApp(tk.Tk):
         prog = row["progress_log"] or ""
         outlook_id = row["outlook_id"]
 
-        # --- Description ---
-        # --- Description ---
+        # (existing description rendering code follows unchanged)
         if outlook_id and HAS_HTML:
             clean = desc or ""
+            clean = re.sub(r'<style.*?>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+            clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE).replace("</font>", "")
+            clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+            clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+            clean = re.sub(r'<span[^>]*>', '<span>', clean, flags=re.IGNORECASE)
 
-            # Strip <style> sections
-            clean = re.sub(r'<style.*?>.*?</style>', '', clean,
-                        flags=re.DOTALL | re.IGNORECASE)
-
-            # Strip <font ...> tags
-            clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE)
-            clean = clean.replace("</font>", "")
-
-            # Strip inline font-family and font-size
-            clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean,
-                        flags=re.IGNORECASE)
-            clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean,
-                        flags=re.IGNORECASE)
-
-            # Replace spans with plain spans
-            clean = re.sub(r'<span[^>]*>', '<span>', clean,
-                        flags=re.IGNORECASE)
-
-            # Final wrapper → enforce **our** font
             if os.name == "nt":
                 wrapper_style = "font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3; color:#333;"
             else:
@@ -712,12 +708,11 @@ class TaskApp(tk.Tk):
             self.kanban_text.insert(tk.END, desc)
             self.kanban_text.pack(fill=tk.BOTH, expand=True, before=self.btn_save_desc)
 
-        # --- Progress Log ---
+        # progress log
         self.kanban_progress.delete("1.0", tk.END)
         self.kanban_progress.insert(tk.END, prog)
 
-
-        # --- Attachments ---
+        # attachments
         cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
         row2 = cur.fetchone()
         if row2 and row2["attachments"]:
@@ -726,7 +721,7 @@ class TaskApp(tk.Tk):
         else:
             self.kanban_attachments_var.set("No attachments")
 
-        # --- Enable buttons ---
+        # enable buttons
         self.btn_edit.config(state="normal")
         self.btn_delete.config(state="normal")
         self.btn_done.config(state="normal")
@@ -746,7 +741,7 @@ class TaskApp(tk.Tk):
 
     def _delete_selected_kanban(self):
         for status, lb in self.kanban_lists.items():
-            sel = lb.curselection()
+            sel = list(lb.curselection())
             if not sel:
                 continue
 
@@ -754,11 +749,16 @@ class TaskApp(tk.Tk):
             if not confirm:
                 return
 
-            for idx in sel:
-                line = lb.get(idx)
-                task_id = int(line.split("]")[0][1:])
+            # delete in reverse order so indices remain correct
+            for idx in sorted(sel, reverse=True):
+                try:
+                    task_id = self.kanban_item_map[status][idx]
+                except Exception:
+                    continue
                 self.db.delete(task_id)
                 self._sync_outlook_task(task_id, {}, action="delete")
+                lb.delete(idx)
+                del self.kanban_item_map[status][idx]
 
         self._populate()
         self._populate_kanban()
@@ -863,7 +863,7 @@ class TaskApp(tk.Tk):
                     if getattr(item, "Class", 0) == 43 and getattr(item,"FlagStatus",0) == 2: 
                         due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         flagged.append({
-                            "title": f"[OUTLOOK_MAIL] {item.Subject}",
+                            "title": f"[OM] {item.Subject}",
                             "description": item.Body or "",
                             "due_date": due,
                             "priority": "Medium",
