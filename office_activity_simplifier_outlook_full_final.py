@@ -776,6 +776,34 @@ class TaskApp(tk.Tk):
 
         self.tree = ttk.Treeview(list_tab, columns=cols, show="headings")
         self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        
+                # ---- Filter bar for Task List (insert here, before creating the Treeview) ----
+        filter_frame = ttk.Frame(list_tab, padding=(6,4))
+        filter_frame.pack(fill=tk.X, padx=6, pady=(0,4))
+
+        ttk.Label(filter_frame, text="Search:").pack(side=tk.LEFT, padx=(0,4))
+        self.filter_text_var = tk.StringVar(value="")
+        ttk.Entry(filter_frame, textvariable=self.filter_text_var, width=30).pack(side=tk.LEFT)
+
+        ttk.Label(filter_frame, text="Priority:").pack(side=tk.LEFT, padx=(12,4))
+        self.filter_priority_var = tk.StringVar(value="All")
+        pri_vals = ["All"] + PRIORITIES
+        ttk.Combobox(filter_frame, textvariable=self.filter_priority_var, values=pri_vals, width=10, state="readonly").pack(side=tk.LEFT)
+
+        ttk.Label(filter_frame, text="Status:").pack(side=tk.LEFT, padx=(12,4))
+        self.filter_status_var = tk.StringVar(value="All")
+        stat_vals = ["All"] + STATUSES
+        ttk.Combobox(filter_frame, textvariable=self.filter_status_var, values=stat_vals, width=12, state="readonly").pack(side=tk.LEFT)
+
+        ttk.Label(filter_frame, text="Due on (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12,4))
+        self.filter_due_var = tk.StringVar(value="")
+        ttk.Entry(filter_frame, textvariable=self.filter_due_var, width=12).pack(side=tk.LEFT)
+
+        ttk.Button(filter_frame, text="Apply", command=self._apply_filters).pack(side=tk.LEFT, padx=(12,4))
+        ttk.Button(filter_frame, text="Clear", command=self._clear_filters).pack(side=tk.LEFT)
+
+
+
 
         for col in cols:
             # Title-case header
@@ -954,19 +982,85 @@ class TaskApp(tk.Tk):
             except Exception:
                 self.attachments_var.set("")
 
+
+    def _apply_filters(self):
+        """Apply current filter controls to the Task List."""
+        # basic validation for date format (if filled)
+        fd = self.filter_due_var.get().strip() if hasattr(self, "filter_due_var") else ""
+        if fd:
+            try:
+                datetime.strptime(fd, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showwarning("Filter", "Due Date filter must be YYYY-MM-DD")
+                return
+        self._populate()
+
+    def _clear_filters(self):
+        """Clear all filters and refresh."""
+        if hasattr(self, "filter_text_var"):
+            self.filter_text_var.set("")
+        if hasattr(self, "filter_priority_var"):
+            self.filter_priority_var.set("All")
+        if hasattr(self, "filter_status_var"):
+            self.filter_status_var.set("All")
+        if hasattr(self, "filter_due_var"):
+            self.filter_due_var.set("")
+        self._populate()
+
+
     # -------------------- Populate --------------------
     def _populate(self):
-        """Populate the Treeview with tasks including reminder column."""
+        """Populate the Treeview with tasks including reminder column, respecting filter controls."""
+
+        # clear existing rows
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        for r in self.db.fetch():
-            desc = r["description"] or ""
-            # Clean HTML for preview
-            desc = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            desc = desc.replace("\n", " ")[:80] + "..." if desc else ""
+        # fetch all tasks (we filter in Python for simplicity)
+        rows = self.db.fetch()
 
-            # sqlite3.Row supports keys() membership check
+        # read current filter values
+        ft = (self.filter_text_var.get().strip().lower() if hasattr(self, "filter_text_var") else "").strip()
+        fpri = (self.filter_priority_var.get() if hasattr(self, "filter_priority_var") else "All")
+        fstat = (self.filter_status_var.get() if hasattr(self, "filter_status_var") else "All")
+        fdue = (self.filter_due_var.get().strip() if hasattr(self, "filter_due_var") else "").strip()
+
+        def row_matches(r):
+            # text search against title + description
+            if ft:
+                hay = ((r["title"] or "") + " " + (r["description"] or "")).lower()
+                if ft not in hay:
+                    return False
+            # priority
+            if fpri and fpri != "All":
+                if (r["priority"] or "") != fpri:
+                    return False
+            # status
+            if fstat and fstat != "All":
+                if (r["status"] or "") != fstat:
+                    return False
+            # due date exact match if specified
+            if fdue:
+                try:
+                    # normalize both sides to YYYY-MM-DD
+                    if (r["due_date"] or "") != fdue:
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        for r in rows:
+            if not row_matches(r):
+                continue
+
+            desc = r["description"] or ""
+            # Clean HTML for preview (short)
+            desc_preview = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+            desc_preview = desc_preview.replace("\n", " ")
+            if len(desc_preview) > 80:
+                desc_preview = desc_preview[:80] + "..."
+
+            # reminder column handling (works with sqlite3.Row)
             reminder_val = r["reminder_minutes"] if "reminder_minutes" in r.keys() else None
             reminder_display = str(reminder_val) if reminder_val not in (None, "", "None") else "—"
 
@@ -974,7 +1068,7 @@ class TaskApp(tk.Tk):
                 values = [
                     r["id"],
                     r["title"],
-                    desc,
+                    desc_preview,
                     r["due_date"] or "—",
                     r["priority"],
                     r["status"],
