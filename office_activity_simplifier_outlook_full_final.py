@@ -170,15 +170,18 @@ class TaskDB:
         self.conn.commit()
 
     def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None, reminder_set_at=None):
+        """Insert and return new row id (so callers can attach files reliably)."""
         now = _now_iso()
         done_at = now if status == "Done" else None
+        cur = self.conn.cursor()
         with self.conn:
-            self.conn.execute(
+            cur.execute(
                 """INSERT INTO tasks(title, description, due_date, priority, status,
                    created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, reminder_set_at, None),
             )
+            return cur.lastrowid
 
     def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None, reminder_set_at=None):
         now = _now_iso()
@@ -240,14 +243,15 @@ class TaskDB:
         return cur.fetchall()
 
     def bulk_add(self, rows):
+        """rows is list of dicts like {title, description, due_date, priority, status, outlook_id, progress_log, attachments}"""
         now = _now_iso()
         with self.conn:
             for r in rows:
                 done_at = now if r.get("status") == "Done" else None
                 self.conn.execute(
                     """INSERT INTO tasks(title, description, due_date, priority, status,
-                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at, attachments)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         r.get("title"),
                         r.get("description"),
@@ -262,6 +266,7 @@ class TaskDB:
                         None,
                         None,
                         None,
+                        r.get("attachments") if r.get("attachments") is not None else None,
                     ),
                 )
 
@@ -843,23 +848,24 @@ class TaskApp(BaseWindow):
                 reminder_set_at_iso = None
 
             if task_id:
-                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-            else:
-                self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
-                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-                # attach staged attachments after add
                 try:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT last_insert_rowid() as id")
-                    new_row = cur.fetchone()
-                    if new_row:
-                        new_id = new_row["id"] if "id" in new_row.keys() else new_row[0]
-                        if staged_attachments:
+                    self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
+                                reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+                except Exception as e:
+                    messagebox.showerror("DB Error", f"Could not update task: {e}", parent=win)
+            else:
+                try:
+                    new_id = self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
+                                reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+                    # attach staged attachments after add
+                    if staged_attachments:
+                        try:
                             self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
                             self.db.conn.commit()
-                except Exception:
-                    pass
+                        except Exception:
+                            pass
+                except Exception as e:
+                    messagebox.showerror("DB Error", f"Could not add task: {e}", parent=win)
 
             self._populate()
             self._populate_kanban()
@@ -1595,21 +1601,39 @@ class TaskApp(BaseWindow):
 
     # -------------------- Outlook / CSV / Sync --------------------
     def _get_flagged_from_folder(self, folder, flagged):
+        """
+        Walk a folder's items and subfolders collecting flagged mail items (FlagStatus=2)
+        and task items where appropriate. This function is defensive to avoid COM failures.
+        """
         try:
-            items = folder.Items
-            # sort by ReceivedTime desc
+            items = getattr(folder, "Items", None)
+            if items is None:
+                return
+            # Try to restrict to flagged items; fallback to iterating all items
             try:
-                items.Sort("[ReceivedTime]", True)
+                restricted = items.Restrict("[FlagStatus] = 2")
+                iterable = restricted
             except Exception:
-                pass
-            # restrict flagged mails where FlagStatus = 2 (flagged)
-            try:
-                flagged_items = items.Restrict("[FlagStatus] = 2")
-            except Exception:
-                flagged_items = items
-            for item in flagged_items:
-                # MailItem class = 43
-                if getattr(item, "Class", 0) == 43:
+                iterable = items
+
+            # We use a for loop that handles COM collection iteration failures gracefully
+            for item in iterable:
+                try:
+                    cls = getattr(item, "Class", 0)
+                except Exception:
+                    continue
+
+                # MailItem class = 43 (flagged mails)
+                if cls == 43:
+                    try:
+                        flag_status = getattr(item, "FlagStatus", 0)
+                        if flag_status != 2:
+                            # skip non-flagged unless the restrict produced only flagged
+                            continue
+                    except Exception:
+                        # if FlagStatus not available, assume candidate if subject/body present
+                        pass
+
                     attachments = []
                     try:
                         if getattr(item, "Attachments", None) and item.Attachments.Count > 0:
@@ -1617,19 +1641,23 @@ class TaskApp(BaseWindow):
                             for att in item.Attachments:
                                 try:
                                     fname = os.path.join("attachments", att.FileName)
-                                    # SaveAsFile available on Attachment object
                                     att.SaveAsFile(fname)
                                     attachments.append(fname)
                                 except Exception:
                                     pass
                     except Exception as e:
                         print("Attachment import error:", e)
+
                     due = None
                     try:
                         if getattr(item, "TaskDueDate", None):
-                            due = item.TaskDueDate.strftime("%Y-%m-%d")
+                            try:
+                                due = item.TaskDueDate.strftime("%Y-%m-%d")
+                            except Exception:
+                                due = None
                     except Exception:
                         due = None
+
                     desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
                     flagged.append({
                         "title": f"[Mail] {getattr(item, 'Subject', '(no subject)')}",
@@ -1640,14 +1668,38 @@ class TaskApp(BaseWindow):
                         "outlook_id": getattr(item, "EntryID", None),
                         "attachments": json.dumps(attachments)
                     })
+
+                # TaskItem class = 48
+                elif cls == 48:
+                    try:
+                        due = None
+                        if getattr(item, "DueDate", None):
+                            try:
+                                due = item.DueDate.strftime("%Y-%m-%d")
+                            except Exception:
+                                due = None
+                        flagged.append({
+                            "title": f"[Task] {getattr(item, 'Subject', '(no subject)')}",
+                            "description": getattr(item, "Body", "") or "",
+                            "due_date": due,
+                            "priority": "Medium",
+                            "status": "Pending" if getattr(item, "Complete", False) is False else "Done",
+                            "outlook_id": getattr(item, "EntryID", None)
+                        })
+                    except Exception:
+                        pass
+                # else: ignore other classes
             # recurse into subfolders if present
             try:
                 for sub in folder.Folders:
-                    self._get_flagged_from_folder(sub, flagged)
+                    try:
+                        self._get_flagged_from_folder(sub, flagged)
+                    except Exception:
+                        pass
             except Exception:
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            print("Error scanning folder for flagged items:", e)
 
     def _get_flagged_emails(self):
         if not HAS_OUTLOOK:
@@ -1655,46 +1707,76 @@ class TaskApp(BaseWindow):
             return []
         flagged = []
         try:
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            # try Tasks folder first (folder 28)
+            ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            # Try Tasks folder (folder type 28) - may contain TaskItems
             try:
-                todo_folder = outlook.GetDefaultFolder(28)
-                for item in todo_folder.Items:
-                    if getattr(item, "Class", 0) == 43 and getattr(item, "FlagStatus", 0) == 2:
-                        due = None
+                todo_folder = ns.GetDefaultFolder(28)
+                try:
+                    for item in list(todo_folder.Items):
                         try:
-                            if getattr(item, "DueDate", None):
-                                due = item.DueDate.strftime("%Y-%m-%d")
+                            cls = getattr(item, "Class", 0)
+                            if cls == 48:  # TaskItem
+                                due = None
+                                try:
+                                    if getattr(item, "DueDate", None):
+                                        try:
+                                            due = item.DueDate.strftime("%Y-%m-%d")
+                                        except Exception:
+                                            due = None
+                                except Exception:
+                                    due = None
+                                flagged.append({
+                                    "title": f"[OM Task] {getattr(item, 'Subject', '(no subject)')}",
+                                    "description": getattr(item, "Body", "") or "",
+                                    "due_date": due,
+                                    "priority": "Medium",
+                                    "status": "Pending" if getattr(item, "Complete", False) is False else "Done",
+                                    "outlook_id": getattr(item, "EntryID", None)
+                                })
                         except Exception:
-                            due = None
-                        flagged.append({
-                            "title": f"[OM] {getattr(item, 'Subject', '(no subject)')}",
-                            "description": getattr(item, "Body", "") or "",
-                            "due_date": due,
-                            "priority": "Medium",
-                            "status": "Pending",
-                            "outlook_id": getattr(item, "EntryID", None)
-                        })
+                            continue
+                except Exception as e:
+                    print("Error iterating Tasks folder items:", e)
             except Exception as e:
-                print("To-Do List fetch error:", e)
-            # search Inbox and subfolders for flagged items
+                print("To-Do List fetch error (folder 28):", e)
+
+            # Inbox and subfolders for flagged items
             try:
-                inbox = outlook.GetDefaultFolder(6)
+                inbox = ns.GetDefaultFolder(6)
                 self._get_flagged_from_folder(inbox, flagged)
             except Exception as e:
                 print("Inbox flagged mail fetch error:", e)
-            # try search folders root
+
+            # Some setups put follow-ups under other folder roots - try common ones
             try:
-                search_root = outlook.GetDefaultFolder(23)
-                for folder in search_root.Folders:
-                    if folder.Name.lower() == "for follow up":
-                        self._get_flagged_from_folder(folder, flagged)
-            except Exception as e:
-                # not all outlook setups have folder 23 etc.
+                # Folder 23 is Search Folders - iterate its child folders
+                search_root = ns.GetDefaultFolder(23)
+                try:
+                    for folder in list(search_root.Folders):
+                        try:
+                            if getattr(folder, "Name", "").lower() == "for follow up":
+                                self._get_flagged_from_folder(folder, flagged)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                # ignore - not all outlook setups have folder 23
                 pass
         except Exception as e:
             print("Outlook fetch error:", e)
-        return flagged
+        # deduplicate by outlook_id if present
+        seen = set()
+        result = []
+        for f in flagged:
+            oid = f.get("outlook_id")
+            if oid and oid in seen:
+                continue
+            if oid:
+                seen.add(oid)
+            result.append(f)
+        print(f"[Outlook] Found {len(result)} flagged/task items to consider for import.")
+        return result
 
     def _import_outlook_flags(self):
         """Run Outlook import in a background thread to avoid freezing UI."""
@@ -1745,7 +1827,7 @@ class TaskApp(BaseWindow):
         if not HAS_OUTLOOK:
             return
         try:
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
             cur = self.db.conn.cursor()
             cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
             row = cur.fetchone()
@@ -1755,37 +1837,46 @@ class TaskApp(BaseWindow):
             item = None
             # try Tasks folder
             try:
-                todo_folder = outlook.GetDefaultFolder(28)
+                todo_folder = ns.GetDefaultFolder(28)
                 for i in todo_folder.Items:
-                    if getattr(i, "EntryID", None) == entryid:
-                        item = i
-                        break
+                    try:
+                        if getattr(i, "EntryID", None) == entryid:
+                            item = i
+                            break
+                    except Exception:
+                        continue
             except Exception:
                 pass
             if not item:
                 try:
-                    inbox = outlook.GetDefaultFolder(6)
-                    # Items.Find works with DASL or property comparisons; fallback to iteration
-                    try:
-                        item = inbox.Items.Find(f"[EntryID] = '{entryid}'")
-                    except Exception:
-                        for m in inbox.Items:
+                    inbox = ns.GetDefaultFolder(6)
+                    # iterate to find entryid
+                    for m in inbox.Items:
+                        try:
                             if getattr(m, "EntryID", None) == entryid:
                                 item = m
                                 break
+                        except Exception:
+                            continue
                 except Exception:
                     pass
             if not item:
                 return
             if action == "done" or (action == "update" and data.get("status") == "Done"):
-                if getattr(item, "Class", 0) == 48:
-                    item.MarkComplete()
-                elif getattr(item, "Class", 0) == 43:
-                    item.FlagStatus = 1
-                    item.Categories = "Completed"
-                item.Save()
+                try:
+                    if getattr(item, "Class", 0) == 48:
+                        item.MarkComplete()
+                    elif getattr(item, "Class", 0) == 43:
+                        item.FlagStatus = 1
+                        item.Categories = "Completed"
+                    item.Save()
+                except Exception as e:
+                    print("Error marking outlook item complete:", e)
             elif action == "delete":
-                item.Delete()
+                try:
+                    item.Delete()
+                except Exception as e:
+                    print("Error deleting outlook item:", e)
         except Exception as e:
             print("Outlook sync error:", e)
 
