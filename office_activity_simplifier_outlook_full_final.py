@@ -124,8 +124,18 @@ class _ToolTip:
 # -------------------- Database --------------------
 class TaskDB:
     def __init__(self, path=DB_FILE):
-        self.conn = sqlite3.connect(path)
+        # Allow access from background threads (sqlite3 default forbids same-connection cross-thread use)
+        # This is simpler for small apps where you ensure DB calls are short and you marshal UI updates
+        # back to the main thread (which this app does).
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+
+        # Slightly friendlier concurrency: enable WAL mode so readers don't block writers as much.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+
         self._init_db()
 
     def _init_db(self):
@@ -452,8 +462,7 @@ class TaskApp(BaseWindow):
     def _check_task_reminders(self):
         """
         Query DB for tasks whose stopwatch-style reminder target has passed.
-        IMPORTANT: Do NOT mark 'reminder_sent_at' here. Marking must happen on user action (Dismiss),
-        otherwise snooze won't work correctly (user snoozes but record already marked sent).
+        Do NOT mark reminder_sent_at here. Marking happens when user dismisses/closes.
         """
         try:
             cur = self.db.conn.cursor()
@@ -467,7 +476,6 @@ class TaskApp(BaseWindow):
             now_dt = datetime.now()
 
             for r in rows:
-                # parse minutes and set time
                 try:
                     rm_min = int(r["reminder_minutes"])
                 except Exception:
@@ -479,7 +487,6 @@ class TaskApp(BaseWindow):
 
                 target = set_at + timedelta(minutes=rm_min)
 
-                # if we have reminder_sent_at, parse it
                 sent = None
                 if r["reminder_sent_at"]:
                     try:
@@ -487,43 +494,31 @@ class TaskApp(BaseWindow):
                     except Exception:
                         sent = None
 
-                # Only show if current time >= target and we have NOT already recorded a send at/after target
                 if now_dt >= target and (sent is None or sent < target):
-                    # Use after(0, ...) to ensure popup is created on the Tk event loop (UI thread)
+                    # schedule popup on UI thread immediately
                     try:
                         self.after(0, lambda _id=r["id"], _t=r["title"], _d=r["description"]: self._show_reminder_popup(_id, _t, _d))
                     except Exception as e:
                         print("Failed to schedule reminder popup on UI thread:", e)
-
-                    # NOTE: do not update reminder_sent_at here — only update when the user dismisses the popup.
+                    # DO NOT mark reminder_sent_at here
         except Exception as e:
             print("Reminder check error:", e)
 
     def _show_reminder_popup(self, task_id, title, description):
-        """
-        Improved cross-platform reminder popup:
-        - Avoid modal grab_set() which can freeze UI on some platforms.
-        - Bring window to front robustly (lift + focus_force + toggle -topmost).
-        - Mark reminder_sent_at only when user dismisses, not when popup is shown.
-        """
-
-        # Windows toast (safe wrapper) — non-blocking
+        # Windows toast (safe wrapper)
         if HAS_NOTIFY:
             _safe_show_toast(f"Reminder: {title}", description or "Task due soon")
 
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
-        # slightly larger so buttons don't wrap
         win.geometry("700x300")
         win.transient(self)
 
-        # Do not call grab_set() — keep popup non-modal so UI remains responsive.
+        # Bring to front safely
         try:
-            # try to raise and focus the popup in a way that works across platforms
             win.lift()
             win.attributes("-topmost", True)
             win.update()
-            # small toggle may help macOS bring to front
             try:
                 win.attributes("-topmost", False)
             except Exception:
@@ -532,21 +527,20 @@ class TaskApp(BaseWindow):
         except Exception:
             pass
 
-        # ensure closing via window manager triggers the same cleanup as Dismiss
-        def _on_close():
-            # treat closing as dismiss: mark reminder_sent_at
+        def _mark_sent_and_close():
             now_iso = datetime.now().isoformat(timespec="seconds")
             try:
                 self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
                 self.db.conn.commit()
             except Exception as e:
-                print("Error marking reminder_sent_at on close:", e)
+                print("Error setting reminder_sent_at:", e)
             try:
                 win.destroy()
             except Exception:
                 pass
 
-        win.protocol("WM_DELETE_WINDOW", _on_close)
+        # treat window close as dismiss (same as pressing Dismiss)
+        win.protocol("WM_DELETE_WINDOW", _mark_sent_and_close)
 
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
         header.pack(padx=12, pady=(12, 6), anchor="w")
@@ -570,10 +564,8 @@ class TaskApp(BaseWindow):
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
-            # When snoozing, restart countdown from now and clear reminder_sent_at so it can fire again.
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
-                # store integer minutes; reminder_sent_at cleared (NULL)
                 self.db.conn.execute(
                     "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=NULL WHERE id=?",
                     (int(minutes), new_set, task_id)
@@ -587,26 +579,14 @@ class TaskApp(BaseWindow):
                 pass
 
         def dismiss():
-            # Mark as reminded now (so it won't re-fire)
-            now_iso = datetime.now().isoformat(timespec="seconds")
-            try:
-                self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, task_id))
-                self.db.conn.commit()
-            except Exception as e:
-                print("Dismiss update error:", e)
-            try:
-                win.destroy()
-            except Exception:
-                pass
+            _mark_sent_and_close()
 
-        # Buttons laid out to avoid wrapping
         ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
-        # final lift/focus to ensure visible
         try:
             win.lift()
             win.focus_force()
@@ -659,10 +639,7 @@ class TaskApp(BaseWindow):
 
         win = tk.Toplevel(self)
         win.transient(self)
-        try:
-            win.grab_set()
-        except Exception:
-            pass
+        # NOTE: do NOT call grab_set() — non-modal windows are more robust on Windows & macOS.
         win.title("Edit Task" if task_id else "Add Task")
         win.geometry("680x560")
 
@@ -817,22 +794,27 @@ class TaskApp(BaseWindow):
 
             if task_id:
                 self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                               reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
             else:
                 self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
                             reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-                cur = self.db.conn.cursor()
-                cur.execute("SELECT last_insert_rowid() as id")
-                new_id = cur.fetchone()["id"]
-                if staged_attachments:
-                    try:
+                # update attachments for the new task if any
+                try:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT last_insert_rowid() as id")
+                    new_id = cur.fetchone()["id"]
+                    if staged_attachments:
                         self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
-                    except Exception:
-                        pass
+                        self.db.conn.commit()
+                except Exception:
+                    pass
 
             self._populate()
             self._populate_kanban()
-            win.destroy()
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
         btn_frame = ttk.Frame(frm)
         btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
@@ -1581,16 +1563,37 @@ class TaskApp(BaseWindow):
             print("Outlook fetch error:", e)
         return flagged
 
+    import threading
+
     def _import_outlook_flags(self):
-        flagged = self._get_flagged_emails()
-        if not flagged:
-            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
-            return
-        cur = self.db.conn.cursor()
-        new_items = [f for f in flagged if not cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (f["outlook_id"],)).fetchone()]
-        self.db.bulk_add(new_items)
-        self._populate(); self._populate_kanban()
-        messagebox.showinfo("Outlook", f"Imported {len(new_items)} new tasks.")
+        """Run Outlook import in a background thread to avoid freezing UI."""
+        def _worker():
+            # original import logic (safe to call from background thread, but DB/FS ok)
+            new_count = 0
+            try:
+                flagged = self._get_flagged_emails()
+                if flagged:
+                    cur = self.db.conn.cursor()
+                    new_items = [f for f in flagged if not cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (f["outlook_id"],)).fetchone()]
+                    if new_items:
+                        self.db.bulk_add(new_items)
+                        new_count = len(new_items)
+            except Exception as e:
+                print("Background outlook import error:", e)
+
+            # schedule UI updates on main thread
+            def _on_done():
+                if new_count:
+                    self._populate(); self._populate_kanban()
+                    messagebox.showinfo("Outlook", f"Imported {new_count} new tasks.")
+                else:
+                    messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+            try:
+                self.after(0, _on_done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _refresh_outlook_flags(self):
         self._import_outlook_flags()
@@ -1642,16 +1645,31 @@ class TaskApp(BaseWindow):
     def _import_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv")])
         if not path: return
-        rows = []
-        with open(path,newline="",encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                if not r.get("title"): continue
-                rows.append({"title": r["title"], "description": r.get("description",""), "due_date": r.get("due_date"),
-                             "priority": r.get("priority","Medium"), "status": r.get("status","Pending")})
-        if rows:
-            self.db.bulk_add(rows); self._populate(); self._populate_kanban()
-            messagebox.showinfo("CSV Import", f"Imported {len(rows)} tasks.")
+
+        import threading
+        def _worker():
+            rows = []
+            try:
+                with open(path,newline="",encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        if not r.get("title"): continue
+                        rows.append({"title": r["title"], "description": r.get("description",""), "due_date": r.get("due_date"),
+                                    "priority": r.get("priority","Medium"), "status": r.get("status","Pending")})
+                if rows:
+                    self.db.bulk_add(rows)
+            except Exception as e:
+                print("CSV import error:", e)
+
+            def _on_done():
+                if rows:
+                    self._populate(); self._populate_kanban()
+                    messagebox.showinfo("CSV Import", f"Imported {len(rows)} tasks.")
+                else:
+                    messagebox.showinfo("CSV Import", "No tasks imported.")
+            self.after(0, _on_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _export_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
