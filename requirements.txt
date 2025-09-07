@@ -4,3 +4,4 @@ win10toast; platform_system == "Windows" # Windows toast notifications
 tkhtmlview         # render HTML emails
 ttkbootstrap       # modern themes, dark mode support
 markdown           # future: rich-text / markdown descriptions
+tkcalendar>=1.6.1
