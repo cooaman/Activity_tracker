@@ -221,22 +221,49 @@ class TaskDB:
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
+    def strike_text(self, text: str) -> str:
+        """
+        Return a visual strike-through using combining long stroke overlay characters.
+        This is a portable fallback for widgets (like Listbox) that don't support
+        a per-item 'overstrike' font. For Treeview we will also attempt an overstrike font.
+        """
+        if not text:
+            return text
+        try:
+            # combine each char with U+0336 combining long stroke overlay
+            return "".join(ch + "\u0336" for ch in text)
+        except Exception:
+            return text
 
     def _init_styles(self):
         """Initialize simple theme palettes and default style tweaks."""
         style = ttk.Style()
-        # font tweaks
-        default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
-        heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
+        # font tweaks – store fonts on self so other methods can reuse
         try:
+            default_font = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
+            heading_font = ("Segoe UI", 11, "bold") if os.name == "nt" else ("Helvetica", 11, "bold")
+            # Create an overstrike font (may be ignored if not supported)
+            try:
+                # create overstrike font tuple
+                strike_font = (default_font[0], default_font[1], "overstrike")
+            except Exception:
+                strike_font = default_font
+            self.default_font = default_font
+            self.heading_font = heading_font
+            self.strike_font = strike_font
+
             style.configure(".", font=default_font)
             style.configure("Treeview.Heading", font=heading_font)
             style.configure("TButton", padding=6)
             style.configure("TLabel", padding=2)
         except Exception:
+            # fallbacks if anything fails
+            self.default_font = ("Helvetica", 10)
+            self.heading_font = ("Helvetica", 11, "bold")
+            self.strike_font = self.default_font
             pass
 
-        # theme palettes
+        # theme palettes (unchanged)...
         self._themes = {
             "Light": {
                 "bg": "#f7f7f7",
@@ -568,12 +595,12 @@ class TaskApp(tk.Tk):
             return
         self._open_edit_window(task_id)
 
+    #####
     def _open_edit_window(self, task_id=None):
         """
         Open popup for adding/editing a task.
-        Adds a Reminder control (dropdown) to pick minutes before due (or None).
+        Includes a Progress panel (existing log + multi-line add entry).
         """
-        # local DateEntry import (if available)
         try:
             from tkcalendar import DateEntry
             has_dateentry = True
@@ -583,33 +610,36 @@ class TaskApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.transient(self)
-        win.grab_set()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
         win.title("Edit Task" if task_id else "Add Task")
-        win.geometry("680x560")
+        win.geometry("780x720")
 
         # Variables
         title_var = tk.StringVar()
         due_var = tk.StringVar()
         priority_var = tk.StringVar(value="Medium")
         status_var = tk.StringVar(value="Pending")
-        reminder_var = tk.StringVar(value="")  # will store minutes as string or "" for none
+        reminder_var = tk.StringVar(value="")
 
         staged_attachments = []
         existing_attachments = []
+        staged_progress_entries = ""
 
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
 
+        # --- Basic fields ---
         ttk.Label(frm, text="Title *").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=title_var, width=50).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=title_var, width=60).grid(row=0, column=1, sticky="w", padx=6, pady=4, columnspan=2)
 
         ttk.Label(frm, text="Due Date (YYYY-MM-DD)").grid(row=1, column=0, sticky="w")
         if has_dateentry:
-            due_widget = DateEntry(frm, date_pattern="yyyy-mm-dd", textvariable=due_var, width=20)
-            due_widget.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+            DateEntry(frm, date_pattern="yyyy-mm-dd", textvariable=due_var, width=20).grid(row=1, column=1, sticky="w", padx=6, pady=4)
         else:
-            due_widget = ttk.Entry(frm, textvariable=due_var, width=20)
-            due_widget.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+            ttk.Entry(frm, textvariable=due_var, width=20).grid(row=1, column=1, sticky="w", padx=6, pady=4)
 
         ttk.Label(frm, text="Priority").grid(row=2, column=0, sticky="w")
         ttk.Combobox(frm, textvariable=priority_var, values=PRIORITIES, state="readonly", width=12).grid(row=2, column=1, sticky="w", padx=6, pady=4)
@@ -617,53 +647,70 @@ class TaskApp(tk.Tk):
         ttk.Label(frm, text="Status").grid(row=3, column=0, sticky="w")
         ttk.Combobox(frm, textvariable=status_var, values=STATUSES, state="readonly", width=12).grid(row=3, column=1, sticky="w", padx=6, pady=4)
 
-        # Reminder control (combo)
         ttk.Label(frm, text="Reminder (minutes before due)").grid(row=4, column=0, sticky="w")
-        # preset choices plus custom entry allowed
-        reminder_choices = ["", "5", "10", "30", "60", "120", "1440"]  # 1440 = 1 day
+        reminder_choices = ["", "5", "10", "30", "60", "120", "1440"]
         reminder_cb = ttk.Combobox(frm, textvariable=reminder_var, values=reminder_choices, width=18)
         reminder_cb.grid(row=4, column=1, sticky="w", padx=6, pady=4)
-        reminder_cb.set("")  # default none
+        reminder_cb.set("")
 
+        # Description
         ttk.Label(frm, text="Description").grid(row=5, column=0, sticky="nw", pady=(6,0))
-        desc_text = tk.Text(frm, height=10, width=60, wrap="word")
-        desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0))
+        desc_text = tk.Text(frm, height=10, width=70, wrap="word")
+        desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0), columnspan=2)
 
-        # Load existing values if editing
-        if task_id:
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
-            r = cur.fetchone()
-            if r:
-                title_var.set(r["title"])
-                due_var.set(r["due_date"] or "")
-                priority_var.set(r["priority"] or "Medium")
-                status_var.set(r["status"] or "Pending")
-                desc_text.insert(tk.END, r["description"] or "")
+        # --- Progress section ---
+        ttk.Label(frm, text="Progress Log").grid(row=6, column=0, sticky="nw", pady=(10,0))
+        progress_frame = ttk.Frame(frm)
+        progress_frame.grid(row=6, column=1, sticky="we", padx=6, pady=(10,0), columnspan=2)
 
-                # attachments
-                if "attachments" in r.keys() and r["attachments"]:
-                    try:
-                        existing_attachments = json.loads(r["attachments"])
-                    except Exception:
-                        existing_attachments = []
+        progress_display = tk.Text(progress_frame, height=8, width=68, wrap="word")
+        progress_display.insert("1.0", "")
+        progress_display.config(state="disabled")
+        progress_display.pack(fill=tk.BOTH, expand=False)
 
-                # load reminder value if present
+        ttk.Label(progress_frame, text="New progress entry:").pack(anchor="w", pady=(8,2))
+        new_progress_entry = tk.Text(progress_frame, height=4, width=68, wrap="word")
+        new_progress_entry.pack(fill=tk.BOTH, expand=False)
+
+        def _add_progress_entry_from_text(text_value):
+            nonlocal staged_progress_entries
+            text = text_value.strip()
+            if not text:
+                messagebox.showwarning("Progress", "Enter some progress text before adding.", parent=win)
+                return
+            now_str = date.today().isoformat()
+            entry = f"[{now_str}] {text}\n"
+            if task_id:
                 try:
-                    rm = r["reminder_minutes"]
-                    if rm not in (None, "", "None"):
-                        reminder_var.set(str(rm))
-                    else:
-                        reminder_var.set("")
-                except Exception:
-                    reminder_var.set("")
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT progress_log FROM tasks WHERE id=?", (task_id,))
+                    old = cur.fetchone()[0] or ""
+                    new_log = entry + old
+                    self.db.update_progress(task_id, new_log)
+                    progress_display.config(state="normal")
+                    progress_display.delete("1.0", tk.END)
+                    progress_display.insert(tk.END, new_log)
+                    progress_display.config(state="disabled")
+                    new_progress_entry.delete("1.0", tk.END)
+                    self._populate(); self._populate_kanban()
+                except Exception as e:
+                    messagebox.showerror("Progress Error", f"Could not add progress: {e}", parent=win)
+            else:
+                staged_progress_entries = entry + staged_progress_entries
+                progress_display.config(state="normal")
+                progress_display.delete("1.0", tk.END)
+                progress_display.insert(tk.END, staged_progress_entries)
+                progress_display.config(state="disabled")
+                new_progress_entry.delete("1.0", tk.END)
 
-        # Attachments UI (same as earlier)
-        ttk.Label(frm, text="Attachments").grid(row=6, column=0, sticky="nw", pady=(10,0))
+        ttk.Button(progress_frame, text="Add Progress Entry", command=lambda: _add_progress_entry_from_text(new_progress_entry.get("1.0", tk.END))).pack(pady=(6,0))
+
+        # --- Attachments UI ---
+        ttk.Label(frm, text="Attachments").grid(row=7, column=0, sticky="nw", pady=(10,0))
         attachments_frame = ttk.Frame(frm)
-        attachments_frame.grid(row=6, column=1, sticky="we", padx=6, pady=(10,0))
+        attachments_frame.grid(row=7, column=1, sticky="we", padx=6, pady=(10,0), columnspan=2)
         attachments_list_var = tk.StringVar(value=", ".join(os.path.basename(p) for p in existing_attachments))
-        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=500)
+        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=560)
         attachments_label.pack(anchor="w", fill=tk.X)
 
         def add_file_to_attachments():
@@ -707,7 +754,7 @@ class TaskApp(tk.Tk):
                     if os.name == "nt":
                         os.startfile(f)
                     elif sys.platform == "darwin":
-                        os.system(f"open '{f}'")
+                        os.system(f"open '{f}'")   # ✅ fixed here
                     else:
                         os.system(f"xdg-open '{f}'")
                 except Exception as e:
@@ -717,6 +764,30 @@ class TaskApp(tk.Tk):
         btns_attach.pack(anchor="w", pady=(6,0))
         ttk.Button(btns_attach, text="Add File", command=add_file_to_attachments).pack(side=tk.LEFT)
         ttk.Button(btns_attach, text="Open", command=open_attachments).pack(side=tk.LEFT, padx=6)
+
+        # Load existing task values
+        if task_id:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+            r = cur.fetchone()
+            if r:
+                title_var.set(r["title"])
+                due_var.set(r["due_date"] or "")
+                priority_var.set(r["priority"] or "Medium")
+                status_var.set(r["status"] or "Pending")
+                desc_text.insert(tk.END, r["description"] or "")
+                if "attachments" in r.keys() and r["attachments"]:
+                    try:
+                        existing_attachments = json.loads(r["attachments"])
+                    except Exception:
+                        existing_attachments = []
+                if r["reminder_minutes"]:
+                    reminder_var.set(str(r["reminder_minutes"]))
+                if r["progress_log"]:
+                    progress_display.config(state="normal")
+                    progress_display.delete("1.0", tk.END)
+                    progress_display.insert(tk.END, r["progress_log"])
+                    progress_display.config(state="disabled")
 
         # Save handler
         def save():
@@ -735,7 +806,6 @@ class TaskApp(tk.Tk):
             desc = desc_text.get("1.0", tk.END).strip()
             reminder_value = reminder_var.get().strip() or None
 
-            # convert empty string to None; store as integer when present
             if reminder_value not in (None, "", "None"):
                 try:
                     reminder_minutes_int = int(reminder_value)
@@ -748,30 +818,25 @@ class TaskApp(tk.Tk):
                 reminder_set_at_iso = None
 
             if task_id:
-                # update task and reminder fields
                 self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                               reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
             else:
-                # create new -> add with reminder values
                 self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
                             reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-                # handle attachments (staged) and commit id -> same logic as you had
                 cur = self.db.conn.cursor()
                 cur.execute("SELECT last_insert_rowid() as id")
                 new_id = cur.fetchone()["id"]
                 if staged_attachments:
-                    try:
-                        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
-                    except Exception:
-                        pass
-                # if we created with reminder_set_at already set we are good
+                    self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
+                if staged_progress_entries:
+                    self.db.update_progress(new_id, staged_progress_entries)
 
             self._populate()
             self._populate_kanban()
             win.destroy()
 
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
+        btn_frame.grid(row=8, column=0, columnspan=3, pady=12)
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
 
@@ -1028,6 +1093,14 @@ class TaskApp(tk.Tk):
         stat_cb.pack(side=tk.LEFT)
         stat_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
 
+
+        ttk.Label(filter_frame, text="Show Completed:").pack(side=tk.LEFT, padx=(12,4))
+        self.filter_show_completed_var = tk.StringVar(value="Yes")  # default: show completed
+        show_vals = ["Yes", "No"]
+        show_cb = ttk.Combobox(filter_frame, textvariable=self.filter_show_completed_var, values=show_vals, width=6, state="readonly")
+        show_cb.pack(side=tk.LEFT)
+        show_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
+
         ttk.Label(filter_frame, text="Due on (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12,4))
         self.filter_due_var = tk.StringVar(value="")
         due_entry = ttk.Entry(filter_frame, textvariable=self.filter_due_var, width=12)
@@ -1254,20 +1327,27 @@ class TaskApp(tk.Tk):
 
     # -------------------- Populate --------------------
     def _populate(self):
-        """Populate the Treeview with tasks including reminder column, respecting filter controls."""
-
+        """Populate the Treeview with tasks, apply filters, and style completed rows."""
         # clear existing rows
-        for row in self.tree.get_children():
-            self.tree.delete(row)
+        try:
+            for row in self.tree.get_children():
+                self.tree.delete(row)
+        except Exception:
+            pass
 
-        # fetch all tasks (we filter in Python for simplicity)
-        rows = self.db.fetch()
+        # fetch all tasks
+        try:
+            rows = self.db.fetch()
+        except Exception as e:
+            print("DB fetch error in _populate:", e)
+            rows = []
 
         # read current filter values
         ft = (self.filter_text_var.get().strip().lower() if hasattr(self, "filter_text_var") else "").strip()
         fpri = (self.filter_priority_var.get() if hasattr(self, "filter_priority_var") else "All")
         fstat = (self.filter_status_var.get() if hasattr(self, "filter_status_var") else "All")
         fdue = (self.filter_due_var.get().strip() if hasattr(self, "filter_due_var") else "").strip()
+        fshow_completed = (self.filter_show_completed_var.get() if hasattr(self, "filter_show_completed_var") else "Yes")
 
         def row_matches(r):
             # text search against title + description
@@ -1279,7 +1359,7 @@ class TaskApp(tk.Tk):
             if fpri and fpri != "All":
                 if (r["priority"] or "") != fpri:
                     return False
-            # status
+            # status filter (exact match unless 'All')
             if fstat and fstat != "All":
                 if (r["status"] or "") != fstat:
                     return False
@@ -1294,91 +1374,196 @@ class TaskApp(tk.Tk):
 
         insert_index = 0
         for r in rows:
-            if not row_matches(r):
-                continue
-
-            desc = r["description"] or ""
-            # Clean HTML for preview (short)
-            desc_preview = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
-            desc_preview = desc_preview.replace("\n", " ")
-            if len(desc_preview) > 80:
-                desc_preview = desc_preview[:80] + "..."
-
-            # reminder column handling (works with sqlite3.Row)
-            reminder_val = r["reminder_minutes"] if "reminder_minutes" in r.keys() else None
-            reminder_display = str(reminder_val) if reminder_val not in (None, "", "None") else "—"
-
-            if self.settings.get("show_description", False):
-                values = [
-                    r["id"],
-                    r["title"],
-                    desc_preview,
-                    r["due_date"] or "—",
-                    r["priority"],
-                    r["status"],
-                    reminder_display
-                ]
-            else:
-                values = [
-                    r["id"],
-                    r["title"],
-                    r["due_date"] or "—",
-                    r["priority"],
-                    r["status"],
-                    reminder_display
-                ]
-
-            # determine tags
-            tags = []
-            pr = (r["priority"] or "").lower()
-            if pr == "high":
-                tags.append("priority_high")
-            elif pr == "medium":
-                tags.append("priority_medium")
-            else:
-                tags.append("priority_low")
-            tags.append("evenrow" if insert_index % 2 == 0 else "oddrow")
-
             try:
-                self.tree.insert("", tk.END, values=values, tags=tags)
-            except Exception:
-                # fallback: insert without tags
-                self.tree.insert("", tk.END, values=values)
-            insert_index += 1
+                status_val = (r["status"] or "").strip()
+                # Hide completed tasks in Task List if Show Completed == "No"
+                if fshow_completed == "No" and status_val.lower() == "done":
+                    continue
 
+                if not row_matches(r):
+                    continue
+
+                desc = r["description"] or ""
+                # Clean HTML for preview (short)
+                desc_preview = desc.replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
+                desc_preview = desc_preview.replace("\n", " ")
+                if len(desc_preview) > 80:
+                    desc_preview = desc_preview[:80] + "..."
+
+                # reminder column handling
+                reminder_val = r["reminder_minutes"] if "reminder_minutes" in r.keys() else None
+                reminder_display = str(reminder_val) if reminder_val not in (None, "", "None") else "—"
+
+                title_display = r["title"] or ""
+                desc_display = desc_preview
+
+                is_done = status_val.lower() == "done"
+
+                # If done -> try to show muted color & (if available) overstrike font via tags
+                if self.settings.get("show_description", False):
+                    values = [
+                        r["id"],
+                        title_display,
+                        desc_display,
+                        r["due_date"] or "—",
+                        r["priority"],
+                        r["status"],
+                        reminder_display
+                    ]
+                else:
+                    values = [
+                        r["id"],
+                        title_display,
+                        r["due_date"] or "—",
+                        r["priority"],
+                        r["status"],
+                        reminder_display
+                    ]
+
+                # tags: completed + priority + zebra
+                tags = []
+                if is_done:
+                    tags.append("completed")
+
+                pr = (r["priority"] or "").lower()
+                if pr == "high":
+                    tags.append("priority_high")
+                elif pr == "medium":
+                    tags.append("priority_medium")
+                else:
+                    tags.append("priority_low")
+
+                tags.append("evenrow" if insert_index % 2 == 0 else "oddrow")
+
+                try:
+                    iid = self.tree.insert("", tk.END, values=values, tags=tags)
+                    if is_done:
+                        try:
+                            # configure completed styling once (defensive)
+                            self.tree.tag_configure("completed", foreground="#666666")
+                            # if you want overstrike font, create and set it elsewhere as self.strike_font
+                            if hasattr(self, "strike_font"):
+                                self.tree.tag_configure("completed", font=self.strike_font)
+                        except Exception:
+                            pass
+                except Exception:
+                    try:
+                        self.tree.insert("", tk.END, values=values)
+                    except Exception:
+                        pass
+
+                insert_index += 1
+            except Exception as e:
+                print("Error inserting row in _populate:", e)
+                continue
+    ####
     def _populate_kanban(self):
-        # clear listboxes and maps
-        for status, lb in self.kanban_lists.items():
-            lb.delete(0, tk.END)
-            self.kanban_item_map[status] = []
+        """Populate the Kanban board listboxes with items, apply priority/completed colouring."""
+        # Clear listboxes and reset maps
+        try:
+            for status, lb in self.kanban_lists.items():
+                try:
+                    lb.delete(0, tk.END)
+                except Exception:
+                    pass
+                self.kanban_item_map[status] = []
+        except Exception:
+            self.kanban_item_map = {status: [] for status in STATUSES}
+
+        # fetch all tasks once
+        try:
+            rows = self.db.fetch()
+        except Exception as e:
+            print("DB fetch error in _populate_kanban:", e)
+            rows = []
+
+        # Build groups keyed by normalized status (match STATUSES case-insensitively)
+        groups = {}
+        for r in rows:
+            try:
+                st = (r["status"] or "").strip()
+                matched = None
+                for s in STATUSES:
+                    if s.lower() == st.lower():
+                        matched = s
+                        break
+                if matched is None:
+                    matched = st or "Pending"
+                groups.setdefault(matched, []).append(r)
+            except Exception:
+                continue
 
         today = date.today()
 
-        for status, lb in self.kanban_lists.items():
-            for r in self.db.fetch_by_status(status):
-                task_id = r['id']
-                title = r['title']
-                due_date = r['due_date']
+        # Fill each Kanban column according to STATUSES order
+        for status in STATUSES:
+            lb = self.kanban_lists.get(status)
+            if lb is None:
+                continue
 
-                # Display only the title — no S.No and no priority icon
-                display = f"{title}"
+            items = groups.get(status, [])
 
-                idx = lb.size()
-                lb.insert(tk.END, display)
+            for r in items:
+                try:
+                    task_id = r["id"]
+                    title = r["title"] or ""
+                    due_date = r["due_date"]
+                    priority = (r["priority"] or "Medium").lower()
+                    is_done = (r["status"] or "").strip().lower() == "done"
 
-                # keep mapping
-                self.kanban_item_map[status].append(task_id)
+                    title_display = title
 
-                # --- Overdue & Today highlighting (row background) ---
-                if due_date:
+                    # Insert item into listbox
                     try:
-                        due = datetime.strptime(due_date, "%Y-%m-%d").date()
-                        if due < today:  # Overdue
-                            lb.itemconfig(idx, bg="#FFCCCC", fg="black")
-                        elif due == today:  # Due today
-                            lb.itemconfig(idx, bg="#FFFACD", fg="black")
+                        idx = lb.size()
+                        lb.insert(tk.END, title_display)
+                    except Exception:
+                        continue
+
+                    # Map index -> task id
+                    try:
+                        self.kanban_item_map[status].append(task_id)
+                    except Exception:
+                        self.kanban_item_map.setdefault(status, []).append(task_id)
+
+                    # Determine base bg for priority
+                    if priority == "high":
+                        bg = "#FFD6D6"
+                    elif priority == "medium":
+                        bg = "#FFF5CC"
+                    else:
+                        bg = "#E6FFEA"
+
+                    # Completed items get muted fg and neutral bg
+                    if is_done:
+                        fg = "#666666"
+                        bg_use = "#f2f2f2"
+                    else:
+                        fg = "black"
+                        bg_use = bg
+
+                    # Overdue / due-today highlight (take precedence)
+                    if due_date:
+                        try:
+                            due = datetime.strptime(due_date, "%Y-%m-%d").date()
+                            if due < today:
+                                bg_use = "#FFCCCC"
+                                fg = "black"
+                            elif due == today:
+                                bg_use = "#FFFACD"
+                                fg = "black"
+                        except Exception:
+                            pass
+
+                    # Apply style to the listbox item if supported
+                    try:
+                        lb.itemconfig(idx, bg=bg_use, fg=fg)
                     except Exception:
                         pass
+
+                except Exception as e:
+                    print("Error inserting kanban item:", e)
+                    continue
 
     # -------------------- Kanban Actions --------------------
     def _kanban_select(self, event):
