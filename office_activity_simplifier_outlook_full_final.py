@@ -1,4 +1,5 @@
 # office_activity_simplifier_outlook_full_final.py
+import calendar
 import sys
 import re
 import tkinter as tk
@@ -106,12 +107,14 @@ class TaskDB:
                 attachments TEXT,
                 reminder_minutes INTEGER,
                 reminder_set_at TEXT,
-                reminder_sent_at TEXT
+                reminder_sent_at TEXT,
+                deleted_at TEXT,
+                recurrence TEXT
             );"""
         )
 
         # Ensure schema migrations (if db already exists but lacks these columns)
-        for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_set_at", "reminder_sent_at"]:
+        for col in ["outlook_id", "progress_log", "attachments", "reminder_minutes", "reminder_set_at", "reminder_sent_at", "deleted_at", "recurrence"]:
             try:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT;")
             except sqlite3.OperationalError:
@@ -120,33 +123,34 @@ class TaskDB:
 
         self.conn.commit()
 
-    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None, reminder_set_at=None):
+    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None, reminder_minutes=None, reminder_set_at=None, recurrence=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
             self.conn.execute(
                 """INSERT INTO tasks(title, description, due_date, priority, status,
-                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, reminder_set_at, None),
+                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at, deleted_at, recurrence)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, reminder_set_at, None, None, recurrence),
             )
 
-    def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None, reminder_set_at=None):
+    def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None, reminder_set_at=None, recurrence=None):
         now = _now_iso()
         done_at = now if status == "Done" else None
         with self.conn:
             # If caller passes reminder_* explicitly, update them; otherwise leave as-is
-            if reminder_minutes is None and reminder_set_at is None:
+            if reminder_minutes is None and reminder_set_at is None and recurrence is None:
                 self.conn.execute(
                     """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
                        status=?, updated_at=?, done_at=? WHERE id=?""",
                     (title, description, due_date, priority, status, now, done_at, task_id),
                 )
             else:
+                # handle recurrence possibly None meaning explicitly set to NULL
                 self.conn.execute(
                     """UPDATE tasks SET title=?, description=?, due_date=?, priority=?, 
-                       status=?, updated_at=?, done_at=?, reminder_minutes=?, reminder_set_at=? WHERE id=?""",
-                    (title, description, due_date, priority, status, now, done_at, reminder_minutes, reminder_set_at, task_id),
+                       status=?, updated_at=?, done_at=?, reminder_minutes=?, reminder_set_at=?, recurrence=? WHERE id=?""",
+                    (title, description, due_date, priority, status, now, done_at, reminder_minutes, reminder_set_at, recurrence, task_id),
                 )
 
     def update_progress(self, task_id, progress_log):
@@ -158,37 +162,59 @@ class TaskDB:
             )
 
     def delete(self, task_id):
+        """Hard delete (keeps for backward compatibility)."""
         with self.conn:
             self.conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def mark_done(self, task_id):
+    def soft_delete(self, task_id):
+        """Soft-delete: set deleted_at timestamp (keeps row for restore)."""
         now = _now_iso()
         with self.conn:
-            self.conn.execute(
-                "UPDATE tasks SET status='Done', updated_at=?, done_at=? WHERE id=?",
-                (now, now, task_id),
-            )
+            self.conn.execute("UPDATE tasks SET deleted_at=?, updated_at=? WHERE id=?", (now, now, task_id))
+
+    def restore(self, task_id):
+        """Restore a soft-deleted task by clearing deleted_at."""
+        with self.conn:
+            self.conn.execute("UPDATE tasks SET deleted_at=NULL, updated_at=? WHERE id=?", (_now_iso(), task_id))
+
+    def purge_deleted(self, older_than_iso=None):
+        """
+        Permanently delete soft-deleted tasks.
+        If older_than_iso is provided, only delete those deleted before that timestamp.
+        """
+        with self.conn:
+            if older_than_iso:
+                self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL AND deleted_at < ?", (older_than_iso,))
+            else:
+                self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL")
 
     def fetch(self):
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM tasks ORDER BY due_date IS NULL, due_date ASC, priority DESC")
+        # By default, don't include deleted tasks
+        cur.execute("SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY due_date IS NULL, due_date ASC, priority DESC")
         return cur.fetchall()
 
     def fetch_by_status(self, status):
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE status=? ORDER BY priority DESC, due_date ASC", (status,))
+        cur.execute("SELECT * FROM tasks WHERE status=? AND deleted_at IS NULL ORDER BY priority DESC, due_date ASC", (status,))
         return cur.fetchall()
 
     def fetch_due_today(self):
         today = date.today().isoformat()
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE status!='Done' AND due_date=? ORDER BY priority DESC", (today,))
+        cur.execute("SELECT * FROM tasks WHERE status!='Done' AND due_date=? AND deleted_at IS NULL ORDER BY priority DESC", (today,))
         return cur.fetchall()
 
     def fetch_overdue(self):
         today = date.today().isoformat()
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE status!='Done' AND due_date IS NOT NULL AND due_date < ?", (today,))
+        cur.execute("SELECT * FROM tasks WHERE status!='Done' AND due_date IS NOT NULL AND due_date < ? AND deleted_at IS NULL", (today,))
+        return cur.fetchall()
+
+    def fetch_deleted(self):
+        """Return soft-deleted tasks (ordered newest deleted first)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM tasks WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC")
         return cur.fetchall()
     
     def bulk_add(self, rows):
@@ -199,8 +225,8 @@ class TaskDB:
                 done_at = now if r.get("status") == "Done" else None
                 self.conn.execute(
                     """INSERT INTO tasks(title, description, due_date, priority, status,
-                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at, deleted_at, recurrence)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         r.get("title"),
                         r.get("description"),
@@ -215,12 +241,178 @@ class TaskDB:
                         None,
                         None,
                         None,
+                        None,
+                        r.get("recurrence")
                     ),
                 )
 
+    def mark_done(self, task_id):
+        now = _now_iso()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET status='Done', updated_at=?, done_at=? WHERE id=?",
+                (now, now, task_id),
+            )
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
+
+        # ---------- Recurrence helpers ----------
+    def _parse_recurrence(self, rec_text):
+        """
+        Parse recurrence storage string into a dict:
+        - 'none' -> {"type": "none"}
+        - 'days:3' -> {"type":"days", "n":3}
+        - 'weeks:2' -> {"type":"weeks", "n":2}
+        - 'months:1' -> {"type":"months", "n":1}
+        """
+        if not rec_text:
+            return {"type": "none"}
+        try:
+            rt = rec_text.strip().lower()
+            if rt in ("none", "0", ""):
+                return {"type": "none"}
+            if ":" in rt:
+                typ, num = rt.split(":", 1)
+                n = int(num)
+                if typ in ("days", "weeks", "months"):
+                    return {"type": typ, "n": max(1, n)}
+            # fall back: treat numeric as days
+            if rt.isdigit():
+                return {"type": "days", "n": max(1, int(rt))}
+        except Exception:
+            pass
+        return {"type": "none"}
+
+    def _format_recurrence(self, rec_dict):
+        """Format recurrence dict back to storage string."""
+        if not rec_dict or rec_dict.get("type") == "none":
+            return "none"
+        typ = rec_dict.get("type")
+        n = int(rec_dict.get("n", 1))
+        return f"{typ}:{n}"
+
+    def _compute_next_due(self, due_iso, rec_text):
+        """
+        Given current due_date (YYYY-MM-DD) and recurrence string, return next due (YYYY-MM-DD or None).
+        """
+        if not due_iso or not rec_text:
+            return None
+        try:
+            parsed = self._parse_recurrence(rec_text)
+            if parsed.get("type") == "none":
+                return None
+            n = int(parsed.get("n", 1))
+            cur = datetime.strptime(due_iso, "%Y-%m-%d").date()
+            typ = parsed.get("type")
+            if typ == "days":
+                nxt = cur + timedelta(days=n)
+            elif typ == "weeks":
+                nxt = cur + timedelta(weeks=n)
+            elif typ == "months":
+                # increment month while keeping day if possible
+                month = cur.month - 1 + n
+                year = cur.year + month // 12
+                month = month % 12 + 1
+                day = min(cur.day, calendar.monthrange(year, month)[1])
+                nxt = date(year, month, day)
+            else:
+                return None
+            return nxt.isoformat()
+        except Exception:
+            return None
+
+    def _populate_trash(self):
+        """Populate Trash treeview with soft-deleted tasks."""
+        try:
+            for iid in getattr(self, "trash_tree", tk.Frame()).get_children():
+                self.trash_tree.delete(iid)
+        except Exception:
+            pass
+
+        try:
+            rows = self.db.fetch_deleted()
+        except Exception as e:
+            print("DB fetch_deleted error:", e)
+            rows = []
+
+        for r in rows:
+            try:
+                deleted_at = r["deleted_at"] or "?"
+                self.trash_tree.insert("", tk.END, values=(r["id"], r["title"], deleted_at, r["due_date"] or "—", r["priority"], r["status"]))
+            except Exception:
+                pass
+
+    def _restore_selected_trash(self):
+        sel = self.trash_tree.selection()
+        if not sel:
+            return
+        for s in sel:
+            try:
+                task_id = int(self.trash_tree.item(s, "values")[0])
+                self.db.restore(task_id)
+            except Exception as e:
+                print("Restore error:", e)
+        self._populate()
+        self._populate_kanban()
+        self._populate_trash()
+
+    def _permanently_delete_selected_trash(self):
+        sel = self.trash_tree.selection()
+        if not sel:
+            return
+        confirm = messagebox.askyesno("Confirm Permanent Delete", f"Permanently delete {len(sel)} selected item(s)? This cannot be undone.")
+        if not confirm:
+            return
+        for s in sel:
+            try:
+                task_id = int(self.trash_tree.item(s, "values")[0])
+                # optionally sync remove with Outlook if it had an outlook_id
+                try:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT outlook_id FROM tasks WHERE id=?", (task_id,))
+                    row = cur.fetchone()
+                    if row and row["outlook_id"]:
+                        # attempt Outlook sync deletion
+                        try:
+                            self._sync_outlook_task(task_id, {}, action="delete")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                self.db.delete(task_id)  # hard delete
+            except Exception as e:
+                print("Permanent delete error:", e)
+        self._populate()
+        self._populate_kanban()
+        self._populate_trash()
+
+    def _empty_trash_confirm(self):
+        confirm = messagebox.askyesno("Empty Trash", "Permanently delete all items in Trash? This cannot be undone.")
+        if not confirm:
+            return
+        # Optionally: call self.db.purge_deleted() to remove all soft-deleted rows
+        try:
+            # if you want to also attempt outlook delete for each, iterate fetch_deleted and call _sync_outlook_task
+            rows = self.db.fetch_deleted()
+            for r in rows:
+                try:
+                    if r["outlook_id"]:
+                        try:
+                            self._sync_outlook_task(r["id"], {}, action="delete")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            self.db.purge_deleted()
+        except Exception as e:
+            print("Empty trash error:", e)
+        self._populate()
+        self._populate_kanban()
+        self._populate_trash()
+
+
     def strike_text(self, text: str) -> str:
         """
         Return a visual strike-through using combining long stroke overlay characters.
@@ -457,28 +649,56 @@ class TaskApp(tk.Tk):
 
     ####
     def _show_reminder_popup(self, task_id, title, description):
-        """Focused reminder popup with safe, defensive snooze/dismiss DB updates."""
-        # On Windows, show a toast too (safe wrapper)
+        """Focused reminder popup that forces itself above other windows/dialogs.
+
+        This is defensive: it tries several strategies to ensure the user sees the popup
+        even if other Toplevels are open or the app is minimized.
+        """
+        # Show a Windows toast as before
         if HAS_NOTIFY:
             _safe_show_toast(f"Reminder: {title}", description or "Task due soon")
 
-        # Create popup
+        # Create the popup
         win = tk.Toplevel(self)
         win.title("🔔 Task Reminder")
         win.geometry("640x320")
-        win.transient(self)
-        # try to keep on top & focused, but don't crash if attributes not supported
+        # Do not use transient(self) alone — we want this to be visible above everything.
         try:
+            # If app is minimized, try to restore it so the popup is visible
+            try:
+                if str(self.state()) == "iconic":
+                    self.deiconify()
+            except Exception:
+                pass
+
+            # attempt to make popup topmost and visible
             win.attributes("-topmost", True)
             win.lift()
+            win.update_idletasks()
+
+            # attempt to grab events globally so popup is interactive even when other
+            # modal windows exist. This may fail on some platforms — ignore errors.
+            try:
+                win.grab_set_global()
+            except Exception:
+                try:
+                    win.grab_set()
+                except Exception:
+                    pass
+
+            # Bring the whole application to front (platform-dependent best-effort)
+            try:
+                self.lift()
+            except Exception:
+                pass
         except Exception:
             pass
 
-        # header
+        # Header
         header = ttk.Label(win, text=title, font=("", 14, "bold"))
         header.pack(padx=12, pady=(12, 6), anchor="w")
 
-        # description area (read-only)
+        # Description (read-only)
         txt = tk.Text(win, height=8, wrap="word", padx=8, pady=4)
         txt.insert("1.0", description or "(no description)")
         txt.config(state="disabled")
@@ -489,6 +709,11 @@ class TaskApp(tk.Tk):
 
         def open_task():
             try:
+                # release any global grab before opening editor to avoid focus issues
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
                 win.destroy()
             except Exception:
                 pass
@@ -498,7 +723,6 @@ class TaskApp(tk.Tk):
                 print("Error opening task editor from reminder popup:", e)
 
         def _snooze(minutes):
-            # Defensive conversion & DB update; do not let exceptions escape
             try:
                 minutes_int = int(minutes)
             except Exception:
@@ -507,23 +731,23 @@ class TaskApp(tk.Tk):
 
             new_set = datetime.now().isoformat(timespec="seconds")
             try:
-                # use context manager so commit happens (and exceptions are raised here)
                 with self.db.conn:
-                    # set reminder_minutes and reminder_set_at, clear reminder_sent_at (NULL)
                     self.db.conn.execute(
                         "UPDATE tasks SET reminder_minutes=?, reminder_set_at=?, reminder_sent_at=? WHERE id=?",
                         (minutes_int, new_set, None, task_id)
                     )
             except Exception as e:
-                # log and show non-blocking error so app does not crash
                 print("Snooze update error:", e)
                 try:
-                    messagebox.showerror("Snooze Error", f"Could not snooze reminder: {e}")
+                    messagebox.showerror("Snooze Error", f"Could not snooze reminder: {e}", parent=win)
                 except Exception:
                     pass
                 return
 
-            # close popup after successful snooze
+            try:
+                win.grab_release()
+            except Exception:
+                pass
             try:
                 win.destroy()
             except Exception:
@@ -537,24 +761,32 @@ class TaskApp(tk.Tk):
             except Exception as e:
                 print("Dismiss update error:", e)
                 try:
-                    messagebox.showerror("Dismiss Error", f"Could not dismiss reminder: {e}")
+                    messagebox.showerror("Dismiss Error", f"Could not dismiss reminder: {e}", parent=win)
                 except Exception:
                     pass
-                # still attempt to close the window
+            try:
+                win.grab_release()
+            except Exception:
+                pass
             try:
                 win.destroy()
             except Exception:
                 pass
 
-        # Buttons — use ttk but layout is flexible
+        # Buttons
         ttk.Button(btnf, text="Open Task", command=open_task).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 5m", command=lambda: _snooze(5)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 10m", command=lambda: _snooze(10)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Snooze 30m", command=lambda: _snooze(30)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text="Dismiss", command=dismiss).pack(side=tk.RIGHT, padx=6)
 
+        # Focus and ensure topmost for a brief time so it gets attention.
         try:
             win.focus_force()
+            win.update()
+            # Keep topmost for a short alert window to ensure visibility, then keep it topmost.
+            # (We already set topmost=True above; this is extra reinforcement.)
+            self.after(1500, lambda: win.attributes("-topmost", True))
         except Exception:
             pass
 
@@ -599,7 +831,8 @@ class TaskApp(tk.Tk):
     def _open_edit_window(self, task_id=None):
         """
         Open popup for adding/editing a task.
-        Includes a Progress panel (existing log + multi-line add entry).
+        Scrollable content so the dialog fits on smaller screens (macbooks / windows laptops).
+        Includes Save and Cancel buttons at the bottom.
         """
         try:
             from tkcalendar import DateEntry
@@ -608,14 +841,78 @@ class TaskApp(tk.Tk):
             DateEntry = None
             has_dateentry = False
 
+        # Create toplevel
         win = tk.Toplevel(self)
         win.transient(self)
+        win.title("Edit Task" if task_id else "Add Task")
         try:
             win.grab_set()
         except Exception:
             pass
-        win.title("Edit Task" if task_id else "Add Task")
-        win.geometry("780x720")
+
+        # Size the window proportionally to screen (works on macOS and Windows)
+        try:
+            screen_w = self.winfo_screenwidth()
+            screen_h = self.winfo_screenheight()
+            width = min(1000, int(screen_w * 0.85))
+            height = min(900, int(screen_h * 0.85))
+            min_width, min_height = 700, 520
+            width = max(min_width, width)
+            height = max(min_height, height)
+            win.geometry(f"{width}x{height}")
+            win.minsize(min_width, min_height)
+            win.resizable(True, True)
+        except Exception:
+            try:
+                win.geometry("900x700")
+                win.minsize(700, 520)
+                win.resizable(True, True)
+            except Exception:
+                pass
+
+        # Top-level layout: a canvas with scrollbar so content can scroll if window is small.
+        container = ttk.Frame(win)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, highlightthickness=0)
+        vscroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        content_frame = ttk.Frame(canvas, padding=10)
+        # Put the content_frame in the canvas
+        canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+        # Make canvas resize with window
+        def _on_frame_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        content_frame.bind("<Configure>", _on_frame_configure)
+
+        # Allow mousewheel scrolling (cross-platform)
+        def _on_mousewheel(event):
+            # Windows / Linux
+            if sys.platform.startswith("win") or sys.platform.startswith("linux"):
+                delta = -1 * int(event.delta / 120)
+            else:
+                # macOS: event.delta is small; reverse sign
+                delta = -1 * int(event.delta)
+            canvas.yview_scroll(delta, "units")
+
+        # bind mousewheel to canvas when pointer is over it
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))  # linux
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        # Column weights for nice grid expansion inside content_frame
+        for c in range(6):
+            content_frame.columnconfigure(c, weight=0)
+        content_frame.columnconfigure(1, weight=1)
+        content_frame.columnconfigure(2, weight=0)
+        content_frame.columnconfigure(3, weight=0)
+        content_frame.columnconfigure(4, weight=0)
+        content_frame.columnconfigure(5, weight=0)
 
         # Variables
         title_var = tk.StringVar()
@@ -623,55 +920,65 @@ class TaskApp(tk.Tk):
         priority_var = tk.StringVar(value="Medium")
         status_var = tk.StringVar(value="Pending")
         reminder_var = tk.StringVar(value="")
+        rec_type_var = tk.StringVar(value="None")
+        rec_n_var = tk.StringVar(value="1")
 
         staged_attachments = []
         existing_attachments = []
         staged_progress_entries = ""
 
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill=tk.BOTH, expand=True)
+        row = 0
+        # Title
+        ttk.Label(content_frame, text="Title *").grid(row=row, column=0, sticky="w")
+        ttk.Entry(content_frame, textvariable=title_var, width=60).grid(row=row, column=1, columnspan=4, sticky="we", padx=6, pady=4)
+        row += 1
 
-        # --- Basic fields ---
-        ttk.Label(frm, text="Title *").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=title_var, width=60).grid(row=0, column=1, sticky="w", padx=6, pady=4, columnspan=2)
-
-        ttk.Label(frm, text="Due Date (YYYY-MM-DD)").grid(row=1, column=0, sticky="w")
+        # Due date
+        ttk.Label(content_frame, text="Due Date (YYYY-MM-DD)").grid(row=row, column=0, sticky="w")
         if has_dateentry:
-            DateEntry(frm, date_pattern="yyyy-mm-dd", textvariable=due_var, width=20).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+            DateEntry(content_frame, date_pattern="yyyy-mm-dd", textvariable=due_var, width=20).grid(row=row, column=1, sticky="w", padx=6, pady=4)
         else:
-            ttk.Entry(frm, textvariable=due_var, width=20).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+            ttk.Entry(content_frame, textvariable=due_var, width=20).grid(row=row, column=1, sticky="w", padx=6, pady=4)
 
-        ttk.Label(frm, text="Priority").grid(row=2, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=priority_var, values=PRIORITIES, state="readonly", width=12).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        # Priority & Status
+        ttk.Label(content_frame, text="Priority").grid(row=row, column=2, sticky="w", padx=(12,0))
+        ttk.Combobox(content_frame, textvariable=priority_var, values=PRIORITIES, state="readonly", width=12).grid(row=row, column=3, sticky="w", padx=6, pady=4)
+        ttk.Label(content_frame, text="Status").grid(row=row, column=4, sticky="w", padx=(12,0))
+        ttk.Combobox(content_frame, textvariable=status_var, values=STATUSES, state="readonly", width=14).grid(row=row, column=5, sticky="w", padx=6, pady=4)
+        row += 1
 
-        ttk.Label(frm, text="Status").grid(row=3, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=status_var, values=STATUSES, state="readonly", width=12).grid(row=3, column=1, sticky="w", padx=6, pady=4)
-
-        ttk.Label(frm, text="Reminder (minutes before due)").grid(row=4, column=0, sticky="w")
+        # Reminder
+        ttk.Label(content_frame, text="Reminder (minutes before due)").grid(row=row, column=0, sticky="w")
         reminder_choices = ["", "5", "10", "30", "60", "120", "1440"]
-        reminder_cb = ttk.Combobox(frm, textvariable=reminder_var, values=reminder_choices, width=18)
-        reminder_cb.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        reminder_cb = ttk.Combobox(content_frame, textvariable=reminder_var, values=reminder_choices, width=18)
+        reminder_cb.grid(row=row, column=1, sticky="w", padx=6, pady=4)
         reminder_cb.set("")
+        # Recurrence controls in same row to the right
+        ttk.Label(content_frame, text="Recurrence").grid(row=row, column=2, sticky="w", padx=(12,0))
+        rec_types = ["None", "Every N days", "Every N weeks", "Every N months"]
+        rec_cb = ttk.Combobox(content_frame, textvariable=rec_type_var, values=rec_types, state="readonly", width=18)
+        rec_cb.grid(row=row, column=3, sticky="w", padx=6, pady=4)
+        ttk.Label(content_frame, text="N").grid(row=row, column=4, sticky="w")
+        ttk.Entry(content_frame, textvariable=rec_n_var, width=6).grid(row=row, column=5, sticky="w", padx=(4,0))
+        row += 1
 
-        # Description
-        ttk.Label(frm, text="Description").grid(row=5, column=0, sticky="nw", pady=(6,0))
-        desc_text = tk.Text(frm, height=10, width=70, wrap="word")
-        desc_text.grid(row=5, column=1, sticky="we", padx=6, pady=(6,0), columnspan=2)
+        # Description (spanning columns)
+        ttk.Label(content_frame, text="Description").grid(row=row, column=0, sticky="nw", pady=(6,0))
+        desc_text = tk.Text(content_frame, height=10, width=80, wrap="word")
+        desc_text.grid(row=row, column=1, columnspan=5, sticky="we", padx=6, pady=(6,0))
+        row += 1
 
-        # --- Progress section ---
-        ttk.Label(frm, text="Progress Log").grid(row=6, column=0, sticky="nw", pady=(10,0))
-        progress_frame = ttk.Frame(frm)
-        progress_frame.grid(row=6, column=1, sticky="we", padx=6, pady=(10,0), columnspan=2)
-
-        progress_display = tk.Text(progress_frame, height=8, width=68, wrap="word")
+        # Progress log
+        ttk.Label(content_frame, text="Progress Log").grid(row=row, column=0, sticky="nw", pady=(10,0))
+        progress_frame = ttk.Frame(content_frame)
+        progress_frame.grid(row=row, column=1, columnspan=5, sticky="we", padx=6, pady=(10,0))
+        progress_display = tk.Text(progress_frame, height=8, width=72, wrap="word")
         progress_display.insert("1.0", "")
         progress_display.config(state="disabled")
         progress_display.pack(fill=tk.BOTH, expand=False)
-
         ttk.Label(progress_frame, text="New progress entry:").pack(anchor="w", pady=(8,2))
-        new_progress_entry = tk.Text(progress_frame, height=4, width=68, wrap="word")
+        new_progress_entry = tk.Text(progress_frame, height=4, width=72, wrap="word")
         new_progress_entry.pack(fill=tk.BOTH, expand=False)
-
         def _add_progress_entry_from_text(text_value):
             nonlocal staged_progress_entries
             text = text_value.strip()
@@ -702,17 +1009,16 @@ class TaskApp(tk.Tk):
                 progress_display.insert(tk.END, staged_progress_entries)
                 progress_display.config(state="disabled")
                 new_progress_entry.delete("1.0", tk.END)
-
         ttk.Button(progress_frame, text="Add Progress Entry", command=lambda: _add_progress_entry_from_text(new_progress_entry.get("1.0", tk.END))).pack(pady=(6,0))
+        row += 1
 
-        # --- Attachments UI ---
-        ttk.Label(frm, text="Attachments").grid(row=7, column=0, sticky="nw", pady=(10,0))
-        attachments_frame = ttk.Frame(frm)
-        attachments_frame.grid(row=7, column=1, sticky="we", padx=6, pady=(10,0), columnspan=2)
+        # Attachments
+        ttk.Label(content_frame, text="Attachments").grid(row=row, column=0, sticky="nw", pady=(10,0))
+        attachments_frame = ttk.Frame(content_frame)
+        attachments_frame.grid(row=row, column=1, columnspan=5, sticky="we", padx=6, pady=(10,0))
         attachments_list_var = tk.StringVar(value=", ".join(os.path.basename(p) for p in existing_attachments))
-        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=560)
+        attachments_label = ttk.Label(attachments_frame, textvariable=attachments_list_var, wraplength=700)
         attachments_label.pack(anchor="w", fill=tk.X)
-
         def add_file_to_attachments():
             path = filedialog.askopenfilename(parent=win)
             if not path:
@@ -725,7 +1031,6 @@ class TaskApp(tk.Tk):
                 dest = os.path.join("attachments", f"{base}_{int(datetime.now().timestamp())}{ext}")
             with open(path, "rb") as fsrc, open(dest, "wb") as fdst:
                 fdst.write(fsrc.read())
-
             if task_id:
                 cur = self.db.conn.cursor()
                 cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
@@ -743,7 +1048,6 @@ class TaskApp(tk.Tk):
             else:
                 staged_attachments.append(dest)
                 attachments_list_var.set(", ".join(os.path.basename(p) for p in staged_attachments))
-
         def open_attachments():
             files = list(existing_attachments) + list(staged_attachments)
             if not files:
@@ -754,43 +1058,77 @@ class TaskApp(tk.Tk):
                     if os.name == "nt":
                         os.startfile(f)
                     elif sys.platform == "darwin":
-                        os.system(f"open '{f}'")   # ✅ fixed here
+                        os.system(f"open '{f}'")
                     else:
                         os.system(f"xdg-open '{f}'")
                 except Exception as e:
                     messagebox.showerror("Error", f"Could not open {f}: {e}", parent=win)
-
         btns_attach = ttk.Frame(attachments_frame)
         btns_attach.pack(anchor="w", pady=(6,0))
         ttk.Button(btns_attach, text="Add File", command=add_file_to_attachments).pack(side=tk.LEFT)
         ttk.Button(btns_attach, text="Open", command=open_attachments).pack(side=tk.LEFT, padx=6)
+        row += 1
 
-        # Load existing task values
+        # Populate existing values if editing
         if task_id:
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
-            r = cur.fetchone()
-            if r:
-                title_var.set(r["title"])
-                due_var.set(r["due_date"] or "")
-                priority_var.set(r["priority"] or "Medium")
-                status_var.set(r["status"] or "Pending")
-                desc_text.insert(tk.END, r["description"] or "")
-                if "attachments" in r.keys() and r["attachments"]:
-                    try:
-                        existing_attachments = json.loads(r["attachments"])
-                    except Exception:
-                        existing_attachments = []
-                if r["reminder_minutes"]:
-                    reminder_var.set(str(r["reminder_minutes"]))
-                if r["progress_log"]:
-                    progress_display.config(state="normal")
-                    progress_display.delete("1.0", tk.END)
-                    progress_display.insert(tk.END, r["progress_log"])
-                    progress_display.config(state="disabled")
+            try:
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+                r = cur.fetchone()
+                if r:
+                    title_var.set(r["title"])
+                    due_var.set(r["due_date"] or "")
+                    priority_var.set(r["priority"] or "Medium")
+                    status_var.set(r["status"] or "Pending")
+                    desc_text.insert(tk.END, r["description"] or "")
+                    if "attachments" in r.keys() and r["attachments"]:
+                        try:
+                            existing_attachments = json.loads(r["attachments"])
+                        except Exception:
+                            existing_attachments = []
+                        attachments_list_var.set(", ".join(os.path.basename(p) for p in existing_attachments))
+                    if r["reminder_minutes"]:
+                        reminder_var.set(str(r["reminder_minutes"]))
+                    if r["progress_log"]:
+                        progress_display.config(state="normal")
+                        progress_display.delete("1.0", tk.END)
+                        progress_display.insert(tk.END, r["progress_log"])
+                        progress_display.config(state="disabled")
+                    # recurrence
+                    rec_val = (r["recurrence"] or "").strip().lower()
+                    if rec_val and rec_val != "none":
+                        parsed = self._parse_recurrence(rec_val)
+                        typ = parsed.get("type")
+                        n = parsed.get("n", 1)
+                        if typ == "days":
+                            rec_type_var.set("Every N days")
+                        elif typ == "weeks":
+                            rec_type_var.set("Every N weeks")
+                        elif typ == "months":
+                            rec_type_var.set("Every N months")
+                        else:
+                            rec_type_var.set("None")
+                        rec_n_var.set(str(n))
+                    else:
+                        rec_type_var.set("None")
+                        rec_n_var.set("1")
+            except Exception:
+                pass
 
-        # Save handler
-        def save():
+        # Save & Cancel buttons frame (sticky at bottom)
+        bottom_frame = ttk.Frame(win, padding=8)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        # Add a horizontal separator
+        sep = ttk.Separator(bottom_frame, orient="horizontal")
+        sep.pack(fill=tk.X, pady=(0,6))
+
+        def _close():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _save():
             title = title_var.get().strip()
             if not title:
                 messagebox.showwarning("Validation", "Title is required", parent=win)
@@ -802,10 +1140,8 @@ class TaskApp(tk.Tk):
                 except ValueError:
                     messagebox.showwarning("Validation", "Date must be YYYY-MM-DD", parent=win)
                     return
-
             desc = desc_text.get("1.0", tk.END).strip()
             reminder_value = reminder_var.get().strip() or None
-
             if reminder_value not in (None, "", "None"):
                 try:
                     reminder_minutes_int = int(reminder_value)
@@ -817,28 +1153,81 @@ class TaskApp(tk.Tk):
                 reminder_minutes_int = None
                 reminder_set_at_iso = None
 
-            if task_id:
-                self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
+            # recurrence
+            rec_type_label = rec_type_var.get()
+            try:
+                n_val = int(rec_n_var.get())
+                n_val = max(1, n_val)
+            except Exception:
+                messagebox.showwarning("Validation", "Recurrence interval N must be an integer >= 1.", parent=win)
+                return
+
+            if rec_type_label == "Every N days":
+                rec_store = f"days:{n_val}"
+            elif rec_type_label == "Every N weeks":
+                rec_store = f"weeks:{n_val}"
+            elif rec_type_label == "Every N months":
+                rec_store = f"months:{n_val}"
             else:
-                self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
-                            reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso)
-                cur = self.db.conn.cursor()
-                cur.execute("SELECT last_insert_rowid() as id")
-                new_id = cur.fetchone()["id"]
-                if staged_attachments:
-                    self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
-                if staged_progress_entries:
-                    self.db.update_progress(new_id, staged_progress_entries)
+                rec_store = "none"
+
+            try:
+                if task_id:
+                    self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
+                                reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso, recurrence=rec_store)
+                    # update attachments if we added staged_attachments
+                    if staged_attachments:
+                        # merge with existing attachments
+                        cur = self.db.conn.cursor()
+                        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
+                        row = cur.fetchone()
+                        files = []
+                        if row and row["attachments"]:
+                            try:
+                                files = json.loads(row["attachments"])
+                            except Exception:
+                                files = []
+                        files.extend(staged_attachments)
+                        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(files), task_id))
+                else:
+                    self.db.add(title, desc, due or None, priority_var.get(), status_var.get(),
+                                reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso, recurrence=rec_store)
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT last_insert_rowid() as id")
+                    new_id = cur.fetchone()["id"]
+                    if staged_attachments:
+                        self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (json.dumps(staged_attachments), new_id))
+                    if staged_progress_entries:
+                        self.db.update_progress(new_id, staged_progress_entries)
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Could not save task: {e}", parent=win)
+                return
 
             self._populate()
             self._populate_kanban()
-            win.destroy()
+            _close()
 
-        btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=8, column=0, columnspan=3, pady=12)
-        ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
+        # Buttons (Save on right, Cancel on left)
+        btn_frame = ttk.Frame(bottom_frame)
+        btn_frame.pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Save", command=_save).pack(side=tk.RIGHT, padx=(6,0))
+        ttk.Button(btn_frame, text="Cancel", command=_close).pack(side=tk.RIGHT, padx=(0,6))
+
+        # Ensure focus goes to title entry
+        try:
+            win.focus_force()
+            # set keyboard focus to the first entry
+            for child in content_frame.winfo_children():
+                if isinstance(child, ttk.Entry):
+                    child.focus_set()
+                    break
+        except Exception:
+            pass
+
+        # keep scroll region updated and allow the dialog to recalculate on resize
+        def _on_win_configure(event=None):
+            _on_frame_configure()
+        win.bind("<Configure>", _on_win_configure)
 
     def _open_selected_kanban_attachments(self):
         if not self.kanban_selected_id:
@@ -1011,9 +1400,50 @@ class TaskApp(tk.Tk):
         # build UI once
         self._build_ui()
 
+                # --- Robust Delete key bindings (works when focus is in tree / kanban / trash / text) ---
+        # Global handler already exists: self.bind_all("<Delete>", self._on_delete_key)
+        # Add explicit bindings for the main widgets and macOS Backspace mapping.
+
+        try:
+            # Treeview focused delete
+            self.tree.bind("<Delete>", lambda e: self._delete_task())
+            # Some mac keyboards send BackSpace for delete — treat it the same when tree has focus
+            self.tree.bind("<BackSpace>", lambda e: self._delete_task())
+
+            # Trash tree: Delete -> permanently delete selected
+            if hasattr(self, "trash_tree"):
+                self.trash_tree.bind("<Delete>", lambda e: self._permanently_delete_selected_trash())
+                self.trash_tree.bind("<BackSpace>", lambda e: self._permanently_delete_selected_trash())
+
+            # Kanban listboxes: bind delete/backspace for each column/listbox
+            if hasattr(self, "kanban_lists"):
+                for status, lb in self.kanban_lists.items():
+                    # use a small wrapper to ensure current selection uses kanban deletion logic
+                    lb.bind("<Delete>", lambda e, _lb=lb: self._delete_selected_kanban())
+                    lb.bind("<BackSpace>", lambda e, _lb=lb: self._delete_selected_kanban())
+
+            # Also ensure the global fallback is set (in case some widget swallows it)
+            self.bind_all("<Delete>", lambda e: self._on_delete_key())
+            self.bind_all("<BackSpace>", lambda e: self._on_delete_key())
+        except Exception as e:
+            # defensive: don't crash app if binding fails
+            print("Delete key binding setup error (ignored):", e)
+
+
+
+        # Keyboard shortcuts
+        # Delete -> delete / move to trash (context-aware)
+        self.bind_all("<Delete>", self._on_delete_key)
+        # Ctrl+N -> create new task
+        self.bind_all("<Control-n>", lambda e: self._open_edit_window(None))
+        # Also support Ctrl+N uppercase on some platforms
+        self.bind_all("<Control-N>", lambda e: self._open_edit_window(None))
+
         # populate after a short delay
         self.after(100, self._populate)
         self.after(100, self._populate_kanban)
+        # after self.after(100, self._populate_kanban)
+        self.after(200, self._populate_trash)
 
         # start reminder checking + UI refresher
         self._schedule_task_reminder_checker()   # every ~5s to fire popups
@@ -1024,6 +1454,25 @@ class TaskApp(tk.Tk):
 
         # existing reminder check for due-today toast
         self._check_reminders()
+
+    def _on_delete_key(self, event=None):
+        # determine active tab
+        try:
+            idx = self.notebook.index(self.notebook.select())
+            tab_text = self.notebook.tab(idx, "text")
+        except Exception:
+            tab_text = None
+
+        if tab_text == "Task List":
+            self._delete_task()
+        elif tab_text == "Kanban Board":
+            self._delete_selected_kanban()
+        elif tab_text == "Trash":
+            # in Trash tab, Delete -> permanently delete selected
+            self._permanently_delete_selected_trash()
+        else:
+            # fallback: try tree delete
+            self._delete_task()
 
     def _treeview_sort_column(self, col, reverse):
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
@@ -1212,6 +1661,34 @@ class TaskApp(tk.Tk):
         self.kanban_attachments_label.pack(anchor="w", fill=tk.X, pady=2)
         ttk.Button(desc_frame, text="Open Attachments", command=self._open_selected_kanban_attachments).pack(anchor="w", pady=2)
 
+        # -------------------- Trash --------------------
+        trash_tab = ttk.Frame(self.notebook)
+        self.notebook.add(trash_tab, text="Trash")
+
+        trash_toolbar = ttk.Frame(trash_tab, padding=6)
+        trash_toolbar.pack(fill=tk.X)
+        ttk.Button(trash_toolbar, text="Restore", command=self._restore_selected_trash).pack(side=tk.LEFT, padx=4)
+        ttk.Button(trash_toolbar, text="Delete Permanently", command=self._permanently_delete_selected_trash).pack(side=tk.LEFT, padx=4)
+        ttk.Button(trash_toolbar, text="Empty Trash", command=self._empty_trash_confirm).pack(side=tk.LEFT, padx=4)
+        ttk.Button(trash_toolbar, text="Refresh", command=self._populate_trash).pack(side=tk.RIGHT, padx=4)
+
+        # Trash Treeview
+        self.trash_tree = ttk.Treeview(trash_tab, columns=["id", "title", "deleted_at", "due", "priority", "status"], show="headings")
+        self.trash_tree.heading("id", text="ID")
+        self.trash_tree.heading("title", text="Title")
+        self.trash_tree.heading("deleted_at", text="Deleted At")
+        self.trash_tree.heading("due", text="Due")
+        self.trash_tree.heading("priority", text="Priority")
+        self.trash_tree.heading("status", text="Status")
+        self.trash_tree.column("id", width=60, anchor="center")
+        self.trash_tree.column("title", width=400, anchor="w")
+        self.trash_tree.column("deleted_at", width=160, anchor="center")
+        self.trash_tree.column("due", width=120, anchor="center")
+        self.trash_tree.column("priority", width=90, anchor="center")
+        self.trash_tree.column("status", width=90, anchor="center")
+        self.trash_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.trash_tree.bind("<Double-1>", lambda e: self._restore_selected_trash())
+
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
         action_frame.pack(fill=tk.X)
         self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled"); self.btn_edit.pack(side=tk.LEFT, padx=5)
@@ -1252,25 +1729,104 @@ class TaskApp(tk.Tk):
         if not sel:
             return
 
-        confirm = messagebox.askyesno("Confirm Delete", f"Delete {len(sel)} selected task(s)?")
+        confirm = messagebox.askyesno("Confirm Delete", f"Move {len(sel)} selected task(s) to Trash?")
         if not confirm:
             return
 
         for s in sel:
             task_id = int(self.tree.item(s, "values")[0])
-            self.db.delete(task_id)
-            self._sync_outlook_task(task_id, {}, action="delete")
-
+            # soft-delete
+            try:
+                self.db.soft_delete(task_id)
+            except Exception as e:
+                print("Soft-delete error:", e)
+            # Note: do NOT delete from Outlook now; only on permanent purge (to be safe)
         self._populate()
         self._populate_kanban()
+        # refresh trash view if open
+        try:
+            self._populate_trash()
+        except Exception:
+            pass
+    ###
+    def _create_next_occurrence_if_needed(self, task_row):
+        try:
+            rec = (task_row["recurrence"] or "none")
+            due = task_row["due_date"]
+            if not due:
+                return None
+            if not rec or rec.strip().lower() in ("none", ""):
+                return None
+            next_due = self._compute_next_due(due, rec)
+            if not next_due:
+                return None
 
+            # copy attachments and progress if present
+            attachments = task_row["attachments"] or None
+            progress = task_row["progress_log"] or None
+
+            self.db.add(
+                title=task_row["title"],
+                description=task_row["description"],
+                due_date=next_due,
+                priority=task_row["priority"] or "Medium",
+                status="Pending",
+                outlook_id=None,
+                reminder_minutes=task_row["reminder_minutes"],
+                reminder_set_at=None,
+                recurrence=rec
+            )
+            # update attachments/progress on new row
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT last_insert_rowid() as id")
+            new_id = cur.fetchone()["id"]
+            if attachments:
+                self.db.conn.execute("UPDATE tasks SET attachments=? WHERE id=?", (attachments, new_id))
+            if progress:
+                self.db.update_progress(new_id, progress)
+            return new_id
+        except Exception as e:
+            print("Error creating next recurrence:", e)
+            return None
+    ###
     def _mark_done(self):
         sel = self.tree.selection()
-        if not sel: return
-        task_id = int(self.tree.item(sel[0], "values")[0])
-        self.db.mark_done(task_id)
+        if not sel:
+            return
+        for s in sel:
+            try:
+                task_id = int(self.tree.item(s, "values")[0])
+            except Exception:
+                continue
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            self.db.mark_done(task_id)
+            try:
+                self._create_next_occurrence_if_needed(row)
+            except Exception:
+                pass
+            self._sync_outlook_task(task_id, {}, action="done")
         self._populate(); self._populate_kanban()
-        self._sync_outlook_task(task_id, {}, action="done")
+
+    def _mark_done_selected_kanban(self):
+        if not self.kanban_selected_id: return
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT * FROM tasks WHERE id=?", (self.kanban_selected_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+        # mark done
+        self.db.mark_done(self.kanban_selected_id)
+        # create next occurrence if needed
+        try:
+            self._create_next_occurrence_if_needed(row)
+        except Exception:
+            pass
+        self._populate(); self._populate_kanban()
+        self._sync_outlook_task(self.kanban_selected_id, {}, action="done")
 
     def _on_select(self, event):
         sel = self.tree.selection()
@@ -1655,7 +2211,7 @@ class TaskApp(tk.Tk):
             if not sel:
                 continue
 
-            confirm = messagebox.askyesno("Confirm Delete", f"Delete {len(sel)} selected task(s)?")
+            confirm = messagebox.askyesno("Confirm Delete", f"Move {len(sel)} selected task(s) to Trash?")
             if not confirm:
                 return
 
@@ -1665,19 +2221,24 @@ class TaskApp(tk.Tk):
                     task_id = self.kanban_item_map[status][idx]
                 except Exception:
                     continue
-                self.db.delete(task_id)
-                self._sync_outlook_task(task_id, {}, action="delete")
+                try:
+                    self.db.soft_delete(task_id)
+                except Exception as e:
+                    print("Soft-delete error (kanban):", e)
                 lb.delete(idx)
-                del self.kanban_item_map[status][idx]
+                try:
+                    del self.kanban_item_map[status][idx]
+                except Exception:
+                    pass
 
         self._populate()
         self._populate_kanban()
+        try:
+            self._populate_trash()
+        except Exception:
+            pass
 
-    def _mark_done_selected_kanban(self):
-        if not self.kanban_selected_id: return
-        self.db.mark_done(self.kanban_selected_id)
-        self._populate(); self._populate_kanban()
-        self._sync_outlook_task(self.kanban_selected_id, {}, action="done")
+    
 
     def _move_prev_selected(self):
         if not self.kanban_selected_id: return
