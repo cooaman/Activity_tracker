@@ -1408,23 +1408,23 @@ class TaskApp(tk.Tk):
             # Treeview focused delete
             self.tree.bind("<Delete>", lambda e: self._delete_task())
             # Some mac keyboards send BackSpace for delete — treat it the same when tree has focus
-            self.tree.bind("<BackSpace>", lambda e: self._delete_task())
+           #  self.tree.bind("<BackSpace>", lambda e: self._delete_task())
 
             # Trash tree: Delete -> permanently delete selected
             if hasattr(self, "trash_tree"):
                 self.trash_tree.bind("<Delete>", lambda e: self._permanently_delete_selected_trash())
-                self.trash_tree.bind("<BackSpace>", lambda e: self._permanently_delete_selected_trash())
+             #   self.trash_tree.bind("<BackSpace>", lambda e: self._permanently_delete_selected_trash())
 
             # Kanban listboxes: bind delete/backspace for each column/listbox
             if hasattr(self, "kanban_lists"):
                 for status, lb in self.kanban_lists.items():
                     # use a small wrapper to ensure current selection uses kanban deletion logic
                     lb.bind("<Delete>", lambda e, _lb=lb: self._delete_selected_kanban())
-                    lb.bind("<BackSpace>", lambda e, _lb=lb: self._delete_selected_kanban())
+                 #   lb.bind("<BackSpace>", lambda e, _lb=lb: self._delete_selected_kanban())
 
             # Also ensure the global fallback is set (in case some widget swallows it)
             self.bind_all("<Delete>", lambda e: self._on_delete_key())
-            self.bind_all("<BackSpace>", lambda e: self._on_delete_key())
+            # self.bind_all("<BackSpace>", lambda e: self._on_delete_key())
         except Exception as e:
             # defensive: don't crash app if binding fails
             print("Delete key binding setup error (ignored):", e)
