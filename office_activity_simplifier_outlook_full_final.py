@@ -1109,11 +1109,17 @@ class TaskApp(tk.Tk):
         row += 1
 
         # Responsible (dropdown) - choices will be set from DB
-        ttk.Label(content_frame, text="Responsible (contact)").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        # Responsible (dropdown populated from contacts)
+        ttk.Label(content_frame, text="Responsible (contact)").grid(row=row, column=0, sticky="w", pady=(12,0))
         responsible_var = tk.StringVar(value="")
         responsible_cb = ttk.Combobox(content_frame, textvariable=responsible_var, values=[], width=40, state="readonly")
-        responsible_cb.grid(row=row, column=1, columnspan=2, sticky="w", padx=6, pady=(8, 0))
+        responsible_cb.grid(row=row, column=1, columnspan=2, sticky="w", padx=6, pady=(8,0))
+        row += 1
 
+        # Reminder email body (HTML) and toolbar
+        email_toolbar = ttk.Frame(content_frame)
+        email_toolbar.grid(row=row, column=1, columnspan=4, sticky="w", padx=6, pady=(6, 0))
+        # Helper: load contacts to combobox (callable so we can refresh after import)
         def _load_contacts_to_combobox():
             try:
                 contacts = self.db.get_contacts()
@@ -1132,8 +1138,77 @@ class TaskApp(tk.Tk):
                 responsible_cb['values'] = []
                 responsible_cb.lookup_map = {}
 
+        # Insert HTML building blocks into the email body text widget
+        def _insert_html_at_cursor(html_snippet):
+            try:
+                pos = email_body_text.index(tk.INSERT)
+                email_body_text.insert(pos, html_snippet)
+                email_body_text.focus_set()
+            except Exception:
+                try:
+                    email_body_text.insert(tk.END, html_snippet)
+                except Exception:
+                    pass
+
+        def _insert_table_dialog():
+            dlg = tk.Toplevel(win)
+            dlg.title("Insert Table")
+            ttk.Label(dlg, text="Rows:").grid(row=0, column=0, padx=6, pady=6)
+            rows_var = tk.IntVar(value=2)
+            ttk.Entry(dlg, textvariable=rows_var, width=6).grid(row=0, column=1, padx=6, pady=6)
+            ttk.Label(dlg, text="Cols:").grid(row=1, column=0, padx=6, pady=6)
+            cols_var = tk.IntVar(value=2)
+            ttk.Entry(dlg, textvariable=cols_var, width=6).grid(row=1, column=1, padx=6, pady=6)
+
+            def _do_insert_table():
+                r = max(1, int(rows_var.get()))
+                c = max(1, int(cols_var.get()))
+                html = "<table border='1' cellpadding='4' cellspacing='0'>\n"
+                for _ in range(r):
+                    html += "  <tr>\n"
+                    for _ in range(c):
+                        html += "    <td>&nbsp;</td>\n"
+                    html += "  </tr>\n"
+                html += "</table>\n"
+                _insert_html_at_cursor(html)
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+
+            ttk.Button(dlg, text="Insert", command=_do_insert_table).grid(row=2, column=0, columnspan=2, pady=8)
+
+        def _insert_image_dialog():
+            f = filedialog.askopenfilename(parent=win, filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp"), ("All files","*.*")])
+            if not f:
+                return
+            file_url = f"file://{os.path.abspath(f)}"
+            html = f'<img src="{file_url}" alt="Image" style="max-width:600px; height:auto;" />\n'
+            _insert_html_at_cursor(html)
+
+        def _insert_snippet():
+            dlg = tk.Toplevel(win)
+            dlg.title("Insert HTML Snippet")
+            txt = tk.Text(dlg, height=8, width=60, wrap="none")
+            txt.pack(padx=6, pady=6)
+            def _ok():
+                snippet = txt.get("1.0", tk.END)
+                _insert_html_at_cursor(snippet)
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+            ttk.Button(dlg, text="Insert", command=_ok).pack(pady=(0,8))
+
+        ttk.Button(email_toolbar, text="Table", command=_insert_table_dialog).pack(side=tk.LEFT, padx=(0,4))
+        ttk.Button(email_toolbar, text="Image", command=_insert_image_dialog).pack(side=tk.LEFT, padx=(0,4))
+        ttk.Button(email_toolbar, text="Snippet", command=_insert_snippet).pack(side=tk.LEFT, padx=(0,4))
         _load_contacts_to_combobox()
         row += 1
+
+
+        # If there is a responsible_id stored, map it to the combobox label
+
 
         # Description (below)
         ttk.Label(content_frame, text="Description").grid(row=row, column=0, sticky="nw", pady=(6, 0))
@@ -1226,10 +1301,14 @@ class TaskApp(tk.Tk):
                 messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
             else:
                 messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
-
-        ttk.Button(content_frame, text="Send Reminder Now (Outlook)", command=_send_now_action).grid(row=row, column=5, sticky="w", padx=6, pady=(10, 0))
+                
         row += 1
 
+        # Centered Send Reminder Now button
+        send_btn = ttk.Button(content_frame, text="Send Reminder Now (Outlook)", command=_send_now_action)
+        send_btn.grid(row=row, column=0, columnspan=6, pady=(10, 0))
+        row += 1
+        # .pack(side=tk.LEFT, padx=6)
         # Attachments
         ttk.Label(content_frame, text="Attachments").grid(row=row, column=0, sticky="nw", pady=(10, 0))
         attachments_frame = ttk.Frame(content_frame)
@@ -1469,6 +1548,67 @@ class TaskApp(tk.Tk):
         win.bind("<Configure>", _on_win_configure)
 
     # -------------------- Other CRUD helpers & Kanban --------------------
+
+        # Recurrence helpers
+    def _parse_recurrence(self, rec_str):
+        """
+        Parse stored recurrence strings like 'days:3', 'weeks:1', 'months:2' or 'none'.
+        Returns dict: {'type': 'days'|'weeks'|'months'|'none', 'n': int}
+        """
+        try:
+            if not rec_str:
+                return {"type": "none", "n": 0}
+            s = str(rec_str).strip().lower()
+            if s in ("none", ""):
+                return {"type": "none", "n": 0}
+            if ":" in s:
+                typ, n = s.split(":", 1)
+                typ = typ.strip()
+                try:
+                    n = max(1, int(n))
+                except Exception:
+                    n = 1
+                if typ in ("days", "weeks", "months"):
+                    return {"type": typ, "n": n}
+            # fallback
+            return {"type": "none", "n": 0}
+        except Exception:
+            return {"type": "none", "n": 0}
+
+    def _compute_next_due(self, due_date_iso, recurrence_store):
+        """
+        Given a due date string 'YYYY-MM-DD' and a recurrence store like 'days:3',
+        compute next due date string in same format. Returns None on failure.
+        """
+        try:
+            if not due_date_iso:
+                return None
+            parsed = self._parse_recurrence(recurrence_store)
+            typ = parsed.get("type")
+            n = parsed.get("n", 0) or 0
+            if typ == "none" or n <= 0:
+                return None
+            cur_due = datetime.strptime(due_date_iso, "%Y-%m-%d").date()
+            if typ == "days":
+                next_due = cur_due + timedelta(days=n)
+            elif typ == "weeks":
+                next_due = cur_due + timedelta(weeks=n)
+            elif typ == "months":
+                # Add months conservatively (roll month forward, clamp day)
+                year = cur_due.year
+                month = cur_due.month + n
+                # normalize year/month
+                year += (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                day = min(cur_due.day, calendar.monthrange(year, month)[1])
+                next_due = date(year, month, day)
+            else:
+                return None
+            return next_due.isoformat()
+        except Exception:
+            logger.exception("Error computing next due date")
+            return None
+        
     def _selected_tree_task_id(self):
         sel = self.tree.selection()
         if not sel:
