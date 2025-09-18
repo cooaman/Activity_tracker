@@ -2693,7 +2693,6 @@ class TaskApp(tk.Tk):
         self._populate_kanban()
 
     # -------------------- Outlook integration --------------------
-
     def _load_outlook_signature(self):
         """Try to load the default HTML signature from the user's Signatures folder (Windows)."""
         try:
@@ -2705,7 +2704,7 @@ class TaskApp(tk.Tk):
             sig_dir = os.path.join(appdata, "Microsoft", "Signatures")
             if not os.path.isdir(sig_dir):
                 return ""
-            # pick the first .htm signature (or .html)
+            # pick the first .htm or .html signature
             for fn in os.listdir(sig_dir):
                 if fn.lower().endswith(".htm") or fn.lower().endswith(".html"):
                     try:
@@ -2716,37 +2715,37 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Signature load error")
         return ""
-    #####
-    def _send_reminder_email(self, task_id, to_address, subject_title, html_body):
+
+    def _send_reminder_email(self, task_id, to_address, subject_title, html_body, debug_sync=False):
         """
         Send an HTML reminder email via Outlook while preserving thread & avoiding duplicate signature.
-        Runs the COM calls in a background thread to keep UI responsive.
-        Uses self._cached_signature and self._outlook_app to avoid repeated expensive operations.
+        If debug_sync=True the worker runs synchronously and returns the real result (useful for debugging).
+        Returns True if send initiated (or succeeded in sync mode), False on error.
         """
         if not HAS_OUTLOOK:
             logger.debug("Outlook not available; cannot send reminder email.")
             return False
 
-        def _worker():
-            try:
-                # lazy-load signature into instance cache
-                if self._cached_signature is None:
-                    try:
-                        self._cached_signature = self._load_outlook_signature() or ""
-                    except Exception:
-                        self._cached_signature = ""
+        # ensure cached signature loaded once
+        try:
+            if self._cached_signature is None:
+                self._cached_signature = self._load_outlook_signature() or ""
+        except Exception:
+            self._cached_signature = ""
 
-                # lazy init Outlook.Application namespace
+        def _worker_body():
+            try:
+                # lazy init Outlook.Application once per process
                 try:
                     if self._outlook_app is None:
                         self._outlook_app = win32com.client.Dispatch("Outlook.Application")
                     ol = self._outlook_app
                     ns = ol.GetNamespace("MAPI")
-                except Exception:
+                except Exception as e:
                     logger.exception("Outlook COM dispatch failed")
-                    return False
+                    return False, f"COM dispatch failed: {e}"
 
-                # fetch task's outlook_id and last_sent_entryid
+                # fetch task metadata (outlook_id and last_sent_entryid if present)
                 try:
                     cur = self.db.conn.cursor()
                     cur.execute("SELECT outlook_id, last_sent_entryid FROM tasks WHERE id=?", (task_id,))
@@ -2769,14 +2768,12 @@ class TaskApp(tk.Tk):
                         except Exception:
                             return None
 
-                # Attempt to reply to prior sent message (keeps thread)
                 orig_item = None
                 if last_sent_entryid:
                     try:
                         orig_item = _get_item_by_entryid(last_sent_entryid)
                     except Exception:
                         orig_item = None
-
                 if orig_item is None and outlook_entryid:
                     try:
                         orig_item = _get_item_by_entryid(outlook_entryid)
@@ -2793,7 +2790,7 @@ class TaskApp(tk.Tk):
                     except Exception:
                         logger.exception("Failed to persist last_sent_entryid")
 
-                # If we can reply, do so (preserves thread)
+                # Try to reply to previous message to preserve thread
                 if orig_item is not None:
                     try:
                         reply = None
@@ -2806,13 +2803,13 @@ class TaskApp(tk.Tk):
                                 reply = None
 
                         if reply is not None:
+                            # override recipient if explicit
                             if to_address:
                                 try:
                                     reply.To = to_address
                                 except Exception:
                                     pass
 
-                            # compose body carefully and avoid duplicate signature
                             final_body = safe_html
                             sig = self._cached_signature or ""
 
@@ -2821,18 +2818,20 @@ class TaskApp(tk.Tk):
                             except Exception:
                                 existing_reply_html = ""
 
+                            # append signature only if it's not already present in the composed body
                             append_sig = False
                             if sig:
                                 def _norm(s): return re.sub(r"\s+", " ", (s or "")).strip()
                                 try:
-                                    if _norm(sig) not in _norm(safe_html[-len(sig) - 200:]):
+                                    if _norm(sig) not in _norm(final_body[-len(sig) - 500:]):
                                         append_sig = True
                                 except Exception:
                                     append_sig = True
 
                             if append_sig:
-                                final_body = safe_html + "\n\n" + sig
+                                final_body = final_body + "\n\n" + sig
 
+                            # try to place our composed HTML before the quoted content
                             try:
                                 combined = final_body + (existing_reply_html or "")
                                 reply.HTMLBody = combined
@@ -2842,18 +2841,18 @@ class TaskApp(tk.Tk):
                                 except Exception:
                                     pass
 
-                            # prefer Send() without Display() to avoid Outlook auto-appending signature again
+                            # Try sending directly; fallback to Display + Send only if necessary
                             try:
                                 reply.Send()
                             except Exception:
                                 try:
                                     reply.Display(False)
                                     reply.Send()
-                                except Exception:
-                                    logger.exception("Failed to send reply (even after Display fallback)")
-                                    return False
+                                except Exception as e:
+                                    logger.exception("Failed to send reply (after Display fallback)")
+                                    return False, f"Send failed: {e}"
 
-                            # capture EntryID
+                            # attempt to capture EntryID
                             sent_entryid = None
                             try:
                                 sent_entryid = getattr(reply, "EntryID", None)
@@ -2861,6 +2860,7 @@ class TaskApp(tk.Tk):
                                 sent_entryid = None
 
                             if not sent_entryid:
+                                # scan recent Sent Items for a match (best-effort)
                                 try:
                                     sent_folder = ns.GetDefaultFolder(5)  # olFolderSentMail
                                     items = sent_folder.Items
@@ -2887,14 +2887,13 @@ class TaskApp(tk.Tk):
 
                             if sent_entryid:
                                 _save_sent_entryid(sent_entryid)
-
-                            return True
+                            return True, None
                     except Exception:
-                        logger.exception("Failed to reply to original item; falling back to new mail")
+                        logger.exception("Failed to reply to original item; will fall back to new mail")
 
-                # fallback: create a new mail item
+                # Create new mail if reply isn't possible
                 try:
-                    mail = ol.CreateItem(0)  # olMailItem
+                    mail = ol.CreateItem(0)
                     mail.To = to_address or ""
                     mail.Subject = base_subject
                     final_body = safe_html
@@ -2914,9 +2913,9 @@ class TaskApp(tk.Tk):
                         try:
                             mail.Display(False)
                             mail.Send()
-                        except Exception:
+                        except Exception as e:
                             logger.exception("Failed to send new mail")
-                            return False
+                            return False, f"Send failed (new mail): {e}"
 
                     try:
                         eid = getattr(mail, "EntryID", None)
@@ -2925,16 +2924,33 @@ class TaskApp(tk.Tk):
                     except Exception:
                         logger.exception("Could not persist new mail EntryID")
 
-                    return True
-                except Exception:
+                    return True, None
+                except Exception as e:
                     logger.exception("Failed to create/send new mail")
-                    return False
+                    return False, f"Create/send failed: {e}"
 
-            except Exception:
+            except Exception as e:
                 logger.exception("Unhandled error in reminder send worker")
-                return False
+                return False, f"Unhandled worker error: {e}"
 
-        t = threading.Thread(target=_worker, daemon=True)
+        # debug synchronous mode
+        if debug_sync:
+            ok, err = _worker_body()
+            if not ok:
+                logger.error("Synchronous send failed: %s", err)
+            else:
+                logger.info("Synchronous send succeeded")
+            return ok
+
+        # run in background thread for normal operation
+        def _thread_wrapper():
+            ok, err = _worker_body()
+            if not ok:
+                logger.error("Background send failed for task %s: %s", task_id, err)
+            else:
+                logger.info("Background send succeeded for task %s", task_id)
+
+        t = threading.Thread(target=_thread_wrapper, daemon=True)
         t.start()
         return True
 
