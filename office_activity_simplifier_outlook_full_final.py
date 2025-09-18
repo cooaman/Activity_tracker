@@ -2679,10 +2679,11 @@ class TaskApp(tk.Tk):
     def _send_reminder_email(self, task_id, to_address, subject_title, html_body):
         """
         Send an HTML reminder email via Outlook to `to_address`.
-        If we have previously sent a reminder for this task and stored the
-        Outlook EntryID (reminder_mail_entryid), reply to that message so the
-        conversation/thread is preserved. Otherwise create a new mail and
-        store its EntryID on the task for future replies (if task_id > 0).
+        Behavior:
+         - If a previous reminder was sent and we stored its EntryID (reminder_mail_entryid),
+           reply to that message (Reply()) so Outlook keeps the conversation/thread.
+         - Otherwise create a new mail using subject_title (no extra "Reminder:" prefix)
+           and set ConversationTopic when possible, then store its EntryID for future replies.
         Returns True on success, False otherwise.
         """
         if not HAS_OUTLOOK:
@@ -2696,122 +2697,122 @@ class TaskApp(tk.Tk):
             logger.exception("Failed to initialize Outlook COM objects")
             return False
 
+        # Normalize subject: keep exactly the conversation subject you want threaded
+        conv_subject = (subject_title or "Reminder").strip()
+
+        # Attempt to read stored reminder EntryID
+        entry_id = None
         try:
-            # Attempt to fetch stored reminder mail EntryID for this task (if any)
-            entry_id = None
+            if task_id:
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
+                row = cur.fetchone()
+                if row and row["reminder_mail_entryid"]:
+                    entry_id = row["reminder_mail_entryid"]
+        except Exception:
+            logger.exception("Could not read reminder_mail_entryid")
+
+        # Helper to get signature HTML using a probe item (best-effort)
+        def _get_signature():
             try:
-                if task_id:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
-                    row = cur.fetchone()
-                    if row and row["reminder_mail_entryid"]:
-                        entry_id = row["reminder_mail_entryid"]
+                probe = ol_app.CreateItem(0)
+                probe.Display(False)
+                sig = probe.HTMLBody or ""
+                try:
+                    probe.Close(0)
+                except Exception:
+                    pass
+                return sig
             except Exception:
-                logger.exception("Could not read reminder_mail_entryid")
+                return ""
 
-            # Helper to get signature HTML by creating a new Item (displayed momentarily)
-            def _get_signature():
-                try:
-                    probe = ol_app.CreateItem(0)
-                    probe.Display(False)
-                    sig = probe.HTMLBody or ""
-                    # Try to close probe window if possible
-                    try:
-                        probe.Close(0)  # 0 = olDiscard
-                    except Exception:
-                        pass
-                    return sig
-                except Exception:
-                    return ""
+        signature_html = _get_signature()
 
-            signature_html = _get_signature()
-
-            # If we have an entry_id try to get the item and reply to it
-            if entry_id:
-                try:
-                    # GetItemFromID returns the item by EntryID
-                    orig_item = ns.GetItemFromID(entry_id)
-                    if orig_item is not None:
-                        # Reply (or ReplyAll if you prefer). Use Reply to maintain thread.
-                        try:
-                            reply = orig_item.Reply()
-                            # Prepend our html_body to the reply body so the new reminder is first
-                            try:
-                                # Keep original quoted body by appending it after our content
-                                reply.HTMLBody = (html_body or "") + signature_html + reply.HTMLBody
-                            except Exception:
-                                reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
-                            reply.Send()
-                            # If reply produced an EntryID, update stored EntryID (safer)
-                            try:
-                                new_eid = getattr(reply, "EntryID", None)
-                                if new_eid and task_id:
-                                    try:
-                                        self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (new_eid, task_id))
-                                        self.db.conn.commit()
-                                    except Exception:
-                                        logger.exception("Could not update reminder_mail_entryid after reply")
-                            except Exception:
-                                pass
-                            logger.info("Replied to existing reminder mail for task %s -> %s", task_id, to_address)
-                            return True
-                        except Exception:
-                            logger.exception("Failed to reply to existing mail; will fallback to creating a new mail")
-                    else:
-                        logger.debug("No original item found by EntryID; will create a new mail")
-                except Exception:
-                    logger.exception("Error retrieving original mail by EntryID; will create a new mail")
-
-            # No existing thread or failed to reply -> create a new mail
+        # If we have an entry_id, try to get that item and reply to it (keeps thread)
+        if entry_id:
             try:
-                mail = ol_app.CreateItem(0)  # olMailItem
-                # Set basic fields
-                mail.To = to_address or ""
-                mail.Subject = f"Reminder: {subject_title}"
-                # Display briefly so default signature is available, then set the HTMLBody
+                orig_item = ns.GetItemFromID(entry_id)
+            except Exception:
+                orig_item = None
+
+            if orig_item is not None:
                 try:
-                    mail.Display(False)
-                    base_sig = mail.HTMLBody or ""
-                    mail.HTMLBody = (html_body or "") + base_sig
-                    mail.Send()
-                    # After send, try to obtain EntryID and save it to DB for future replies
+                    # Use Reply() to preserve the thread/topic; change to ReplyAll() to include all recipients.
+                    reply = orig_item.Reply()
+                    # Prepend our HTML content but preserve the quoted body that Reply() provides.
                     try:
-                        eid = getattr(mail, "EntryID", None)
-                        if eid and task_id:
+                        reply.HTMLBody = (html_body or "") + signature_html + (reply.HTMLBody or "")
+                    except Exception:
+                        reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
+                    reply.Send()
+
+                    # After sending a reply, EntryID might change (a sent item has an EntryID).
+                    try:
+                        new_eid = getattr(reply, "EntryID", None)
+                        if new_eid and task_id:
                             try:
-                                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (new_eid, task_id))
                                 self.db.conn.commit()
                             except Exception:
-                                logger.exception("Failed to store reminder_mail_entryid")
+                                logger.exception("Could not update reminder_mail_entryid after reply")
                     except Exception:
                         pass
-                    logger.info("Sent new reminder mail to %s for task %s", to_address, task_id)
+
+                    logger.info("Replied to existing reminder mail for task %s -> %s", task_id, to_address)
                     return True
                 except Exception:
-                    logger.exception("Failed to display/send with signature; try sending without signature")
-                    try:
-                        mail.HTMLBody = html_body or ""
-                        mail.Send()
-                        try:
-                            eid = getattr(mail, "EntryID", None)
-                            if eid and task_id:
-                                try:
-                                    self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
-                                    self.db.conn.commit()
-                                except Exception:
-                                    logger.exception("Failed to store reminder_mail_entryid (fallback)")
-                        except Exception:
-                            pass
-                        return True
-                    except Exception:
-                        logger.exception("Failed to send reminder mail")
-                        return False
+                    logger.exception("Failed to reply to existing mail; will fallback to creating a new mail")
+                    # fall through to create new mail
+
+        # No existing thread (or reply failed) => create a new mail and ensure subject matches conv_subject
+        try:
+            mail = ol_app.CreateItem(0)  # olMailItem
+            mail.To = to_address or ""
+            # Use the exact conversation subject (no extra "Reminder:" prefix)
+            mail.Subject = conv_subject
+            # Try to set ConversationTopic to help Outlook thread grouping (best-effort)
+            try:
+                # Some Outlook object models expose ConversationTopic; set if present
+                try:
+                    setattr(mail, "ConversationTopic", conv_subject)
+                except Exception:
+                    # If attribute can't be set, ignore silently
+                    pass
             except Exception:
-                logger.exception("Failed to create/send Outlook mail")
-                return False
+                pass
+
+            # Display briefly to get signature then send
+            try:
+                mail.Display(False)
+                base_sig = mail.HTMLBody or ""
+                mail.HTMLBody = (html_body or "") + base_sig
+                mail.Send()
+            except Exception:
+                # fallback: send without signature if display failed
+                try:
+                    mail.HTMLBody = html_body or ""
+                    mail.Send()
+                except Exception:
+                    logger.exception("Failed to send new reminder mail")
+                    return False
+
+            # Store EntryID on the task for future replies (if we have a real task row)
+            try:
+                eid = getattr(mail, "EntryID", None)
+                if eid and task_id:
+                    try:
+                        self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                        self.db.conn.commit()
+                    except Exception:
+                        logger.exception("Failed to store reminder_mail_entryid")
+            except Exception:
+                pass
+
+            logger.info("Sent new reminder mail to %s for task %s (subject=%s)", to_address, task_id, conv_subject)
+            return True
 
         except Exception:
-            logger.exception("Outlook send error")
+            logger.exception("Failed to create/send Outlook mail")
             return False
 
     def _get_flagged_from_folder(self, folder, flagged):
