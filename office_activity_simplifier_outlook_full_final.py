@@ -177,7 +177,7 @@ class TaskDB:
         cols_to_ensure = [
             "outlook_id", "progress_log", "attachments", "reminder_minutes",
             "reminder_set_at", "reminder_sent_at", "deleted_at", "recurrence",
-            "responsible_id", "reminder_email_body"
+            "responsible_id", "reminder_email_body", "reminder_mail_entryid"
         ]
         for col in cols_to_ensure:
             try:
@@ -2679,30 +2679,137 @@ class TaskApp(tk.Tk):
     def _send_reminder_email(self, task_id, to_address, subject_title, html_body):
         """
         Send an HTML reminder email via Outlook to `to_address`.
-        Attempts to include default signature by Displaying the mail first.
+        If we have previously sent a reminder for this task and stored the
+        Outlook EntryID (reminder_mail_entryid), reply to that message so the
+        conversation/thread is preserved. Otherwise create a new mail and
+        store its EntryID on the task for future replies (if task_id > 0).
         Returns True on success, False otherwise.
         """
         if not HAS_OUTLOOK:
             logger.debug("Outlook not available; cannot send reminder email.")
             return False
+
         try:
-            ol = win32com.client.Dispatch("Outlook.Application")
-            mail = ol.CreateItem(0)  # olMailItem
-            mail.To = to_address
-            mail.Subject = f"Reminder: {subject_title}"
+            ol_app = win32com.client.Dispatch("Outlook.Application")
+            ns = ol_app.GetNamespace("MAPI")
+        except Exception:
+            logger.exception("Failed to initialize Outlook COM objects")
+            return False
+
+        try:
+            # Attempt to fetch stored reminder mail EntryID for this task (if any)
+            entry_id = None
             try:
-                # Display to ensure signature appended
-                mail.Display(False)
-                signature_html = mail.HTMLBody or ""
-                mail.HTMLBody = html_body + signature_html
-                mail.Send()
-                logger.info("Reminder email sent to %s for task %s", to_address, task_id)
-                return True
+                if task_id:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
+                    row = cur.fetchone()
+                    if row and row["reminder_mail_entryid"]:
+                        entry_id = row["reminder_mail_entryid"]
             except Exception:
-                logger.exception("Failed to set signature; sending without signature")
-                mail.HTMLBody = html_body
-                mail.Send()
-                return True
+                logger.exception("Could not read reminder_mail_entryid")
+
+            # Helper to get signature HTML by creating a new Item (displayed momentarily)
+            def _get_signature():
+                try:
+                    probe = ol_app.CreateItem(0)
+                    probe.Display(False)
+                    sig = probe.HTMLBody or ""
+                    # Try to close probe window if possible
+                    try:
+                        probe.Close(0)  # 0 = olDiscard
+                    except Exception:
+                        pass
+                    return sig
+                except Exception:
+                    return ""
+
+            signature_html = _get_signature()
+
+            # If we have an entry_id try to get the item and reply to it
+            if entry_id:
+                try:
+                    # GetItemFromID returns the item by EntryID
+                    orig_item = ns.GetItemFromID(entry_id)
+                    if orig_item is not None:
+                        # Reply (or ReplyAll if you prefer). Use Reply to maintain thread.
+                        try:
+                            reply = orig_item.Reply()
+                            # Prepend our html_body to the reply body so the new reminder is first
+                            try:
+                                # Keep original quoted body by appending it after our content
+                                reply.HTMLBody = (html_body or "") + signature_html + reply.HTMLBody
+                            except Exception:
+                                reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
+                            reply.Send()
+                            # If reply produced an EntryID, update stored EntryID (safer)
+                            try:
+                                new_eid = getattr(reply, "EntryID", None)
+                                if new_eid and task_id:
+                                    try:
+                                        self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (new_eid, task_id))
+                                        self.db.conn.commit()
+                                    except Exception:
+                                        logger.exception("Could not update reminder_mail_entryid after reply")
+                            except Exception:
+                                pass
+                            logger.info("Replied to existing reminder mail for task %s -> %s", task_id, to_address)
+                            return True
+                        except Exception:
+                            logger.exception("Failed to reply to existing mail; will fallback to creating a new mail")
+                    else:
+                        logger.debug("No original item found by EntryID; will create a new mail")
+                except Exception:
+                    logger.exception("Error retrieving original mail by EntryID; will create a new mail")
+
+            # No existing thread or failed to reply -> create a new mail
+            try:
+                mail = ol_app.CreateItem(0)  # olMailItem
+                # Set basic fields
+                mail.To = to_address or ""
+                mail.Subject = f"Reminder: {subject_title}"
+                # Display briefly so default signature is available, then set the HTMLBody
+                try:
+                    mail.Display(False)
+                    base_sig = mail.HTMLBody or ""
+                    mail.HTMLBody = (html_body or "") + base_sig
+                    mail.Send()
+                    # After send, try to obtain EntryID and save it to DB for future replies
+                    try:
+                        eid = getattr(mail, "EntryID", None)
+                        if eid and task_id:
+                            try:
+                                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                                self.db.conn.commit()
+                            except Exception:
+                                logger.exception("Failed to store reminder_mail_entryid")
+                    except Exception:
+                        pass
+                    logger.info("Sent new reminder mail to %s for task %s", to_address, task_id)
+                    return True
+                except Exception:
+                    logger.exception("Failed to display/send with signature; try sending without signature")
+                    try:
+                        mail.HTMLBody = html_body or ""
+                        mail.Send()
+                        try:
+                            eid = getattr(mail, "EntryID", None)
+                            if eid and task_id:
+                                try:
+                                    self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                                    self.db.conn.commit()
+                                except Exception:
+                                    logger.exception("Failed to store reminder_mail_entryid (fallback)")
+                        except Exception:
+                            pass
+                        return True
+                    except Exception:
+                        logger.exception("Failed to send reminder mail")
+                        return False
+            except Exception:
+                logger.exception("Failed to create/send Outlook mail")
+                return False
+
         except Exception:
             logger.exception("Outlook send error")
             return False
