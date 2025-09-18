@@ -25,6 +25,11 @@ import logging
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
+# enable console debug logging during development so we can see what's happening
+import logging as _logging
+if not _logging.getLogger().handlers:
+    _logging.basicConfig(level=_logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+logger.setLevel(_logging.DEBUG)
 logger.addHandler(logging.NullHandler())
 
 # Outlook availability (pywin32). On non-Windows machines this will be False.
@@ -420,12 +425,37 @@ class TaskApp(tk.Tk):
         self.kanban_selected_status = None
         # mapping: status -> list of task_ids in same order as items in the listbox
         self.kanban_item_map = {status: [] for status in STATUSES}
+        # mapping task_id -> card wrapper widget for Kanban visual selection
+        self.kanban_card_widgets = {}
+        # keep reference to currently highlighted widget (so we can un-highlight it)
+        self._kanban_highlighted = None
 
         # attachments var
         self.attachments_var = tk.StringVar(value="")
 
         # Build UI
         self._build_ui()
+
+        ### Global
+        # Global debug binds — confirm any double-click reaches us
+        try:
+            # cheap test handler: will always log when any double-click happens anywhere
+            def _dbg_any_double(e):
+                logger.debug("GLOBAL DEBUG DOUBLE CLICK event: widget=%s x_root=%s y_root=%s type=%s",
+                            getattr(e, "widget", None), getattr(e, "x_root", None), getattr(e, "y_root", None), getattr(e, "type", None))
+
+            # bind the debug handler first (so you can see it in console)
+            self.bind_all("<Double-Button-1>", _dbg_any_double, add="+")
+            self.bind_all("<Double-1>", _dbg_any_double, add="+")
+
+            # your real global handler (keep this)
+            self.bind_all("<Double-Button-1>", self._global_kanban_double_click, add="+")
+            self.bind_all("<Double-1>", self._global_kanban_double_click, add="+")
+        except Exception:
+            logger.exception("Failed to bind global double-click")
+
+        
+
 
         # Key bindings
         try:
@@ -804,12 +834,15 @@ class TaskApp(tk.Tk):
         self.notebook.add(list_tab, text="Task List")
 
         # include 'reminder' column always and 'responsible'
+                # include 'reminder' column always and 'responsible'
+        # Make Task ID visible in the task list
         if self.settings.get("show_description", False):
             cols = ["id", "title", "desc", "due", "priority", "status", "responsible", "reminder"]
-            display_cols = ["title", "desc", "due", "priority", "status", "responsible", "reminder"]
+            # include id in display cols so it's visible
+            display_cols = ["id", "title", "desc", "due", "priority", "status", "responsible", "reminder"]
         else:
             cols = ["id", "title", "due", "priority", "status", "responsible", "reminder"]
-            display_cols = ["title", "due", "priority", "status", "responsible", "reminder"]
+            display_cols = ["id", "title", "due", "priority", "status", "responsible", "reminder"]
 
         # Filter bar
         filter_frame = ttk.Frame(list_tab, padding=(6, 4))
@@ -904,23 +937,33 @@ class TaskApp(tk.Tk):
         frame = ttk.Frame(self.kanban_tab)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self.kanban_lists = {}
+                # Kanban columns - improved card UI
+        self.kanban_columns = {}  # status -> dict(canvas, inner_frame, scrollbar)
         for idx, status in enumerate(STATUSES):
             col = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
             col.grid(row=0, column=idx, sticky="nsew", padx=6)
             frame.columnconfigure(idx, weight=2)
 
-            ttk.Label(col, text=status, font=("", 12, "bold")).pack()
-            lb = tk.Listbox(col, height=45, width=55, selectmode=tk.EXTENDED)
-            lb.pack(fill=tk.BOTH, expand=True)
-            lb.status_name = status
+            ttk.Label(col, text=status, font=("", 12, "bold")).pack(anchor="w")
 
-            lb.bind("<<ListboxSelect>>", self._kanban_select)
-            lb.bind("<ButtonPress-1>", self._on_kanban_drag_start)
-            lb.bind("<B1-Motion>", self._on_kanban_drag_motion)
-            lb.bind("<ButtonRelease-1>", self._on_kanban_drag_drop)
-            lb.bind("<Double-1>", lambda e, _lb=lb: self._on_kanban_double_click(e, _lb))
-            self.kanban_lists[status] = lb
+            # Canvas to hold cards + inner frame
+            canvas_col = tk.Canvas(col, height=700, highlightthickness=0)
+            vscroll = ttk.Scrollbar(col, orient=tk.VERTICAL, command=canvas_col.yview)
+            canvas_col.configure(yscrollcommand=vscroll.set)
+            vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+            canvas_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            inner = ttk.Frame(canvas_col)
+            canvas_col.create_window((0, 0), window=inner, anchor="nw")
+
+            def _configure_inner(e, c=canvas_col):
+                c.configure(scrollregion=c.bbox("all"))
+            inner.bind("<Configure>", _configure_inner)
+
+            # store references
+            self.kanban_columns[status] = {"canvas": canvas_col, "frame": inner, "scroll": vscroll, "status_name": status}
+
+            # clicking on the canvas/frame will select card via bind (cards will be clickable)
 
         # Kanban details panel
         desc_frame = ttk.Frame(frame, padding=6, borderwidth=1, relief="groove")
@@ -1703,11 +1746,71 @@ class TaskApp(tk.Tk):
             self.drag_data = {"listbox": lb, "index": idx, "task_line": lb.get(idx)}
 
     ##
+    # add this method to TaskApp (anywhere inside the class)
+    def _global_kanban_double_click(self, event):
+        """
+        Fallback double-click handler: climb parents and look for a widget annotated with
+        _kanban_task_id. This is more robust than identity comparisons.
+        """
+        try:
+            logger.debug("global handler invoked: widget=%s coords=(%s,%s) type=%s",
+                        getattr(event, "widget", None),
+                        getattr(event, "x_root", None),
+                        getattr(event, "y_root", None),
+                        getattr(event, "type", None))
+
+            x = getattr(event, "x_root", None)
+            y = getattr(event, "y_root", None)
+
+            # Choose widget from coords if available, otherwise fallback to event.widget
+            widget = None
+            if x is not None and y is not None:
+                widget = self.winfo_containing(x, y)
+                logger.debug("winfo_containing -> %s", widget)
+            if not widget:
+                widget = getattr(event, "widget", None)
+                logger.debug("using event.widget -> %s", widget)
+
+            if not widget:
+                logger.debug("no widget under pointer; aborting")
+                return
+
+            # climb parents and check for our custom attribute _kanban_task_id
+            cur = widget
+            chain = []
+            while cur:
+                chain.append(str(cur))
+                try:
+                    tid = getattr(cur, "_kanban_task_id", None)
+                    logger.debug("checking widget %s for _kanban_task_id -> %s", cur, tid)
+                    if tid:
+                        try:
+                            tid_int = int(tid)
+                        except Exception:
+                            tid_int = None
+                        if tid_int:
+                            logger.debug("Found kanban task id=%s on widget %s — opening editor", tid_int, cur)
+                            try:
+                                self._open_edit_window(tid_int)
+                            except Exception:
+                                logger.exception("Error opening editor from global double-click")
+                            return
+                except Exception:
+                    logger.exception("Error inspecting widget for kanban id")
+                # climb to parent
+                try:
+                    cur = getattr(cur, "master", None)
+                except Exception:
+                    break
+
+            # If we get here, no annotated widget found; log the chain to help debugging
+            logger.debug("No kanban task id found in parent chain. widget chain: %s", " -> ".join(chain))
+        except Exception:
+            logger.exception("Unhandled error in global kanban double-click handler")
+
+
+    ##
     def _on_kanban_double_click(self, event, lb=None):
-        """
-        Handle double-click on a Kanban listbox item.
-        `lb` is the listbox instance (passed via the lambda in binding).
-        """
         try:
             widget = lb if lb is not None else event.widget
             idx = widget.nearest(event.y)
@@ -1717,7 +1820,7 @@ class TaskApp(tk.Tk):
             try:
                 task_id = self.kanban_item_map[status][idx]
             except Exception:
-                # fallback: try to deduce title and search DB (best-effort)
+                # fallback: attempt to find by title
                 try:
                     title = widget.get(idx)
                     cur = self.db.conn.cursor()
@@ -1992,13 +2095,367 @@ class TaskApp(tk.Tk):
                 logger.exception("Error inserting row in _populate")
                 continue
 
-    def _populate_kanban(self):
+
+    ####
+    def _kanban_click_select(self, event, lb):
+        """
+        Handle single-click on a Kanban listbox item: select and populate details,
+        but do NOT open the edit window. Double-click will open the editor.
+        """
         try:
-            for status, lb in self.kanban_lists.items():
+            # find clicked index
+            idx = lb.nearest(event.y)
+            if idx < 0:
+                return
+
+            # set listbox selection (visual)
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(idx)
+            lb.activate(idx)
+
+            status = getattr(lb, "status_name", None) or "Pending"
+            try:
+                task_id = self.kanban_item_map[status][idx]
+            except Exception:
+                # nothing to select
+                return
+
+            # set selected id/status so other actions/buttons use it
+            self.kanban_selected_id = task_id
+            self.kanban_selected_status = status
+
+            # populate details panel (reuse existing logic)
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT description, progress_log, outlook_id, attachments FROM tasks WHERE id=?", (task_id,))
+            row = cur.fetchone()
+            if not row:
+                return
+            desc = row["description"] or ""
+            prog = row["progress_log"] or ""
+            outlook_id = row["outlook_id"]
+
+            # show HTML if available else plain text (reuse your code path)
+            if outlook_id and HAS_HTML:
+                clean = desc or ""
+                clean = re.sub(r'<style.*?>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE).replace("</font>", "")
+                clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+                clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+                clean = re.sub(r'<span[^>]*>', '<span>', clean, flags=re.IGNORECASE)
+                if os.name == "nt":
+                    wrapper_style = "font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3; color:#333;"
+                else:
+                    wrapper_style = "font-family:Arial; font-size:11px; line-height:1.3; color:#333;"
+                clean = f"<div style='{wrapper_style}'>{clean}</div>"
                 try:
-                    lb.delete(0, tk.END)
+                    # switch to HTML label if present
+                    if hasattr(self, "kanban_text") and self.kanban_text is not None:
+                        try:
+                            self.kanban_text.pack_forget()
+                        except Exception:
+                            pass
+                    self.kanban_html.set_html(clean)
+                    self.kanban_html.pack(fill=tk.BOTH, expand=True)
+                except Exception:
+                    # fallback to plain text
+                    if hasattr(self, "kanban_html"):
+                        try:
+                            self.kanban_html.pack_forget()
+                        except Exception:
+                            pass
+                    self.kanban_text.delete("1.0", tk.END)
+                    self.kanban_text.insert(tk.END, desc)
+                    self.kanban_text.pack(fill=tk.BOTH, expand=True)
+            else:
+                try:
+                    if HAS_HTML:
+                        self.kanban_html.pack_forget()
                 except Exception:
                     pass
+                self.kanban_text.delete("1.0", tk.END)
+                self.kanban_text.insert(tk.END, desc)
+                self.kanban_text.pack(fill=tk.BOTH, expand=True)
+
+            # progress
+            self.kanban_progress.delete("1.0", tk.END)
+            self.kanban_progress.insert(tk.END, prog)
+
+            # attachments
+            try:
+                files = []
+                if row["attachments"]:
+                    files = json.loads(row["attachments"])
+                self.kanban_attachments_var.set(", ".join(os.path.basename(f) for f in files) if files else "No attachments")
+            except Exception:
+                self.kanban_attachments_var.set("No attachments")
+
+            # enable action buttons
+            self.btn_edit.config(state="normal")
+            self.btn_delete.config(state="normal")
+            self.btn_done.config(state="normal")
+            self.btn_prev.config(state="normal" if self.kanban_selected_status != "Pending" else "disabled")
+            self.btn_next.config(state="normal" if self.kanban_selected_status != "Done" else "disabled")
+        except Exception:
+            logger.exception("Error in kanban single-click select")
+
+    ###
+    def _create_kanban_card(self, parent, task_row):
+        """
+        Create a 'card' in `parent` (an inner frame for the column).
+        Single-click selects (populates details & enables buttons).
+        Double-click opens editor.
+        """
+
+        # helper to safely read sqlite3.Row values with a default
+        def _val(r, key, default=""):
+            try:
+                if key in r.keys() and r[key] is not None:
+                    return r[key]
+            except Exception:
+                try:
+                    # fallback: index access
+                    v = r[key]
+                    return v if v is not None else default
+                except Exception:
+                    return default
+            return default
+
+        try:
+            tid = None
+            try:
+                tid = int(_val(task_row, "id", None))
+            except Exception:
+                tid = None
+
+            title = str(_val(task_row, "title", "(no title)")).strip()
+            due = str(_val(task_row, "due_date", "") or "")
+            pr = str(_val(task_row, "priority", "Medium")).lower()
+            responsible_label = ""
+            try:
+                resp_id = _val(task_row, "responsible_id", None)
+                if resp_id:
+                    responsible_label = self.db.get_contact_label(resp_id) or ""
+            except Exception:
+                responsible_label = ""
+
+            # choose bg by priority
+            if pr == "high":
+                bg = "#FFD6D6"
+            elif pr == "medium":
+                bg = "#FFF5CC"
+            else:
+                bg = "#E6FFEA"
+
+            # wrapper gives the colored card background
+            wrapper = tk.Frame(parent, bg=bg, bd=1, relief="flat")
+            wrapper.pack(fill=tk.X, pady=(6, 4), padx=6)
+
+            # inner content frame to get padding
+            content = tk.Frame(wrapper, bg=bg)
+            content.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+            lbl_title = tk.Label(content, text=title, bg=bg, fg="#111111", anchor="w", justify="left",
+                                font=("", 10, "bold"), wraplength=320)
+            lbl_title.pack(fill=tk.X, anchor="w")
+
+            meta_parts = [f"ID:{tid}" if tid is not None else "ID:?"]
+            if due:
+                meta_parts.append(f"Due: {due}")
+            if responsible_label:
+                meta_parts.append(responsible_label)
+            lbl_meta = tk.Label(content, text="  •  ".join(meta_parts), bg=bg, fg="#333333", anchor="w",
+                                justify="left", font=("", 9), wraplength=320)
+            lbl_meta.pack(fill=tk.X, anchor="w", pady=(4, 0))
+
+            lbl_priority = tk.Label(content, text=str(_val(task_row, "priority", "")), bg=bg, fg="#222222",
+                                    anchor="w", justify="left", font=("", 8))
+            lbl_priority.pack(anchor="w", pady=(6, 0))
+
+            # register widget so we can un-highlight later
+            try:
+                if tid is not None:
+                    self.kanban_card_widgets[tid] = wrapper
+            except Exception:
+                pass
+
+            # Attach task id to wrapper and key child widgets so winfo_containing results can be resolved quickly
+            try:
+                wrapper._kanban_task_id = tid
+                content._kanban_task_id = tid
+                lbl_title._kanban_task_id = tid
+                lbl_meta._kanban_task_id = tid
+                lbl_priority._kanban_task_id = tid
+            except Exception:
+                pass
+
+            # --- selection (single click) ---
+            def _select_card(e=None, _id=tid, _widget=wrapper):
+                try:
+                    # visual highlight: remove previous
+                    prev = getattr(self, "_kanban_highlighted", None)
+                    if prev is not None and prev is not _widget:
+                        try:
+                            prev.configure(highlightthickness=0)
+                        except Exception:
+                            pass
+                    # highlight current
+                    try:
+                        _widget.configure(highlightbackground="#3b82f6", highlightcolor="#3b82f6", highlightthickness=2)
+                        self._kanban_highlighted = _widget
+                    except Exception:
+                        pass
+
+                    # set selected id and status
+                    self.kanban_selected_id = _id
+                    self.kanban_selected_status = None
+                    for s, idlist in self.kanban_item_map.items():
+                        if _id in idlist:
+                            self.kanban_selected_status = s
+                            break
+
+                    # populate details panel
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT description, progress_log, outlook_id, attachments FROM tasks WHERE id=?", (_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        return
+                    desc = row["description"] or ""
+                    prog = row["progress_log"] or ""
+                    # safe access for outlook_id (sqlite3.Row has no .get)
+                    try:
+                        outlook_id = row["outlook_id"] if ("outlook_id" in row.keys() and row["outlook_id"] is not None) else None
+                    except Exception:
+                        outlook_id = None
+
+                    # show HTML if available else plain text (reuse your code path)
+                    if outlook_id and HAS_HTML:
+                        clean = desc or ""
+                        clean = re.sub(r'<style.*?>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+                        clean = re.sub(r'<font[^>]*>', '', clean, flags=re.IGNORECASE).replace("</font>", "")
+                        clean = re.sub(r'style="[^"]*font-size:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+                        clean = re.sub(r'style="[^"]*font-family:[^";]*;?"', '', clean, flags=re.IGNORECASE)
+                        clean = re.sub(r'<span[^>]*>', '<span>', clean, flags=re.IGNORECASE)
+                        if os.name == "nt":
+                            wrapper_style = "font-family:Segoe UI, Arial; font-size:9pt; line-height:1.3; color:#333;"
+                        else:
+                            wrapper_style = "font-family:Arial; font-size:11px; line-height:1.3; color:#333;"
+                        clean = f"<div style='{wrapper_style}'>{clean}</div>"
+                        try:
+                            if hasattr(self, "kanban_text") and self.kanban_text is not None:
+                                try:
+                                    self.kanban_text.pack_forget()
+                                except Exception:
+                                    pass
+                            self.kanban_html.set_html(clean)
+                            self.kanban_html.pack(fill=tk.BOTH, expand=True)
+                        except Exception:
+                            if hasattr(self, "kanban_html"):
+                                try:
+                                    self.kanban_html.pack_forget()
+                                except Exception:
+                                    pass
+                            self.kanban_text.delete("1.0", tk.END)
+                            self.kanban_text.insert(tk.END, desc)
+                            self.kanban_text.pack(fill=tk.BOTH, expand=True)
+                    else:
+                        try:
+                            if HAS_HTML:
+                                self.kanban_html.pack_forget()
+                        except Exception:
+                            pass
+                        self.kanban_text.delete("1.0", tk.END)
+                        self.kanban_text.insert(tk.END, desc)
+                        self.kanban_text.pack(fill=tk.BOTH, expand=True)
+
+                    # progress & attachments
+                    self.kanban_progress.delete("1.0", tk.END)
+                    self.kanban_progress.insert(tk.END, prog)
+                    try:
+                        files = []
+                        if row["attachments"]:
+                            files = json.loads(row["attachments"])
+                        self.kanban_attachments_var.set(", ".join(os.path.basename(f) for f in files) if files else "No attachments")
+                    except Exception:
+                        self.kanban_attachments_var.set("No attachments")
+
+                    # enable action buttons
+                    self.btn_edit.config(state="normal")
+                    self.btn_delete.config(state="normal")
+                    self.btn_done.config(state="normal")
+                    self.btn_prev.config(state="normal" if self.kanban_selected_status != "Pending" else "disabled")
+                    self.btn_next.config(state="normal" if self.kanban_selected_status != "Done" else "disabled")
+                except Exception:
+                    logger.exception("Error selecting kanban card")
+
+            # --- double click opens editor ---
+            def _open_editor(e=None, _id=tid):
+                try:
+                    if _id is not None:
+                        self._open_edit_window(int(_id))
+                except Exception:
+                    logger.exception("Error opening card editor")
+                # Returning "break" tells Tkinter to stop processing this event further
+                return "break"
+
+            # Make widget's own bindtags primary so local bindings get precedence on some platforms
+            try:
+                current_tags = wrapper.bindtags()
+                wrapper.bindtags((str(wrapper),) + tuple(t for t in current_tags if t != str(wrapper)))
+            except Exception:
+                pass
+
+            # Bind click and double-click on wrapper + child labels
+            try:
+                # debug wrappers still useful
+                def _dbg_select(e=None, *_a, **_k):
+                    logger.debug("Kanban single-click on task %s (widget=%s)", tid, getattr(e, "widget", None))
+                    return _select_card(e)
+
+                def _dbg_open(e=None, *_a, **_k):
+                    logger.debug("Kanban double-click on task %s (widget=%s)", tid, getattr(e, "widget", None))
+                    res = _open_editor(e)
+                    # ensure we stop further propagation (prevents global bind_all from also opening editor)
+                    return "break" if res is None else res
+
+                wrapper.bind("<Button-1>", _dbg_select, add="+")
+                wrapper.bind("<Double-Button-1>", _dbg_open, add="+")
+                wrapper.bind("<Double-1>", _dbg_open, add="+")
+
+                content.bind("<Button-1>", _dbg_select, add="+")
+                content.bind("<Double-Button-1>", _dbg_open, add="+")
+                content.bind("<Double-1>", _dbg_open, add="+")
+
+                lbl_title.bind("<Button-1>", _dbg_select, add="+")
+                lbl_title.bind("<Double-Button-1>", _dbg_open, add="+")
+                lbl_title.bind("<Double-1>", _dbg_open, add="+")
+
+                lbl_meta.bind("<Button-1>", _dbg_select, add="+")
+                lbl_meta.bind("<Double-Button-1>", _dbg_open, add="+")
+                lbl_meta.bind("<Double-1>", _dbg_open, add="+")
+
+                lbl_priority.bind("<Button-1>", _dbg_select, add="+")
+                lbl_priority.bind("<Double-Button-1>", _dbg_open, add="+")
+                lbl_priority.bind("<Double-1>", _dbg_open, add="+")
+            except Exception:
+                logger.exception("Failed to bind kanban card events")
+
+            return wrapper
+
+        except Exception:
+            logger.exception("Unhandled error creating kanban card")
+            return None
+
+
+
+    ####------------------ Kanban Board --------------------            
+    def _populate_kanban(self):
+        # clear existing contents
+        try:
+            for status, colinfo in self.kanban_columns.items():
+                inner = colinfo["frame"]
+                # destroy all children inside inner
+                for child in list(inner.winfo_children()):
+                    child.destroy()
                 self.kanban_item_map[status] = []
         except Exception:
             self.kanban_item_map = {status: [] for status in STATUSES}
@@ -2025,63 +2482,28 @@ class TaskApp(tk.Tk):
 
         today = date.today()
         for status in STATUSES:
-            lb = self.kanban_lists.get(status)
-            if lb is None:
+            colinfo = self.kanban_columns.get(status)
+            if not colinfo:
                 continue
+            inner = colinfo["frame"]
+
             items = groups.get(status, [])
             for r in items:
                 try:
-                    task_id = r["id"]
-                    title = r["title"] or ""
-                    due_date = r["due_date"]
-                    priority = (r["priority"] or "Medium").lower()
-                    is_done = (r["status"] or "").strip().lower() == "done"
-
-                    title_display = title
-                    try:
-                        idx = lb.size()
-                        lb.insert(tk.END, title_display)
-                    except Exception:
-                        continue
-
-                    try:
-                        self.kanban_item_map[status].append(task_id)
-                    except Exception:
-                        self.kanban_item_map.setdefault(status, []).append(task_id)
-
-                    if priority == "high":
-                        bg = "#FFD6D6"
-                    elif priority == "medium":
-                        bg = "#FFF5CC"
-                    else:
-                        bg = "#E6FFEA"
-
-                    if is_done:
-                        fg = "#666666"
-                        bg_use = "#f2f2f2"
-                    else:
-                        fg = "black"
-                        bg_use = bg
-
-                    if due_date:
-                        try:
-                            due = datetime.strptime(due_date, "%Y-%m-%d").date()
-                            if due < today:
-                                bg_use = "#FFCCCC"
-                                fg = "black"
-                            elif due == today:
-                                bg_use = "#FFFACD"
-                                fg = "black"
-                        except Exception:
-                            pass
-
-                    try:
-                        lb.itemconfig(idx, bg=bg_use, fg=fg)
-                    except Exception:
-                        pass
+                    # create a card and add it to the column frame
+                    wrapper = self._create_kanban_card(inner, r)
+                    self.kanban_item_map[status].append(r["id"])
                 except Exception:
-                    logger.exception("Error inserting kanban item")
+                    logger.exception("Error creating kanban card")
                     continue
+
+            # ensure smallest width/wrapping is okay
+            try:
+                colinfo["canvas"].update_idletasks()
+                # set canvas scrollregion
+                colinfo["canvas"].configure(scrollregion=colinfo["canvas"].bbox("all"))
+            except Exception:
+                pass
 
     def _kanban_select(self, event):
         lb = event.widget
@@ -2158,35 +2580,58 @@ class TaskApp(tk.Tk):
         if not self.kanban_selected_id:
             return
         self._open_edit_window(self.kanban_selected_id)
-
+    ###
     def _delete_selected_kanban(self):
-        for status, lb in self.kanban_lists.items():
-            sel = list(lb.curselection())
-            if not sel:
-                continue
-            confirm = messagebox.askyesno("Confirm Delete", f"Move {len(sel)} selected task(s) to Trash?")
+        # Prefer selected card id
+        if getattr(self, "kanban_selected_id", None):
+            task_id = self.kanban_selected_id
+            confirm = messagebox.askyesno("Confirm Delete", "Move selected task to Trash?")
             if not confirm:
                 return
-            for idx in sorted(sel, reverse=True):
-                try:
-                    task_id = self.kanban_item_map[status][idx]
-                except Exception:
+            try:
+                self.db.soft_delete(task_id)
+            except Exception:
+                logger.exception("Soft-delete error (kanban single)")
+            # clear selection UI highlight
+            try:
+                prev = getattr(self, "_kanban_highlighted", None)
+                if prev:
+                    prev.configure(highlightthickness=0)
+                    self._kanban_highlighted = None
+            except Exception:
+                pass
+            self.kanban_selected_id = None
+            self.kanban_selected_status = None
+            self._populate(); self._populate_kanban(); self._populate_trash()
+            return
+
+        # Fallback — if someone left old Listbox-based kanban in place
+        if hasattr(self, "kanban_lists"):
+            for status, lb in getattr(self, "kanban_lists", {}).items():
+                sel = list(lb.curselection())
+                if not sel:
                     continue
-                try:
-                    self.db.soft_delete(task_id)
-                except Exception:
-                    logger.exception("Soft-delete error (kanban)")
-                lb.delete(idx)
-                try:
-                    del self.kanban_item_map[status][idx]
-                except Exception:
-                    pass
-        self._populate()
-        self._populate_kanban()
-        try:
-            self._populate_trash()
-        except Exception:
-            pass
+                confirm = messagebox.askyesno("Confirm Delete", f"Move {len(sel)} selected task(s) to Trash?")
+                if not confirm:
+                    return
+                for idx in sorted(sel, reverse=True):
+                    try:
+                        task_id = self.kanban_item_map[status][idx]
+                    except Exception:
+                        continue
+                    try:
+                        self.db.soft_delete(task_id)
+                    except Exception:
+                        logger.exception("Soft-delete error (kanban)")
+                    try:
+                        lb.delete(idx)
+                    except Exception:
+                        pass
+                    try:
+                        del self.kanban_item_map[status][idx]
+                    except Exception:
+                        pass
+        self._populate(); self._populate_kanban(); self._populate_trash()
 
     def _move_prev_selected(self):
         if not self.kanban_selected_id:
@@ -2744,6 +3189,16 @@ class TaskApp(tk.Tk):
                 self.attachments_var.set("")
 
     def _on_delete_key(self, event=None):
+        # Only trigger when Delete key is pressed (prevent BackSpace from acting)
+        try:
+            if event is not None:
+                keysym = getattr(event, "keysym", None)
+                # On some platforms event may be None (when called directly) so allow None -> treat as Delete
+                if keysym is not None and keysym != "Delete":
+                    return
+        except Exception:
+            pass
+
         try:
             idx = self.notebook.index(self.notebook.select())
             tab_text = self.notebook.tab(idx, "text")
