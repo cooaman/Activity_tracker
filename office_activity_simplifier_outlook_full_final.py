@@ -430,17 +430,17 @@ class TaskApp(tk.Tk):
         # Key bindings
         try:
             self.tree.bind("<Delete>", lambda e: self._delete_task())
-            self.tree.bind("<BackSpace>", lambda e: self._delete_task())
+            #self.tree.bind("<BackSpace>", lambda e: self._delete_task())
 
             self.trash_tree.bind("<Delete>", lambda e: self._permanently_delete_selected_trash())
-            self.trash_tree.bind("<BackSpace>", lambda e: self._permanently_delete_selected_trash())
+            #self.trash_tree.bind("<BackSpace>", lambda e: self._permanently_delete_selected_trash())
 
             for status, lb in self.kanban_lists.items():
                 lb.bind("<Delete>", lambda e, _lb=lb: self._delete_selected_kanban())
-                lb.bind("<BackSpace>", lambda e, _lb=lb: self._delete_selected_kanban())
+                #lb.bind("<BackSpace>", lambda e, _lb=lb: self._delete_selected_kanban())
 
             self.bind_all("<Delete>", lambda e: self._on_delete_key())
-            self.bind_all("<BackSpace>", lambda e: self._on_delete_key())
+            #self.bind_all("<BackSpace>", lambda e: self._on_delete_key())
         except Exception:
             pass
 
