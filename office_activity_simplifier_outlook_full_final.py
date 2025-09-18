@@ -2678,13 +2678,13 @@ class TaskApp(tk.Tk):
     # -------------------- Outlook integration --------------------
     def _send_reminder_email(self, task_id, to_address, subject_title, html_body):
         """
-        Send an HTML reminder email via Outlook to `to_address`.
-        Behavior:
-         - If a previous reminder was sent and we stored its EntryID (reminder_mail_entryid),
-           reply to that message (Reply()) so Outlook keeps the conversation/thread.
-         - Otherwise create a new mail using subject_title (no extra "Reminder:" prefix)
-           and set ConversationTopic when possible, then store its EntryID for future replies.
-        Returns True on success, False otherwise.
+        Robust send that tries to reuse an existing Outlook conversation/thread.
+        Strategy:
+          1. If tasks.reminder_mail_entryid exists -> GetItemFromID -> Reply()
+          2. Else search Sent Items for recent mail matching ConversationTopic or Subject+To -> Reply()
+          3. Else search Inbox (flagged/or otherwise) for a match -> Reply()
+          4. Else create a new mail and store its EntryID.
+        Returns True on success, False on failure.
         """
         if not HAS_OUTLOOK:
             logger.debug("Outlook not available; cannot send reminder email.")
@@ -2694,25 +2694,13 @@ class TaskApp(tk.Tk):
             ol_app = win32com.client.Dispatch("Outlook.Application")
             ns = ol_app.GetNamespace("MAPI")
         except Exception:
-            logger.exception("Failed to initialize Outlook COM objects")
+            logger.exception("Outlook COM initialization failed")
             return False
 
-        # Normalize subject: keep exactly the conversation subject you want threaded
         conv_subject = (subject_title or "Reminder").strip()
+        to_address = (to_address or "").strip()
 
-        # Attempt to read stored reminder EntryID
-        entry_id = None
-        try:
-            if task_id:
-                cur = self.db.conn.cursor()
-                cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
-                row = cur.fetchone()
-                if row and row["reminder_mail_entryid"]:
-                    entry_id = row["reminder_mail_entryid"]
-        except Exception:
-            logger.exception("Could not read reminder_mail_entryid")
-
-        # Helper to get signature HTML using a probe item (best-effort)
+        # helper to fetch signature
         def _get_signature():
             try:
                 probe = ol_app.CreateItem(0)
@@ -2728,7 +2716,30 @@ class TaskApp(tk.Tk):
 
         signature_html = _get_signature()
 
-        # If we have an entry_id, try to get that item and reply to it (keeps thread)
+        # try stored entry id first
+        entry_id = None
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("PRAGMA table_info(tasks);")
+            cols = [r["name"] if isinstance(r, sqlite3.Row) else r[1] for r in cur.fetchall()]
+            if "reminder_mail_entryid" in cols:
+                cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
+                row = cur.fetchone()
+                if row and row["reminder_mail_entryid"]:
+                    entry_id = row["reminder_mail_entryid"]
+        except Exception:
+            logger.exception("Could not read reminder_mail_entryid")
+
+        def _store_entryid(eid):
+            if not eid:
+                return
+            try:
+                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                self.db.conn.commit()
+            except Exception:
+                logger.exception("Failed to persist reminder_mail_entryid")
+
+        # Attempt 1: GetItemFromID -> Reply()
         if entry_id:
             try:
                 orig_item = ns.GetItemFromID(entry_id)
@@ -2737,82 +2748,173 @@ class TaskApp(tk.Tk):
 
             if orig_item is not None:
                 try:
-                    # Use Reply() to preserve the thread/topic; change to ReplyAll() to include all recipients.
-                    reply = orig_item.Reply()
-                    # Prepend our HTML content but preserve the quoted body that Reply() provides.
+                    logger.debug("Found original item by EntryID for task %s; replying.", task_id)
+                    reply = orig_item.Reply()  # or ReplyAll()
                     try:
                         reply.HTMLBody = (html_body or "") + signature_html + (reply.HTMLBody or "")
                     except Exception:
                         reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
                     reply.Send()
-
-                    # After sending a reply, EntryID might change (a sent item has an EntryID).
+                    # store new EntryID for reference
                     try:
                         new_eid = getattr(reply, "EntryID", None)
-                        if new_eid and task_id:
-                            try:
-                                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (new_eid, task_id))
-                                self.db.conn.commit()
-                            except Exception:
-                                logger.exception("Could not update reminder_mail_entryid after reply")
+                        if new_eid:
+                            _store_entryid(new_eid)
                     except Exception:
                         pass
-
-                    logger.info("Replied to existing reminder mail for task %s -> %s", task_id, to_address)
+                    logger.info("Replied to existing message (by EntryID) for task %s -> %s", task_id, to_address)
                     return True
                 except Exception:
-                    logger.exception("Failed to reply to existing mail; will fallback to creating a new mail")
-                    # fall through to create new mail
+                    logger.exception("Reply to stored EntryID failed; will try searching Sent Items")
 
-        # No existing thread (or reply failed) => create a new mail and ensure subject matches conv_subject
-        try:
-            mail = ol_app.CreateItem(0)  # olMailItem
-            mail.To = to_address or ""
-            # Use the exact conversation subject (no extra "Reminder:" prefix)
-            mail.Subject = conv_subject
-            # Try to set ConversationTopic to help Outlook thread grouping (best-effort)
+        # Helper: search a folder for likely thread candidates; preference = most recent
+        def _find_candidate_in_folder(folder, subj=None, toaddr=None):
             try:
-                # Some Outlook object models expose ConversationTopic; set if present
+                items = folder.Items
+                # sort newest first
                 try:
-                    setattr(mail, "ConversationTopic", conv_subject)
+                    items.Sort("[ReceivedTime]", True)
                 except Exception:
-                    # If attribute can't be set, ignore silently
                     pass
+
+                # Option A: match ConversationTopic (if we have one)
+                if subj:
+                    # try restrict on ConversationTopic (may not be available via restrict; use Find)
+                    try:
+                        # Try restricting by exact subject first (fast)
+                        safe_subj = subj.replace("'", "''")
+                        crit = f"[Subject] = '{safe_subj}'"
+                        found = items.Restrict(crit)
+                        for it in found:
+                            # ensure mailitem
+                            if getattr(it, "Class", 0) == 43:
+                                # optionally match recipient
+                                if toaddr:
+                                    if toaddr.lower() in (getattr(it, "To", "") or "").lower():
+                                        return it
+                                else:
+                                    return it
+                    except Exception:
+                        # fallback to iterating
+                        pass
+
+                # fallback iteration search (slower) - check subject contains or conv topic
+                for it in items:
+                    try:
+                        if getattr(it, "Class", 0) != 43:
+                            continue
+                        s = (getattr(it, "ConversationTopic", None) or getattr(it, "Subject", "") or "")
+                        t = getattr(it, "To", "") or ""
+                        if subj and subj.lower() in s.lower():
+                            if toaddr:
+                                if toaddr.lower() in t.lower():
+                                    return it
+                                else:
+                                    continue
+                            else:
+                                return it
+                        # also accept subject exact match if conversation topic missing
+                        if subj and subj.lower() == (getattr(it, "Subject", "") or "").lower():
+                            if toaddr:
+                                if toaddr.lower() in t.lower():
+                                    return it
+                                else:
+                                    continue
+                            else:
+                                return it
+                    except Exception:
+                        continue
+            except Exception:
+                logger.exception("Folder search failed")
+            return None
+
+        # Attempt 2: search Sent Items for a prior reminder from us (best candidate)
+        try:
+            sent = ns.GetDefaultFolder(5)  # olFolderSentMail
+            logger.debug("Searching Sent Items for prior matching message for task %s", task_id)
+            candidate = _find_candidate_in_folder(sent, subj=conv_subject, toaddr=to_address)
+            if candidate is None:
+                # broaden: find by subject only
+                candidate = _find_candidate_in_folder(sent, subj=conv_subject, toaddr=None)
+            if candidate:
+                try:
+                    logger.debug("Found candidate in Sent Items; replying to preserve thread")
+                    reply = candidate.Reply()
+                    try:
+                        reply.HTMLBody = (html_body or "") + signature_html + (reply.HTMLBody or "")
+                    except Exception:
+                        reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
+                    reply.Send()
+                    try:
+                        _store_entryid(getattr(reply, "EntryID", None))
+                    except Exception:
+                        pass
+                    logger.info("Replied to Sent Items candidate for task %s", task_id)
+                    return True
+                except Exception:
+                    logger.exception("Reply to Sent candidate failed; will continue searching")
+        except Exception:
+            logger.exception("Error searching Sent Items")
+
+        # Attempt 3: search Inbox / other folders (maybe someone replied to us earlier)
+        try:
+            inbox = ns.GetDefaultFolder(6)  # olFolderInbox
+            logger.debug("Searching Inbox for prior matching message for task %s", task_id)
+            candidate = _find_candidate_in_folder(inbox, subj=conv_subject, toaddr=to_address)
+            if candidate is None:
+                candidate = _find_candidate_in_folder(inbox, subj=conv_subject, toaddr=None)
+            if candidate:
+                try:
+                    logger.debug("Found candidate in Inbox; replying to preserve thread")
+                    reply = candidate.Reply()
+                    try:
+                        reply.HTMLBody = (html_body or "") + signature_html + (reply.HTMLBody or "")
+                    except Exception:
+                        reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
+                    reply.Send()
+                    try:
+                        _store_entryid(getattr(reply, "EntryID", None))
+                    except Exception:
+                        pass
+                    logger.info("Replied to Inbox candidate for task %s", task_id)
+                    return True
+                except Exception:
+                    logger.exception("Reply to Inbox candidate failed; will fall back to creating new mail")
+        except Exception:
+            logger.exception("Inbox search failed")
+
+        # Attempt 4: create a new mail (last resort)
+        try:
+            logger.debug("No existing thread found; creating new mail for task %s", task_id)
+            mail = ol_app.CreateItem(0)
+            mail.To = to_address or ""
+            # Use exact conversation subject (do not prepend 'Reminder:' which may break threading)
+            mail.Subject = conv_subject
+            try:
+                setattr(mail, "ConversationTopic", conv_subject)
             except Exception:
                 pass
-
-            # Display briefly to get signature then send
             try:
                 mail.Display(False)
                 base_sig = mail.HTMLBody or ""
                 mail.HTMLBody = (html_body or "") + base_sig
                 mail.Send()
             except Exception:
-                # fallback: send without signature if display failed
+                # fallback: set HTMLBody and send directly
                 try:
                     mail.HTMLBody = html_body or ""
                     mail.Send()
                 except Exception:
-                    logger.exception("Failed to send new reminder mail")
+                    logger.exception("Failed to send new mail")
                     return False
-
-            # Store EntryID on the task for future replies (if we have a real task row)
             try:
-                eid = getattr(mail, "EntryID", None)
-                if eid and task_id:
-                    try:
-                        self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
-                        self.db.conn.commit()
-                    except Exception:
-                        logger.exception("Failed to store reminder_mail_entryid")
+                _store_entryid(getattr(mail, "EntryID", None))
             except Exception:
                 pass
-
-            logger.info("Sent new reminder mail to %s for task %s (subject=%s)", to_address, task_id, conv_subject)
+            logger.info("Sent new reminder mail for task %s to %s", task_id, to_address)
             return True
-
         except Exception:
-            logger.exception("Failed to create/send Outlook mail")
+            logger.exception("Failed to create/send fallback mail")
             return False
 
     def _get_flagged_from_folder(self, folder, flagged):
