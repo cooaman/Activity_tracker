@@ -31,6 +31,30 @@ import requests
 import msal
 from datetime import datetime, date, timedelta
 
+# ---- Persistent file logging (next to the app/exe) ----
+import sys
+
+try:
+    # Directory where the script or frozen exe lives
+    if getattr(sys, 'frozen', False):
+        app_dir = os.path.dirname(sys.executable)
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+
+    log_file = os.path.join(app_dir, "oats_debug.log")
+    os.makedirs(app_dir, exist_ok=True)
+
+    # Root logger file handler
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    fh.setFormatter(fmt)
+    logging.getLogger().addHandler(fh)
+
+    print(f"[DEBUG] Logging initialized. File: {log_file}")
+except Exception as e:
+    print(f"[WARN] Could not initialize file logging: {e}")
+
 logger = logging.getLogger(__name__)
 # enable console debug logging during development so we can see what's happening
 import logging as _logging
@@ -1731,99 +1755,153 @@ class TaskApp(tk.Tk):
 
 
     ###
-
+    def _http_request_log(method, url, headers=None, json_payload=None, params=None):
+        """
+        Wrapper around requests.request with detailed logging of request/response.
+        """
+        try:
+            logger.debug("HTTP %s %s headers=%s params=%s", method, url, headers, params)
+            if json_payload:
+                logger.debug("Payload: %s", str(json_payload)[:1000])  # limit length
+            resp = requests.request(method, url, headers=headers, json=json_payload, params=params, timeout=30)
+            logger.debug("Response status=%s body=%s", resp.status_code, resp.text[:2000])
+            return resp
+        except Exception:
+            logger.exception("HTTP %s %s failed", method, url)
+            raise
     # Add this method to TaskApp
     def _send_teams_reminder(self, task_id, to_address, subject_title, html_body):
         """
         Send a Teams chat message to `to_address` (email) using Microsoft Graph.
-        Uses MSAL device code flow for a delegated user token (the signed-in user will be the sender).
         Returns True on success, False on failure.
+
+        This implementation logs extensively (requests/responses/errors) to help debugging
+        when running as an .exe (ensure file logging is initialized at program start).
         """
+        def _http_request_log(method, url, headers=None, json_payload=None, params=None, timeout=30):
+            try:
+                logger.debug("HTTP %s %s\nHeaders: %s\nParams: %s", method, url, headers or {}, params or {})
+                if json_payload is not None:
+                    # avoid logging extremely large payloads
+                    try:
+                        payload_str = str(json_payload)
+                        logger.debug("Payload (truncated to 2000 chars): %s", payload_str[:2000])
+                    except Exception:
+                        logger.debug("Payload present but could not stringify for logging.")
+                resp = requests.request(method, url, headers=headers or {}, json=json_payload, params=params or {}, timeout=timeout)
+                body_preview = (resp.text or "")[:4000]
+                logger.debug("HTTP response status=%s url=%s body_preview=%s", resp.status_code, url, body_preview)
+                return resp
+            except Exception:
+                logger.exception("HTTP request failed: %s %s", method, url)
+                raise
 
         # Basic validation
         if not to_address:
-            logger.warning("No recipient email provided for Teams message")
+            logger.warning("No recipient provided for Teams reminder (task_id=%s)", task_id)
             return False
 
-        # Read Graph/MSAL config from settings (store client_id + tenant in settings.json)
-        cfg = self.settings.get("graph", {})  # e.g. {"client_id": "...", "tenant_id": "...", "scopes": ["User.Read","Chat.ReadWrite"]}
+        cfg = self.settings.get("graph", {})
         client_id = cfg.get("client_id")
         tenant = cfg.get("tenant_id") or cfg.get("tenant")
         scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
 
         if not client_id or not tenant:
-            logger.error("Graph/MSAL config missing in settings.json (client_id / tenant_id)")
+            logger.error("Graph/MSAL config missing in settings.json (client_id/tenant_id). settings.graph=%s", cfg)
             return False
 
         authority = f"https://login.microsoftonline.com/{tenant}"
 
         try:
-            # Build MSAL public client and try silent token first (cache)
+            # Build MSAL client with persistent cache
             cache = msal.SerializableTokenCache()
             token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
             if os.path.exists(token_cache_file):
                 try:
-                    cache.deserialize(open(token_cache_file, "r").read())
+                    cache.deserialize(open(token_cache_file, "r", encoding="utf-8").read())
+                    logger.debug("Loaded MSAL token cache from %s", token_cache_file)
                 except Exception:
-                    pass
+                    logger.exception("Failed to read MSAL token cache file (continuing without).")
 
             app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
 
-            # Try to get token silently from cache first
+            # Try silent acquire
             accounts = app.get_accounts()
             result = None
             if accounts:
                 try:
                     result = app.acquire_token_silent(scopes, account=accounts[0])
+                    logger.debug("MSAL acquire_token_silent result: %s", bool(result))
                 except Exception:
+                    logger.exception("acquire_token_silent raised exception (will fallback to device flow).")
                     result = None
 
-            # If no cached token, use device code flow (interactive once)
+            # If no token, do device code flow (interactive)
             if not result:
+                logger.info("No cached token, initiating device code flow for Graph scopes=%s", scopes)
                 flow = app.initiate_device_flow(scopes=scopes)
                 if "user_code" not in flow:
-                    logger.error("Failed to initiate device flow: %s", flow)
+                    logger.error("Device flow initiation failed: %s", flow)
                     return False
-                # show instructions to operator (small blocking dialog)
-                messagebox.showinfo("Sign in required", f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
-                # Acquire token by polling
-                result = app.acquire_token_by_device_flow(flow)  # blocks until complete or error
 
+                # Inform user to authenticate (this will block until the user completes)
+                try:
+                    messagebox.showinfo("Sign in required",
+                                        f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
+                except Exception:
+                    logger.debug("Could not show messagebox for device flow instructions; printing to log instead.")
+                    logger.info("Sign in at %s with code %s", flow.get("verification_uri"), flow.get("user_code"))
+
+                # Acquire token by device flow (will poll until user completes or error)
+                result = app.acquire_token_by_device_flow(flow)
+                logger.debug("Device flow result keys: %s", list(result.keys()) if isinstance(result, dict) else str(type(result)))
                 # persist cache
                 try:
-                    with open(token_cache_file, "w") as fh:
+                    with open(token_cache_file, "w", encoding="utf-8") as fh:
                         fh.write(cache.serialize())
+                    logger.debug("Persisted MSAL token cache to %s", token_cache_file)
                 except Exception:
-                    pass
+                    logger.exception("Failed to persist MSAL token cache")
 
-            if "access_token" not in result:
-                logger.error("Could not obtain Graph access token: %s", result.get("error_description", result))
+            if not result or "access_token" not in result:
+                logger.error("Could not obtain Graph access token: %s", result.get("error_description") if isinstance(result, dict) else result)
                 return False
 
             access_token = result["access_token"]
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
             # 1) Resolve recipient user object by email
-            # Use /users/{email} (URL-encoded email) to find the user principal
-            user_get = requests.get(f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}", headers=headers)
+            user_url = f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}"
+            logger.debug("Resolving teams user for email: %s", to_address)
+            user_get = _http_request_log("GET", user_url, headers=headers)
             if user_get.status_code == 404:
-                logger.error("Teams user not found for email %s", to_address)
+                logger.error("Teams user not found for email %s (status=404)", to_address)
                 return False
-            user_get.raise_for_status()
+            try:
+                user_get.raise_for_status()
+            except Exception:
+                logger.error("Failed resolving user: status=%s text=%s", user_get.status_code, user_get.text[:1000])
+                return False
+
             user_obj = user_get.json()
             recipient_id = user_obj.get("id")
             if not recipient_id:
-                logger.error("Could not resolve user id for %s", to_address)
+                logger.error("Could not extract recipient id from /users response: %s", user_obj)
                 return False
+            logger.debug("Resolved recipient id: %s", recipient_id)
 
             # 2) Get sender id (/me)
-            me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-            me_r.raise_for_status()
+            me_r = _http_request_log("GET", "https://graph.microsoft.com/v1.0/me", headers=headers)
+            try:
+                me_r.raise_for_status()
+            except Exception:
+                logger.error("Failed to get sender (/me): status=%s body=%s", me_r.status_code, me_r.text[:1000])
+                return False
             me_obj = me_r.json()
             me_id = me_obj.get("id")
+            logger.debug("Sender id (me): %s", me_id)
 
             # 3) Create or find a oneOnOne chat with the recipient
-            # A simple approach: try to create a chat - Graph returns 201 and chat id if new, or 409 if exists.
             create_chat_payload = {
                 "chatType": "oneOnOne",
                 "members": [
@@ -1839,37 +1917,47 @@ class TaskApp(tk.Tk):
                     }
                 ]
             }
-            # POST /chats
-            create_r = requests.post("https://graph.microsoft.com/v1.0/chats", headers=headers, json=create_chat_payload)
+
+            create_r = _http_request_log("POST", "https://graph.microsoft.com/v1.0/chats", headers=headers, json_payload=create_chat_payload)
+            chat_id = None
             if create_r.status_code in (200, 201):
-                chat = create_r.json()
-                chat_id = chat.get("id")
+                try:
+                    chat = create_r.json()
+                    chat_id = chat.get("id")
+                    logger.debug("Created new chat id=%s", chat_id)
+                except Exception:
+                    logger.exception("Created chat but failed to parse JSON response.")
             else:
-                # If failed because chat already exists, try to search /users/{me}/chats or list chats and pick one that contains recipient_id.
-                logger.debug("Create chat status: %s - trying to locate existing chat", create_r.status_code)
-                list_chats = requests.get("https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
-                list_chats.raise_for_status()
-                chat_id = None
-                for c in list_chats.json().get("value", []):
-                    # check members for recipient
-                    try:
-                        members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
-                        members_r.raise_for_status()
-                        for m in members_r.json().get("value", []):
-                            if m.get("userId") == recipient_id:
-                                chat_id = c["id"]
+                # If create failed (maybe already exists), attempt to locate an existing chat
+                logger.warning("Create chat returned status %s; attempting to list existing chats", create_r.status_code)
+                list_chats = _http_request_log("GET", "https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
+                try:
+                    list_chats.raise_for_status()
+                    candidate = None
+                    for c in list_chats.json().get("value", []):
+                        try:
+                            # get members of chat to find recipient
+                            members_r = _http_request_log("GET", f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
+                            members_r.raise_for_status()
+                            for m in members_r.json().get("value", []):
+                                if m.get("userId") == recipient_id:
+                                    candidate = c["id"]
+                                    break
+                            if candidate:
+                                chat_id = candidate
+                                logger.debug("Found existing chat id=%s containing recipient %s", chat_id, recipient_id)
                                 break
-                        if chat_id:
-                            break
-                    except Exception:
-                        continue
-                if not chat_id:
-                    logger.error("Could not create or find a chat with %s (create status=%s)", to_address, create_r.status_code)
+                        except Exception:
+                            logger.exception("Error checking chat members for chat id %s", c.get("id"))
+                    if not chat_id:
+                        logger.error("Could not create or find a chat with recipient %s; create_status=%s", to_address, create_r.status_code)
+                        return False
+                except Exception:
+                    logger.exception("Failed to list chats or parse response.")
                     return False
 
             # 4) Send message to chat: contentType html, content = bold subject + two <br> + body
             safe_subject = (subject_title or "Reminder").strip()
-            # ensure html body string is safe-ish (you can further sanitize if desired)
             message_html = f"<b>{safe_subject}</b><br><br>{html_body or ''}"
 
             send_payload = {
@@ -1878,16 +1966,21 @@ class TaskApp(tk.Tk):
                     "content": message_html
                 }
             }
-            send_r = requests.post(f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json=send_payload)
-            if send_r.status_code in (200, 201):
-                logger.info("Teams message sent to %s (task=%s)", to_address, task_id)
-                return True
-            else:
-                logger.error("Failed to send Teams message: status=%s body=%s", send_r.status_code, send_r.text)
+
+            send_r = _http_request_log("POST", f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json_payload=send_payload)
+            try:
+                if send_r.status_code in (200, 201):
+                    logger.info("Teams message sent to %s (task=%s) chat_id=%s", to_address, task_id, chat_id)
+                    return True
+                else:
+                    logger.error("Failed to send Teams message: status=%s response=%s", send_r.status_code, send_r.text[:2000])
+                    return False
+            except Exception:
+                logger.exception("Exception while sending Teams message")
                 return False
 
         except Exception:
-            logger.exception("Unhandled error sending Teams reminder")
+            logger.exception("Unhandled error in _send_teams_reminder for task %s to %s", task_id, to_address)
             return False
     # -------------------- Other CRUD helpers & Kanban --------------------
 
