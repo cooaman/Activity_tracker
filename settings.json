@@ -1,0 +1,12 @@
+{
+  "outlook_refresh_minutes": 30,
+  "show_description": false,
+  "graph": {
+    "client_id": "YOUR-APP-CLIENT-ID-HERE",
+    "tenant_id": "YOUR-TENANT-ID-HERE",
+    "scopes": [
+      "User.Read",
+      "Chat.ReadWrite"
+    ]
+  }
+}
