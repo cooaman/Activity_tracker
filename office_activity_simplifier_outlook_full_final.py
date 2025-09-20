@@ -1772,216 +1772,276 @@ class TaskApp(tk.Tk):
     # Add this method to TaskApp
     def _send_teams_reminder(self, task_id, to_address, subject_title, html_body):
         """
-        Send a Teams chat message to `to_address` (email) using Microsoft Graph.
-        Returns True on success, False on failure.
+        Try Graph/MSAL first (if configured). If that fails or config is missing,
+        fall back to automating Teams web using Selenium + webdriver-manager.
 
-        This implementation logs extensively (requests/responses/errors) to help debugging
-        when running as an .exe (ensure file logging is initialized at program start).
+        Returns True on success, False otherwise.
         """
-        def _http_request_log(method, url, headers=None, json_payload=None, params=None, timeout=30):
-            try:
-                logger.debug("HTTP %s %s\nHeaders: %s\nParams: %s", method, url, headers or {}, params or {})
-                if json_payload is not None:
-                    # avoid logging extremely large payloads
-                    try:
-                        payload_str = str(json_payload)
-                        logger.debug("Payload (truncated to 2000 chars): %s", payload_str[:2000])
-                    except Exception:
-                        logger.debug("Payload present but could not stringify for logging.")
-                resp = requests.request(method, url, headers=headers or {}, json=json_payload, params=params or {}, timeout=timeout)
-                body_preview = (resp.text or "")[:4000]
-                logger.debug("HTTP response status=%s url=%s body_preview=%s", resp.status_code, url, body_preview)
-                return resp
-            except Exception:
-                logger.exception("HTTP request failed: %s %s", method, url)
-                raise
+        import logging
+        import os
+        import time
+        import urllib.parse
 
-        # Basic validation
-        if not to_address:
-            logger.warning("No recipient provided for Teams reminder (task_id=%s)", task_id)
-            return False
+        # ensure file logging (app folder)
+        try:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            app_dir = os.getcwd()
+        log_path = os.path.join(app_dir, "oats_teams.log")
+        fh = None
+        try:
+            # Add a file handler only once
+            if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_path
+                    for h in logging.getLogger().handlers):
+                fh = logging.FileHandler(log_path, encoding="utf-8")
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                logging.getLogger().addHandler(fh)
+                logging.getLogger().setLevel(logging.DEBUG)
+        except Exception:
+            logger.exception("Could not add file handler for Teams logging (ignored)")
 
-        cfg = self.settings.get("graph", {})
-        client_id = cfg.get("client_id")
-        tenant = cfg.get("tenant_id") or cfg.get("tenant")
-        scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
+        logger.debug("Attempting to send Teams reminder to %s (task=%s)", to_address, task_id)
 
-        if not client_id or not tenant:
-            logger.error("Graph/MSAL config missing in settings.json (client_id/tenant_id). settings.graph=%s", cfg)
-            return False
+        # ---- 1) Try Graph/MSAL if configured (same approach as before) ----
+        try:
+            cfg = self.settings.get("graph", {})
+            client_id = cfg.get("client_id")
+            tenant = cfg.get("tenant_id") or cfg.get("tenant")
+            scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
 
-        authority = f"https://login.microsoftonline.com/{tenant}"
+            if client_id and tenant:
+                logger.debug("Graph config found - attempting MSAL Graph send")
+                # reuse the existing Graph-based implementation (call original method body if available)
+                # We attempt to call the original Graph logic from your existing function if present.
+                # If your file already contains a Graph path (above in file), prefer that.
+                # To avoid duplicating code, call the original _send_teams_reminder_graph if you attached one.
+                # But here - fallback to the existing graph code path in current method space:
+                try:
+                    # (Re-use your existing MSAL/Graph implementation — replicate minimal steps)
+                    # Build authority
+                    import msal
+                    import requests
+
+                    authority = f"https://login.microsoftonline.com/{tenant}"
+                    cache = msal.SerializableTokenCache()
+                    token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
+                    if os.path.exists(token_cache_file):
+                        try:
+                            cache.deserialize(open(token_cache_file, "r").read())
+                        except Exception:
+                            pass
+
+                    app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
+                    accounts = app.get_accounts()
+                    result = None
+                    if accounts:
+                        try:
+                            result = app.acquire_token_silent(scopes, account=accounts[0])
+                        except Exception:
+                            result = None
+
+                    if not result:
+                        flow = app.initiate_device_flow(scopes=scopes)
+                        if "user_code" not in flow:
+                            logger.error("MSAL device flow initiation failed: %s", flow)
+                            result = None
+                        else:
+                            messagebox.showinfo("Sign in required", f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
+                            result = app.acquire_token_by_device_flow(flow)
+                            try:
+                                with open(token_cache_file, "w") as fhc:
+                                    fhc.write(cache.serialize())
+                            except Exception:
+                                pass
+
+                    if result and "access_token" in result:
+                        access_token = result["access_token"]
+                        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+                        # resolve user by email
+                        user_get = requests.get(f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}", headers=headers)
+                        if user_get.status_code == 404:
+                            logger.error("Teams user not found for email %s", to_address)
+                            # fall through to browser fallback
+                        else:
+                            user_get.raise_for_status()
+                            user_obj = user_get.json()
+                            recipient_id = user_obj.get("id")
+                            if not recipient_id:
+                                logger.error("Could not resolve recipient id via Graph for %s", to_address)
+                            else:
+                                # create/find chat and send (reuse your existing approach)
+                                me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
+                                me_r.raise_for_status()
+                                me_id = me_r.json().get("id")
+                                create_chat_payload = {
+                                    "chatType": "oneOnOne",
+                                    "members": [
+                                        {
+                                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                                            "roles": ["owner"],
+                                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{me_id}')"
+                                        },
+                                        {
+                                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                                            "roles": ["owner"],
+                                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{recipient_id}')"
+                                        }
+                                    ]
+                                }
+                                create_r = requests.post("https://graph.microsoft.com/v1.0/chats", headers=headers, json=create_chat_payload)
+                                if create_r.status_code in (200, 201):
+                                    chat_id = create_r.json().get("id")
+                                else:
+                                    # try to locate existing chat
+                                    list_chats = requests.get("https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
+                                    list_chats.raise_for_status()
+                                    chat_id = None
+                                    for c in list_chats.json().get("value", []):
+                                        try:
+                                            members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
+                                            members_r.raise_for_status()
+                                            for m in members_r.json().get("value", []):
+                                                if m.get("userId") == recipient_id:
+                                                    chat_id = c["id"]
+                                                    break
+                                            if chat_id:
+                                                break
+                                        except Exception:
+                                            continue
+                                if chat_id:
+                                    message_html = f"<b>{(subject_title or 'Reminder').strip()}</b><br><br>{html_body or ''}"
+                                    send_payload = {"body": {"contentType": "html", "content": message_html}}
+                                    send_r = requests.post(f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json=send_payload)
+                                    if send_r.status_code in (200, 201):
+                                        logger.info("Graph: Teams message sent to %s (task=%s)", to_address, task_id)
+                                        return True
+                                    else:
+                                        logger.error("Graph send failed: %s %s", send_r.status_code, send_r.text)
+                                else:
+                                    logger.error("Graph could not create/find chat with %s", to_address)
+                    else:
+                        logger.debug("No Graph token acquired or Graph not usable - will try browser fallback.")
+                except Exception:
+                    logger.exception("Graph/MSAL path raised exception; will fallback to browser automation.")
+            else:
+                logger.debug("No Graph client_id/tenant in settings - skipping Graph path.")
+        except Exception:
+            logger.exception("Unhandled error in Graph/MSAL attempt (ignored)")
+
+        # ---- 2) Browser automation fallback (Selenium + webdriver-manager) ----
+        logger.debug("Falling back to browser automation for Teams web.")
 
         try:
-            # Build MSAL client with persistent cache
-            cache = msal.SerializableTokenCache()
-            token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
-            if os.path.exists(token_cache_file):
-                try:
-                    cache.deserialize(open(token_cache_file, "r", encoding="utf-8").read())
-                    logger.debug("Loaded MSAL token cache from %s", token_cache_file)
-                except Exception:
-                    logger.exception("Failed to read MSAL token cache file (continuing without).")
+            # Lazy import so packaging works when selenium absent
+            from selenium import webdriver
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.common.keys import Keys
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            from webdriver_manager.chrome import ChromeDriverManager
+            import platform
 
-            app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
+            # Build the Teams chat URL (direct chat to users param)
+            users_q = urllib.parse.quote(to_address)
+            chat_url = f"https://teams.microsoft.com/l/chat/0/0?users={users_q}"
 
-            # Try silent acquire
-            accounts = app.get_accounts()
-            result = None
-            if accounts:
-                try:
-                    result = app.acquire_token_silent(scopes, account=accounts[0])
-                    logger.debug("MSAL acquire_token_silent result: %s", bool(result))
-                except Exception:
-                    logger.exception("acquire_token_silent raised exception (will fallback to device flow).")
-                    result = None
+            # Chrome options; attempt to reuse existing Chrome profile where possible to reuse login
+            options = webdriver.ChromeOptions()
+            options.add_argument("--disable-infobars")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
 
-            # If no token, do device code flow (interactive)
-            if not result:
-                logger.info("No cached token, initiating device code flow for Graph scopes=%s", scopes)
-                flow = app.initiate_device_flow(scopes=scopes)
-                if "user_code" not in flow:
-                    logger.error("Device flow initiation failed: %s", flow)
-                    return False
-
-                # Inform user to authenticate (this will block until the user completes)
-                try:
-                    messagebox.showinfo("Sign in required",
-                                        f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
-                except Exception:
-                    logger.debug("Could not show messagebox for device flow instructions; printing to log instead.")
-                    logger.info("Sign in at %s with code %s", flow.get("verification_uri"), flow.get("user_code"))
-
-                # Acquire token by device flow (will poll until user completes or error)
-                result = app.acquire_token_by_device_flow(flow)
-                logger.debug("Device flow result keys: %s", list(result.keys()) if isinstance(result, dict) else str(type(result)))
-                # persist cache
-                try:
-                    with open(token_cache_file, "w", encoding="utf-8") as fh:
-                        fh.write(cache.serialize())
-                    logger.debug("Persisted MSAL token cache to %s", token_cache_file)
-                except Exception:
-                    logger.exception("Failed to persist MSAL token cache")
-
-            if not result or "access_token" not in result:
-                logger.error("Could not obtain Graph access token: %s", result.get("error_description") if isinstance(result, dict) else result)
-                return False
-
-            access_token = result["access_token"]
-            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
-            # 1) Resolve recipient user object by email
-            user_url = f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}"
-            logger.debug("Resolving teams user for email: %s", to_address)
-            user_get = _http_request_log("GET", user_url, headers=headers)
-            if user_get.status_code == 404:
-                logger.error("Teams user not found for email %s (status=404)", to_address)
-                return False
+            # Try to use standard Chrome user profile location (Windows) to reuse Teams login
             try:
-                user_get.raise_for_status()
-            except Exception:
-                logger.error("Failed resolving user: status=%s text=%s", user_get.status_code, user_get.text[:1000])
-                return False
-
-            user_obj = user_get.json()
-            recipient_id = user_obj.get("id")
-            if not recipient_id:
-                logger.error("Could not extract recipient id from /users response: %s", user_obj)
-                return False
-            logger.debug("Resolved recipient id: %s", recipient_id)
-
-            # 2) Get sender id (/me)
-            me_r = _http_request_log("GET", "https://graph.microsoft.com/v1.0/me", headers=headers)
-            try:
-                me_r.raise_for_status()
-            except Exception:
-                logger.error("Failed to get sender (/me): status=%s body=%s", me_r.status_code, me_r.text[:1000])
-                return False
-            me_obj = me_r.json()
-            me_id = me_obj.get("id")
-            logger.debug("Sender id (me): %s", me_id)
-
-            # 3) Create or find a oneOnOne chat with the recipient
-            create_chat_payload = {
-                "chatType": "oneOnOne",
-                "members": [
-                    {
-                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                        "roles": ["owner"],
-                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{me_id}')"
-                    },
-                    {
-                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                        "roles": ["owner"],
-                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{recipient_id}')"
-                    }
-                ]
-            }
-
-            create_r = _http_request_log("POST", "https://graph.microsoft.com/v1.0/chats", headers=headers, json_payload=create_chat_payload)
-            chat_id = None
-            if create_r.status_code in (200, 201):
-                try:
-                    chat = create_r.json()
-                    chat_id = chat.get("id")
-                    logger.debug("Created new chat id=%s", chat_id)
-                except Exception:
-                    logger.exception("Created chat but failed to parse JSON response.")
-            else:
-                # If create failed (maybe already exists), attempt to locate an existing chat
-                logger.warning("Create chat returned status %s; attempting to list existing chats", create_r.status_code)
-                list_chats = _http_request_log("GET", "https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
-                try:
-                    list_chats.raise_for_status()
-                    candidate = None
-                    for c in list_chats.json().get("value", []):
-                        try:
-                            # get members of chat to find recipient
-                            members_r = _http_request_log("GET", f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
-                            members_r.raise_for_status()
-                            for m in members_r.json().get("value", []):
-                                if m.get("userId") == recipient_id:
-                                    candidate = c["id"]
-                                    break
-                            if candidate:
-                                chat_id = candidate
-                                logger.debug("Found existing chat id=%s containing recipient %s", chat_id, recipient_id)
-                                break
-                        except Exception:
-                            logger.exception("Error checking chat members for chat id %s", c.get("id"))
-                    if not chat_id:
-                        logger.error("Could not create or find a chat with recipient %s; create_status=%s", to_address, create_r.status_code)
-                        return False
-                except Exception:
-                    logger.exception("Failed to list chats or parse response.")
-                    return False
-
-            # 4) Send message to chat: contentType html, content = bold subject + two <br> + body
-            safe_subject = (subject_title or "Reminder").strip()
-            message_html = f"<b>{safe_subject}</b><br><br>{html_body or ''}"
-
-            send_payload = {
-                "body": {
-                    "contentType": "html",
-                    "content": message_html
-                }
-            }
-
-            send_r = _http_request_log("POST", f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json_payload=send_payload)
-            try:
-                if send_r.status_code in (200, 201):
-                    logger.info("Teams message sent to %s (task=%s) chat_id=%s", to_address, task_id, chat_id)
-                    return True
+                if os.name == "nt":
+                    user_profile = os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Google", "Chrome", "User Data")
+                    if os.path.exists(user_profile):
+                        # Use a temporary copy of profile? direct reuse will open Chrome with profile and may lock it.
+                        # Using direct profile improves chance of being already logged into Teams.
+                        options.add_argument(f"--user-data-dir={user_profile}")
+                        # Use 'Default' profile
+                        # options.add_argument(f'--profile-directory=Default')
+                        logger.debug("Using Chrome user-data-dir: %s", user_profile)
+                elif sys.platform == "darwin":
+                    mac_prof = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+                    if os.path.exists(mac_prof):
+                        options.add_argument(f"--user-data-dir={mac_prof}")
+                        logger.debug("Using Chrome user-data-dir (mac): %s", mac_prof)
                 else:
-                    logger.error("Failed to send Teams message: status=%s response=%s", send_r.status_code, send_r.text[:2000])
-                    return False
+                    linux_prof = os.path.expanduser("~/.config/google-chrome")
+                    if os.path.exists(linux_prof):
+                        options.add_argument(f"--user-data-dir={linux_prof}")
+                        logger.debug("Using Chrome user-data-dir (linux): %s", linux_prof)
             except Exception:
-                logger.exception("Exception while sending Teams message")
+                logger.exception("Error trying to set user-data-dir (non-fatal)")
+
+            # Start driver (webdriver-manager will download matching chromedriver)
+            logger.debug("Starting Chrome webdriver with webdriver-manager")
+            driver = webdriver.Chrome(service=webdriver.chrome.service.Service(ChromeDriverManager().install()), options=options)
+            driver.set_page_load_timeout(60)
+            driver.maximize_window()
+            logger.debug("Navigating to Teams chat URL: %s", chat_url)
+            driver.get(chat_url)
+
+            wait = WebDriverWait(driver, 60)
+
+            # Wait for the chat UI to be ready:
+            # Teams web chat has a contenteditable area where you type messages. We'll wait for it.
+            try:
+                # Common selector: a contenteditable area (search for it)
+                editable = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
+            except Exception:
+                # If not found quickly, try a longer wait and show message
+                logger.debug("Editable area not found quickly. Waiting slightly longer for possible login redirect.")
+                try:
+                    editable = WebDriverWait(driver, 120).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
+                except Exception:
+                    logger.error("Could not find Teams chat input area in the page. Giving up and leaving browser open for manual send.")
+                    # Leave browser open so user can send manually
+                    return False
+
+            # Compose message: subject as bold (Teams may accept simple plaintext)
+            try:
+                # Focus the editable area and send subject + two newlines + body
+                editable.click()
+                # Some Teams instances require using Keys.CONTROL + Enter for newline; we'll use Enter for sending at the end.
+                subject = (subject_title or "Reminder").strip()
+                # Convert HTML -> plaintext naive fallback (strip tags)
+                text_body = re.sub(r"<[^>]+>", "", html_body or "")
+                to_send = f"{subject}\n\n{text_body}"
+                editable.send_keys(to_send)
+                time.sleep(0.5)
+                # Press Enter to send
+                editable.send_keys(Keys.ENTER)
+                logger.info("Browser automation: Teams message queued/sent for %s (task=%s)", to_address, task_id)
+                # give it a moment to send
+                time.sleep(2)
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                logger.exception("Failed to type/send message via Teams web automation")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
                 return False
 
         except Exception:
-            logger.exception("Unhandled error in _send_teams_reminder for task %s to %s", task_id, to_address)
+            logger.exception("Unhandled error in browser automation fallback for Teams")
             return False
+        finally:
+            # close file handler if we added one in this call (avoid duplicate handlers across calls)
+            try:
+                if fh is not None:
+                    logging.getLogger().removeHandler(fh)
+                    fh.close()
+            except Exception:
+                pass
     # -------------------- Other CRUD helpers & Kanban --------------------
 
         # Recurrence helpers
