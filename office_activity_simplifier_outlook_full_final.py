@@ -1772,37 +1772,44 @@ class TaskApp(tk.Tk):
     # Add this method to TaskApp
     def _send_teams_reminder(self, task_id, to_address, subject_title, html_body):
         """
-        Try Graph/MSAL first (if configured). If that fails or config is missing,
-        fall back to automating Teams web using Selenium + webdriver-manager.
+        Send Teams reminder. Try Graph/MSAL first (if configured). If that fails,
+        fall back to browser automation with Selenium.
 
-        Returns True on success, False otherwise.
+        This version attempts:
+        1) Use real Chrome user-data-dir (so already-logged-in Teams web session is used).
+        2) If Chrome fails to start (DevToolsActivePort / crash), retry with a temporary
+            user-data-dir (clean profile) so ChromeLauncher won't collide with an existing Chrome.
         """
-        import logging
         import os
         import time
+        import tempfile
+        import shutil
+        import logging
         import urllib.parse
+        import re
 
-        # ensure file logging (app folder)
+        # setup file logging to app folder
         try:
             app_dir = os.path.dirname(os.path.abspath(__file__))
         except Exception:
             app_dir = os.getcwd()
         log_path = os.path.join(app_dir, "oats_teams.log")
-        fh = None
+        file_handler = None
         try:
-            # Add a file handler only once
-            if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_path
-                    for h in logging.getLogger().handlers):
-                fh = logging.FileHandler(log_path, encoding="utf-8")
-                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-                logging.getLogger().addHandler(fh)
-                logging.getLogger().setLevel(logging.DEBUG)
+            root_logger = logging.getLogger()
+            # ensure single handler for log_path
+            existing = [h for h in root_logger.handlers if getattr(h, "baseFilename", "") == log_path]
+            if not existing:
+                file_handler = logging.FileHandler(log_path, encoding="utf-8")
+                file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                root_logger.addHandler(file_handler)
+                root_logger.setLevel(logging.DEBUG)
         except Exception:
-            logger.exception("Could not add file handler for Teams logging (ignored)")
+            logger.exception("Could not install file logger")
 
-        logger.debug("Attempting to send Teams reminder to %s (task=%s)", to_address, task_id)
+        logger.debug("Attempt send Teams reminder to %s (task=%s)", to_address, task_id)
 
-        # ---- 1) Try Graph/MSAL if configured (same approach as before) ----
+        # --- 1) Try Graph/MSAL (same approach you had) ---
         try:
             cfg = self.settings.get("graph", {})
             client_id = cfg.get("client_id")
@@ -1810,18 +1817,9 @@ class TaskApp(tk.Tk):
             scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
 
             if client_id and tenant:
-                logger.debug("Graph config found - attempting MSAL Graph send")
-                # reuse the existing Graph-based implementation (call original method body if available)
-                # We attempt to call the original Graph logic from your existing function if present.
-                # If your file already contains a Graph path (above in file), prefer that.
-                # To avoid duplicating code, call the original _send_teams_reminder_graph if you attached one.
-                # But here - fallback to the existing graph code path in current method space:
+                logger.debug("Graph config present, attempting MSAL Graph path")
                 try:
-                    # (Re-use your existing MSAL/Graph implementation — replicate minimal steps)
-                    # Build authority
-                    import msal
-                    import requests
-
+                    import msal, requests
                     authority = f"https://login.microsoftonline.com/{tenant}"
                     cache = msal.SerializableTokenCache()
                     token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
@@ -1830,7 +1828,6 @@ class TaskApp(tk.Tk):
                             cache.deserialize(open(token_cache_file, "r").read())
                         except Exception:
                             pass
-
                     app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
                     accounts = app.get_accounts()
                     result = None
@@ -1839,7 +1836,6 @@ class TaskApp(tk.Tk):
                             result = app.acquire_token_silent(scopes, account=accounts[0])
                         except Exception:
                             result = None
-
                     if not result:
                         flow = app.initiate_device_flow(scopes=scopes)
                         if "user_code" not in flow:
@@ -1858,21 +1854,15 @@ class TaskApp(tk.Tk):
                         access_token = result["access_token"]
                         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-                        # resolve user by email
+                        # Resolve user by email
                         user_get = requests.get(f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}", headers=headers)
                         if user_get.status_code == 404:
-                            logger.error("Teams user not found for email %s", to_address)
-                            # fall through to browser fallback
+                            logger.error("Graph: Teams user not found for email %s", to_address)
                         else:
                             user_get.raise_for_status()
-                            user_obj = user_get.json()
-                            recipient_id = user_obj.get("id")
-                            if not recipient_id:
-                                logger.error("Could not resolve recipient id via Graph for %s", to_address)
-                            else:
-                                # create/find chat and send (reuse your existing approach)
-                                me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-                                me_r.raise_for_status()
+                            recipient_id = user_get.json().get("id")
+                            if recipient_id:
+                                me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers); me_r.raise_for_status()
                                 me_id = me_r.json().get("id")
                                 create_chat_payload = {
                                     "chatType": "oneOnOne",
@@ -1890,23 +1880,20 @@ class TaskApp(tk.Tk):
                                     ]
                                 }
                                 create_r = requests.post("https://graph.microsoft.com/v1.0/chats", headers=headers, json=create_chat_payload)
+                                chat_id = None
                                 if create_r.status_code in (200, 201):
                                     chat_id = create_r.json().get("id")
                                 else:
-                                    # try to locate existing chat
+                                    logger.debug("Graph: create chat responded %s; trying to locate existing chat", create_r.status_code)
                                     list_chats = requests.get("https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
                                     list_chats.raise_for_status()
-                                    chat_id = None
                                     for c in list_chats.json().get("value", []):
                                         try:
-                                            members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
-                                            members_r.raise_for_status()
+                                            members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers); members_r.raise_for_status()
                                             for m in members_r.json().get("value", []):
                                                 if m.get("userId") == recipient_id:
-                                                    chat_id = c["id"]
-                                                    break
-                                            if chat_id:
-                                                break
+                                                    chat_id = c["id"]; break
+                                            if chat_id: break
                                         except Exception:
                                             continue
                                 if chat_id:
@@ -1918,128 +1905,190 @@ class TaskApp(tk.Tk):
                                         return True
                                     else:
                                         logger.error("Graph send failed: %s %s", send_r.status_code, send_r.text)
-                                else:
-                                    logger.error("Graph could not create/find chat with %s", to_address)
                     else:
-                        logger.debug("No Graph token acquired or Graph not usable - will try browser fallback.")
+                        logger.debug("Graph: token not acquired or login aborted; will fallback to browser UI.")
                 except Exception:
-                    logger.exception("Graph/MSAL path raised exception; will fallback to browser automation.")
+                    logger.exception("Graph path raised exception; falling back to browser automation")
             else:
-                logger.debug("No Graph client_id/tenant in settings - skipping Graph path.")
+                logger.debug("No Graph client_id/tenant present in settings; skip Graph")
         except Exception:
-            logger.exception("Unhandled error in Graph/MSAL attempt (ignored)")
+            logger.exception("Unhandled error during Graph/MSAL attempt (ignored)")
 
-        # ---- 2) Browser automation fallback (Selenium + webdriver-manager) ----
+        # --- 2) Browser fallback using Selenium ---
         logger.debug("Falling back to browser automation for Teams web.")
 
         try:
-            # Lazy import so packaging works when selenium absent
             from selenium import webdriver
+            from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
             from selenium.webdriver.common.by import By
             from selenium.webdriver.common.keys import Keys
             from selenium.webdriver.support.ui import WebDriverWait
             from selenium.webdriver.support import expected_conditions as EC
             from webdriver_manager.chrome import ChromeDriverManager
-            import platform
+        except Exception:
+            logger.exception("Selenium/webdriver-manager not installed - browser fallback unavailable")
+            return False
 
-            # Build the Teams chat URL (direct chat to users param)
-            users_q = urllib.parse.quote(to_address)
-            chat_url = f"https://teams.microsoft.com/l/chat/0/0?users={users_q}"
+        # build chat url for direct chat to email
+        users_q = urllib.parse.quote(to_address)
+        chat_url = f"https://teams.microsoft.com/l/chat/0/0?users={users_q}"
 
-            # Chrome options; attempt to reuse existing Chrome profile where possible to reuse login
-            options = webdriver.ChromeOptions()
-            options.add_argument("--disable-infobars")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-gpu")
-
-            # Try to use standard Chrome user profile location (Windows) to reuse Teams login
+        def _start_driver_with_options(options, driver_path=None, timeout=60):
+            """Start chrome driver using webdriver-manager (or provided driver_path). Return driver or raise."""
             try:
-                if os.name == "nt":
-                    user_profile = os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Google", "Chrome", "User Data")
-                    if os.path.exists(user_profile):
-                        # Use a temporary copy of profile? direct reuse will open Chrome with profile and may lock it.
-                        # Using direct profile improves chance of being already logged into Teams.
-                        options.add_argument(f"--user-data-dir={user_profile}")
-                        # Use 'Default' profile
-                        # options.add_argument(f'--profile-directory=Default')
-                        logger.debug("Using Chrome user-data-dir: %s", user_profile)
-                elif sys.platform == "darwin":
-                    mac_prof = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-                    if os.path.exists(mac_prof):
-                        options.add_argument(f"--user-data-dir={mac_prof}")
-                        logger.debug("Using Chrome user-data-dir (mac): %s", mac_prof)
+                # If driver_path provided use it (packaged driver); else use webdriver-manager
+                if driver_path:
+                    service = webdriver.chrome.service.Service(driver_path)
                 else:
-                    linux_prof = os.path.expanduser("~/.config/google-chrome")
-                    if os.path.exists(linux_prof):
-                        options.add_argument(f"--user-data-dir={linux_prof}")
-                        logger.debug("Using Chrome user-data-dir (linux): %s", linux_prof)
+                    chromedriver_path = ChromeDriverManager().install()
+                    service = webdriver.chrome.service.Service(chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=options)
+                driver.set_page_load_timeout(timeout)
+                return driver
             except Exception:
-                logger.exception("Error trying to set user-data-dir (non-fatal)")
+                raise
 
-            # Start driver (webdriver-manager will download matching chromedriver)
-            logger.debug("Starting Chrome webdriver with webdriver-manager")
-            driver = webdriver.Chrome(service=webdriver.chrome.service.Service(ChromeDriverManager().install()), options=options)
-            driver.set_page_load_timeout(60)
-            driver.maximize_window()
+        # prepare options common
+        options = webdriver.ChromeOptions()
+        options.add_argument("--disable-infobars")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        # don't use headless - want interactive session (and Teams web may block headless)
+        # options.add_argument("--headless=new")  # not recommended for Teams
+
+        # Try user's Chrome profile first (best UX)
+        tried_temp_profile = False
+        temp_profile_dir = None
+        driver = None
+        try_user_profile = True
+        user_profile_dir = None
+        try:
+            if os.name == "nt":
+                user_profile_dir = os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Google", "Chrome", "User Data")
+            elif sys.platform == "darwin":
+                user_profile_dir = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+            else:
+                user_profile_dir = os.path.expanduser("~/.config/google-chrome")
+
+            if user_profile_dir and os.path.exists(user_profile_dir):
+                try:
+                    options.add_argument(f"--user-data-dir={user_profile_dir}")
+                    logger.debug("Using Chrome user-data-dir: %s", user_profile_dir)
+                except Exception:
+                    logger.exception("Could not set --user-data-dir (ignoring)")
+            else:
+                try_user_profile = False
+                logger.debug("No existing Chrome user-data-dir found, skipping user profile attempt")
+        except Exception:
+            logger.exception("Error while determining user profile dir")
+
+        # Attempt loop: try user profile -> on failure remove that flag and try temp profile
+        last_exception = None
+        for attempt in range(2):
+            try:
+                logger.debug("Chrome start attempt #%s (using user profile? %s)", attempt + 1, try_user_profile)
+                driver = _start_driver_with_options(options)
+                logger.debug("Chrome started successfully (attempt %s)", attempt + 1)
+                break
+            except Exception as e:
+                last_exception = e
+                logger.exception("Chrome start failed on attempt %s", attempt + 1)
+                # if first attempt used real profile, retry with temp profile
+                if try_user_profile:
+                    logger.debug("Will retry with a temporary profile to avoid profile lock/crash")
+                    # remove user-data-dir arg and create a temp dir
+                    try:
+                        # remove any existing --user-data-dir from options
+                        new_args = [a for a in options.arguments if not a.startswith("--user-data-dir")]
+                        # unfortunately ChromeOptions doesn't expose simple removal API; recreate options
+                        options = webdriver.ChromeOptions()
+                        options.add_argument("--disable-infobars"); options.add_argument("--no-sandbox")
+                        options.add_argument("--disable-dev-shm-usage"); options.add_argument("--disable-gpu")
+                        temp_profile_dir = tempfile.mkdtemp(prefix="oats_chrome_profile_")
+                        options.add_argument(f"--user-data-dir={temp_profile_dir}")
+                        logger.debug("Created temporary chrome profile at %s", temp_profile_dir)
+                        tried_temp_profile = True
+                        tried_user_profile = False
+                        try_user_profile = False  # ensure next loop uses temp profile
+                        continue  # next attempt
+                    except Exception:
+                        logger.exception("Failed to prepare temporary profile; aborting browser fallback")
+                        break
+                else:
+                    # already tried temp profile or nothing left to try
+                    break
+
+        if driver is None:
+            logger.error("Failed to start Chrome for browser automation. Last error: %s", repr(last_exception))
+            # cleanup temp profile if created
+            if temp_profile_dir:
+                try:
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            return False
+
+        # driver is running; navigate and attempt to send
+        try:
             logger.debug("Navigating to Teams chat URL: %s", chat_url)
             driver.get(chat_url)
-
             wait = WebDriverWait(driver, 60)
-
-            # Wait for the chat UI to be ready:
-            # Teams web chat has a contenteditable area where you type messages. We'll wait for it.
+            # wait for a contenteditable input area
             try:
-                # Common selector: a contenteditable area (search for it)
                 editable = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
             except Exception:
-                # If not found quickly, try a longer wait and show message
-                logger.debug("Editable area not found quickly. Waiting slightly longer for possible login redirect.")
+                logger.debug("Editable area not found quickly; waiting up to 120s (login or SSO possible)")
                 try:
                     editable = WebDriverWait(driver, 120).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
                 except Exception:
-                    logger.error("Could not find Teams chat input area in the page. Giving up and leaving browser open for manual send.")
-                    # Leave browser open so user can send manually
+                    logger.error("Could not find Teams chat input area; leaving browser open for manual send")
                     return False
 
-            # Compose message: subject as bold (Teams may accept simple plaintext)
-            try:
-                # Focus the editable area and send subject + two newlines + body
-                editable.click()
-                # Some Teams instances require using Keys.CONTROL + Enter for newline; we'll use Enter for sending at the end.
-                subject = (subject_title or "Reminder").strip()
-                # Convert HTML -> plaintext naive fallback (strip tags)
-                text_body = re.sub(r"<[^>]+>", "", html_body or "")
-                to_send = f"{subject}\n\n{text_body}"
-                editable.send_keys(to_send)
-                time.sleep(0.5)
-                # Press Enter to send
-                editable.send_keys(Keys.ENTER)
-                logger.info("Browser automation: Teams message queued/sent for %s (task=%s)", to_address, task_id)
-                # give it a moment to send
-                time.sleep(2)
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                return True
-            except Exception:
-                logger.exception("Failed to type/send message via Teams web automation")
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                return False
+            # Compose plain text fallback from HTML
+            text_body = re.sub(r"<[^>]+>", "", html_body or "")
+            subject = (subject_title or "Reminder").strip()
+            to_send = f"{subject}\n\n{text_body}"
 
+            # click and send
+            try:
+                editable.click()
+            except Exception:
+                pass
+            # send message (typing then Enter)
+            editable.send_keys(to_send)
+            time.sleep(0.4)
+            editable.send_keys(Keys.ENTER)
+            logger.info("Browser automation: Teams message sent/queued to %s (task=%s)", to_address, task_id)
+            time.sleep(1.2)
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            # cleanup temp profile if created
+            if temp_profile_dir:
+                try:
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            return True
         except Exception:
-            logger.exception("Unhandled error in browser automation fallback for Teams")
+            logger.exception("Error while automating Teams web to send message")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            if temp_profile_dir:
+                try:
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                except Exception:
+                    pass
             return False
         finally:
-            # close file handler if we added one in this call (avoid duplicate handlers across calls)
             try:
-                if fh is not None:
-                    logging.getLogger().removeHandler(fh)
-                    fh.close()
+                if file_handler is not None:
+                    root_logger.removeHandler(file_handler)
+                    file_handler.close()
             except Exception:
                 pass
     # -------------------- Other CRUD helpers & Kanban --------------------
