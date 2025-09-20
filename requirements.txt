@@ -4,3 +4,7 @@ win10toast
 tkhtmlview
 tkcalendar
 ttkbootstrap
+msal
+requests
+pandas
+openpyxl
