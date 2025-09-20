@@ -22,8 +22,13 @@ import os
 import csv
 import subprocess
 import logging
-import threading
-import time
+import webbrowser
+import urllib.parse
+import urllib.request
+import os
+import subprocess
+import requests
+import msal
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
@@ -126,17 +131,6 @@ class TaskDB:
         self._init_db()
 
     def _init_db(self):
-
-        # inside TaskDB._init_db (or early startup)
-        try:
-            cur.execute("PRAGMA table_info(tasks);")
-            cols = [r[1] for r in cur.fetchall()]
-            if "last_sent_entryid" not in cols:
-                cur.execute("ALTER TABLE tasks ADD COLUMN last_sent_entryid TEXT;")
-                self.conn.commit()
-        except Exception:
-            pass
-
         cur = self.conn.cursor()
         # Primary tasks table
         cur.execute(
@@ -430,10 +424,6 @@ class TaskApp(tk.Tk):
         self.geometry("1400x850")
         self.db = TaskDB()
         self.settings = load_settings()
-                # in __init__ after self.settings = load_settings()
-        # cache signature & Outlook app to avoid repeated Dispatch() calls
-        self._cached_signature = None
-        self._outlook_app = None
 
         # init style & theme
         self._init_styles()
@@ -823,6 +813,61 @@ class TaskApp(tk.Tk):
         except Exception:
             pass
 
+
+
+    ###
+    def _create_filter_bar(self, parent):
+        """
+        Creates the shared filter bar in the given parent frame.
+        Uses the same self.filter_* variables used by Task List so filters are global.
+        """
+        # Ensure filter variables exist (they are created for Task List normally; create if missing)
+        if not hasattr(self, "filter_text_var"):
+            self.filter_text_var = tk.StringVar(value="")
+        if not hasattr(self, "filter_priority_var"):
+            self.filter_priority_var = tk.StringVar(value="All")
+        if not hasattr(self, "filter_status_var"):
+            self.filter_status_var = tk.StringVar(value="All")
+        if not hasattr(self, "filter_show_completed_var"):
+            self.filter_show_completed_var = tk.StringVar(value="Yes")
+        if not hasattr(self, "filter_due_var"):
+            self.filter_due_var = tk.StringVar(value="")
+
+        filter_frame = ttk.Frame(parent, padding=(6, 4))
+        filter_frame.pack(fill=tk.X, padx=6, pady=(6, 4))
+
+        ttk.Label(filter_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
+        search_entry = ttk.Entry(filter_frame, textvariable=self.filter_text_var, width=30)
+        search_entry.pack(side=tk.LEFT)
+        search_entry.bind("<KeyRelease>", lambda e: self._apply_filters())
+
+        ttk.Label(filter_frame, text="Priority:").pack(side=tk.LEFT, padx=(12, 4))
+        pri_vals = ["All"] + PRIORITIES
+        pri_cb = ttk.Combobox(filter_frame, textvariable=self.filter_priority_var, values=pri_vals, width=10, state="readonly")
+        pri_cb.pack(side=tk.LEFT)
+        pri_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
+
+        ttk.Label(filter_frame, text="Status:").pack(side=tk.LEFT, padx=(12, 4))
+        stat_vals = ["All"] + STATUSES
+        stat_cb = ttk.Combobox(filter_frame, textvariable=self.filter_status_var, values=stat_vals, width=12, state="readonly")
+        stat_cb.pack(side=tk.LEFT)
+        stat_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
+
+        ttk.Label(filter_frame, text="Show Completed:").pack(side=tk.LEFT, padx=(12, 4))
+        show_vals = ["Yes", "No"]
+        show_cb = ttk.Combobox(filter_frame, textvariable=self.filter_show_completed_var, values=show_vals, width=6, state="readonly")
+        show_cb.pack(side=tk.LEFT)
+        show_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
+
+        ttk.Label(filter_frame, text="Due on (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12, 4))
+        due_entry = ttk.Entry(filter_frame, textvariable=self.filter_due_var, width=12)
+        due_entry.pack(side=tk.LEFT)
+
+        ttk.Button(filter_frame, text="Apply", command=self._apply_filters).pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(filter_frame, text="Clear", command=self._clear_filters).pack(side=tk.LEFT)
+
+        return filter_frame
+
     # -------------------- UI / CRUD / Kanban --------------------
     def _build_ui(self):
         toolbar = ttk.Frame(self, padding=8)
@@ -862,8 +907,11 @@ class TaskApp(tk.Tk):
             display_cols = ["id", "title", "due", "priority", "status", "responsible", "reminder"]
 
         # Filter bar
-        filter_frame = ttk.Frame(list_tab, padding=(6, 4))
-        filter_frame.pack(fill=tk.X, padx=6, pady=(6, 4))
+        #filter_frame = ttk.Frame(list_tab, padding=(6, 4))
+
+        # Reusable filter bar (Task List)
+        self._create_filter_bar(list_tab)
+        """/* filter_frame.pack(fill=tk.X, padx=6, pady=(6, 4))
 
         ttk.Label(filter_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
         self.filter_text_var = tk.StringVar(value="")
@@ -899,7 +947,7 @@ class TaskApp(tk.Tk):
 
         ttk.Button(filter_frame, text="Apply", command=self._apply_filters).pack(side=tk.LEFT, padx=(12, 4))
         ttk.Button(filter_frame, text="Clear", command=self._clear_filters).pack(side=tk.LEFT)
-
+        """
         # Treeview
         self.tree = ttk.Treeview(list_tab, columns=cols, show="headings", displaycolumns=display_cols)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -949,6 +997,8 @@ class TaskApp(tk.Tk):
 
         # Kanban tab
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
+                # Add the shared filter bar to Kanban
+        self._create_filter_bar(self.kanban_tab)
         self.notebook.add(self.kanban_tab, text="Kanban Board")
 
         frame = ttk.Frame(self.kanban_tab)
@@ -1013,6 +1063,8 @@ class TaskApp(tk.Tk):
 
         # Trash tab
         trash_tab = ttk.Frame(self.notebook)
+                # Add the shared filter bar to Trash
+        self._create_filter_bar(trash_tab)
         self.notebook.add(trash_tab, text="Trash")
 
         trash_toolbar = ttk.Frame(trash_tab, padding=6)
@@ -1364,10 +1416,80 @@ class TaskApp(tk.Tk):
                 
         row += 1
 
-        # Centered Send Reminder Now button
-        send_btn = ttk.Button(content_frame, text="Send Reminder Now (Outlook)", command=_send_now_action)
-        send_btn.grid(row=row, column=0, columnspan=6, pady=(10, 0))
+        """# Centered Send Reminder Now button
+        # Centered Send Reminder Now buttons (Outlook + Teams)
+        btn_frame_send = ttk.Frame(content_frame)
+        btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
+        # Outlook send (existing behavior)
+        send_btn = ttk.Button(btn_frame_send, text="Send Reminder Now (Outlook)", command=_send_now_action)
+        send_btn.pack(side=tk.LEFT, padx=(0,10))
+        """
+        # Teams send
+        def _send_teams_now_action():
+            html_body = email_body_text.get("1.0", tk.END).strip()
+            if not html_body:
+                res = messagebox.askyesno("Send Empty Body?", "Reminder body is empty. Send anyway?")
+                if not res:
+                    return
+            # determine recipient the same way as for email
+            label = responsible_var.get().strip()
+            recipient = None
+            if label and hasattr(responsible_cb, "lookup_map"):
+                cid = responsible_cb.lookup_map.get(label)
+                if cid:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
+                    rowc = cur.fetchone()
+                    if rowc and rowc["email"]:
+                        recipient = rowc["email"]
+            if not recipient:
+                # ask user to enter an email or webhook URL
+                recipient = simpledialog.askstring("Recipient", "Enter recipient email address or Teams webhook URL:", parent=win)
+                if not recipient:
+                    messagebox.showinfo("Aborted", "No recipient provided; aborting Teams send.", parent=win)
+                    return
+
+            # format body for Teams: subject as bold heading then two blank lines then body
+            subject = title_var.get().strip() or "Task Reminder"
+            body = html_body  # plain text or HTML - webhook will display as markdown/text
+            ok = self._send_teams_reminder(task_id or 0, recipient, subject, body)
+            if ok:
+                messagebox.showinfo("Teams", "Teams reminder delivered (or chat opened).", parent=win)
+            else:
+                messagebox.showerror("Teams", "Failed to deliver Teams reminder (see logs).", parent=win)
+        # inside _open_edit_window where you have _send_now_action
+                # Centered Send Reminder Now button
+                    # Centered Send Reminder Now buttons (Outlook + Teams)
+                    # --- Create the Send buttons (Outlook + Teams) ---
+        # Make a small debug log so we can verify this code runs
+                    # --- Create the Send buttons (Outlook + Teams) ---
+        try:
+            logger.debug("_open_edit_window: creating send buttons (Outlook + Teams)")
+        except Exception:
+            pass
+
+        btn_frame_send = ttk.Frame(content_frame)
+        btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
+
+        # Outlook send (existing behavior)
+        try:
+            send_btn = ttk.Button(btn_frame_send, text="Send Reminder Now (Outlook)", command=_send_now_action)
+            send_btn.pack(side=tk.LEFT, padx=(0, 10))
+        except Exception:
+            logger.exception("Failed to create Outlook send button")
+
+        # Teams send (use the _send_teams_now_action defined above)
+        try:
+            teams_btn = ttk.Button(btn_frame_send, text="Send Teams Reminder Now", command=_send_teams_now_action)
+            teams_btn.pack(side=tk.LEFT, padx=(0, 10))
+        except Exception:
+            logger.exception("Failed to create Teams send button")
+
+        # advance layout row index
         row += 1
+        
+
+
         # .pack(side=tk.LEFT, padx=6)
         # Attachments
         ttk.Label(content_frame, text="Attachments").grid(row=row, column=0, sticky="nw", pady=(10, 0))
@@ -1607,6 +1729,166 @@ class TaskApp(tk.Tk):
             _on_frame_configure()
         win.bind("<Configure>", _on_win_configure)
 
+
+    ###
+
+    # Add this method to TaskApp
+    def _send_teams_reminder(self, task_id, to_address, subject_title, html_body):
+        """
+        Send a Teams chat message to `to_address` (email) using Microsoft Graph.
+        Uses MSAL device code flow for a delegated user token (the signed-in user will be the sender).
+        Returns True on success, False on failure.
+        """
+
+        # Basic validation
+        if not to_address:
+            logger.warning("No recipient email provided for Teams message")
+            return False
+
+        # Read Graph/MSAL config from settings (store client_id + tenant in settings.json)
+        cfg = self.settings.get("graph", {})  # e.g. {"client_id": "...", "tenant_id": "...", "scopes": ["User.Read","Chat.ReadWrite"]}
+        client_id = cfg.get("client_id")
+        tenant = cfg.get("tenant_id") or cfg.get("tenant")
+        scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
+
+        if not client_id or not tenant:
+            logger.error("Graph/MSAL config missing in settings.json (client_id / tenant_id)")
+            return False
+
+        authority = f"https://login.microsoftonline.com/{tenant}"
+
+        try:
+            # Build MSAL public client and try silent token first (cache)
+            cache = msal.SerializableTokenCache()
+            token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
+            if os.path.exists(token_cache_file):
+                try:
+                    cache.deserialize(open(token_cache_file, "r").read())
+                except Exception:
+                    pass
+
+            app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
+
+            # Try to get token silently from cache first
+            accounts = app.get_accounts()
+            result = None
+            if accounts:
+                try:
+                    result = app.acquire_token_silent(scopes, account=accounts[0])
+                except Exception:
+                    result = None
+
+            # If no cached token, use device code flow (interactive once)
+            if not result:
+                flow = app.initiate_device_flow(scopes=scopes)
+                if "user_code" not in flow:
+                    logger.error("Failed to initiate device flow: %s", flow)
+                    return False
+                # show instructions to operator (small blocking dialog)
+                messagebox.showinfo("Sign in required", f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
+                # Acquire token by polling
+                result = app.acquire_token_by_device_flow(flow)  # blocks until complete or error
+
+                # persist cache
+                try:
+                    with open(token_cache_file, "w") as fh:
+                        fh.write(cache.serialize())
+                except Exception:
+                    pass
+
+            if "access_token" not in result:
+                logger.error("Could not obtain Graph access token: %s", result.get("error_description", result))
+                return False
+
+            access_token = result["access_token"]
+            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+            # 1) Resolve recipient user object by email
+            # Use /users/{email} (URL-encoded email) to find the user principal
+            user_get = requests.get(f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}", headers=headers)
+            if user_get.status_code == 404:
+                logger.error("Teams user not found for email %s", to_address)
+                return False
+            user_get.raise_for_status()
+            user_obj = user_get.json()
+            recipient_id = user_obj.get("id")
+            if not recipient_id:
+                logger.error("Could not resolve user id for %s", to_address)
+                return False
+
+            # 2) Get sender id (/me)
+            me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
+            me_r.raise_for_status()
+            me_obj = me_r.json()
+            me_id = me_obj.get("id")
+
+            # 3) Create or find a oneOnOne chat with the recipient
+            # A simple approach: try to create a chat - Graph returns 201 and chat id if new, or 409 if exists.
+            create_chat_payload = {
+                "chatType": "oneOnOne",
+                "members": [
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{me_id}')"
+                    },
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{recipient_id}')"
+                    }
+                ]
+            }
+            # POST /chats
+            create_r = requests.post("https://graph.microsoft.com/v1.0/chats", headers=headers, json=create_chat_payload)
+            if create_r.status_code in (200, 201):
+                chat = create_r.json()
+                chat_id = chat.get("id")
+            else:
+                # If failed because chat already exists, try to search /users/{me}/chats or list chats and pick one that contains recipient_id.
+                logger.debug("Create chat status: %s - trying to locate existing chat", create_r.status_code)
+                list_chats = requests.get("https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
+                list_chats.raise_for_status()
+                chat_id = None
+                for c in list_chats.json().get("value", []):
+                    # check members for recipient
+                    try:
+                        members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers)
+                        members_r.raise_for_status()
+                        for m in members_r.json().get("value", []):
+                            if m.get("userId") == recipient_id:
+                                chat_id = c["id"]
+                                break
+                        if chat_id:
+                            break
+                    except Exception:
+                        continue
+                if not chat_id:
+                    logger.error("Could not create or find a chat with %s (create status=%s)", to_address, create_r.status_code)
+                    return False
+
+            # 4) Send message to chat: contentType html, content = bold subject + two <br> + body
+            safe_subject = (subject_title or "Reminder").strip()
+            # ensure html body string is safe-ish (you can further sanitize if desired)
+            message_html = f"<b>{safe_subject}</b><br><br>{html_body or ''}"
+
+            send_payload = {
+                "body": {
+                    "contentType": "html",
+                    "content": message_html
+                }
+            }
+            send_r = requests.post(f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json=send_payload)
+            if send_r.status_code in (200, 201):
+                logger.info("Teams message sent to %s (task=%s)", to_address, task_id)
+                return True
+            else:
+                logger.error("Failed to send Teams message: status=%s body=%s", send_r.status_code, send_r.text)
+                return False
+
+        except Exception:
+            logger.exception("Unhandled error sending Teams reminder")
+            return False
     # -------------------- Other CRUD helpers & Kanban --------------------
 
         # Recurrence helpers
@@ -1765,10 +2047,6 @@ class TaskApp(tk.Tk):
     ##
     # add this method to TaskApp (anywhere inside the class)
     def _global_kanban_double_click(self, event):
-        """
-        Fallback double-click handler: climb parents and look for a widget annotated with
-        _kanban_task_id. This is more robust than identity comparisons.
-        """
         try:
             logger.debug("global handler invoked: widget=%s coords=(%s,%s) type=%s",
                         getattr(event, "widget", None),
@@ -1779,14 +2057,38 @@ class TaskApp(tk.Tk):
             x = getattr(event, "x_root", None)
             y = getattr(event, "y_root", None)
 
-            # Choose widget from coords if available, otherwise fallback to event.widget
             widget = None
             if x is not None and y is not None:
                 widget = self.winfo_containing(x, y)
                 logger.debug("winfo_containing -> %s", widget)
+
             if not widget:
                 widget = getattr(event, "widget", None)
                 logger.debug("using event.widget -> %s", widget)
+
+            # If we hit a Canvas, try to resolve an embedded window/frame at the canvas coords
+            if isinstance(widget, tk.Canvas):
+                try:
+                    # convert screen coords to canvas coords
+                    cx = widget.canvasx(x - widget.winfo_rootx())
+                    cy = widget.canvasy(y - widget.winfo_rooty())
+                    items = widget.find_overlapping(cx, cy, cx, cy)
+                    for it in items:
+                        try:
+                            win_name = widget.itemcget(it, "window")
+                            if win_name:
+                                try:
+                                    child = widget.nametowidget(win_name)
+                                    if child:
+                                        widget = child
+                                        logger.debug("Resolved embedded child widget %s from canvas item %s", child, it)
+                                        break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             if not widget:
                 logger.debug("no widget under pointer; aborting")
@@ -1814,13 +2116,11 @@ class TaskApp(tk.Tk):
                             return
                 except Exception:
                     logger.exception("Error inspecting widget for kanban id")
-                # climb to parent
                 try:
                     cur = getattr(cur, "master", None)
                 except Exception:
                     break
 
-            # If we get here, no annotated widget found; log the chain to help debugging
             logger.debug("No kanban task id found in parent chain. widget chain: %s", " -> ".join(chain))
         except Exception:
             logger.exception("Unhandled error in global kanban double-click handler")
@@ -1985,7 +2285,19 @@ class TaskApp(tk.Tk):
             except ValueError:
                 messagebox.showwarning("Filter", "Due Date filter must be YYYY-MM-DD")
                 return
-        self._populate()
+        # Refresh all views so filters are applied everywhere
+        try:
+            self._populate()
+        except Exception:
+            logger.exception("Error populating Task List from _apply_filters")
+        try:
+            self._populate_kanban()
+        except Exception:
+            logger.exception("Error populating Kanban from _apply_filters")
+        try:
+            self._populate_trash()
+        except Exception:
+            logger.exception("Error populating Trash from _apply_filters")
 
     def _clear_filters(self):
         if hasattr(self, "filter_text_var"):
@@ -2477,10 +2789,41 @@ class TaskApp(tk.Tk):
         except Exception:
             self.kanban_item_map = {status: [] for status in STATUSES}
 
+        
+        ###
         try:
-            rows = self.db.fetch()
+            all_rows = self.db.fetch()
         except Exception:
-            rows = []
+            all_rows = []
+
+        ft = (self.filter_text_var.get().strip().lower() if hasattr(self, "filter_text_var") else "").strip()
+        fpri = (self.filter_priority_var.get() if hasattr(self, "filter_priority_var") else "All")
+        fstat = (self.filter_status_var.get() if hasattr(self, "filter_status_var") else "All")
+        fdue = (self.filter_due_var.get().strip() if hasattr(self, "filter_due_var") else "").strip()
+        fshow_completed = (self.filter_show_completed_var.get() if hasattr(self, "filter_show_completed_var") else "Yes")
+
+        def _row_matches_for_kanban(r):
+            if ft:
+                hay = ((r["title"] or "") + " " + (r["description"] or "")).lower()
+                if ft not in hay:
+                    return False
+            if fpri and fpri != "All":
+                if (r["priority"] or "") != fpri:
+                    return False
+            if fstat and fstat != "All":
+                if (r["status"] or "") != fstat:
+                    return False
+            if fdue:
+                try:
+                    if (r["due_date"] or "") != fdue:
+                        return False
+                except Exception:
+                    return False
+            if fshow_completed == "No" and (r["status"] or "").lower() == "done":
+                return False
+            return True
+
+        rows = [r for r in all_rows if _row_matches_for_kanban(r)]
 
         groups = {}
         for r in rows:
@@ -2693,266 +3036,144 @@ class TaskApp(tk.Tk):
         self._populate_kanban()
 
     # -------------------- Outlook integration --------------------
-    def _load_outlook_signature(self):
-        """Try to load the default HTML signature from the user's Signatures folder (Windows)."""
-        try:
-            if os.name != "nt":
-                return ""
-            appdata = os.getenv("APPDATA")
-            if not appdata:
-                return ""
-            sig_dir = os.path.join(appdata, "Microsoft", "Signatures")
-            if not os.path.isdir(sig_dir):
-                return ""
-            # pick the first .htm or .html signature
-            for fn in os.listdir(sig_dir):
-                if fn.lower().endswith(".htm") or fn.lower().endswith(".html"):
-                    try:
-                        with open(os.path.join(sig_dir, fn), "r", encoding="utf-8", errors="ignore") as f:
-                            return f.read()
-                    except Exception:
-                        continue
-        except Exception:
-            logger.exception("Signature load error")
-        return ""
-
-    def _send_reminder_email(self, task_id, to_address, subject_title, html_body, debug_sync=False):
+    def _send_reminder_email(self, task_id, to_address, subject_title, html_body):
         """
-        Send an HTML reminder email via Outlook while preserving thread & avoiding duplicate signature.
-        If debug_sync=True the worker runs synchronously and returns the real result (useful for debugging).
-        Returns True if send initiated (or succeeded in sync mode), False on error.
+        Send an HTML reminder email via Outlook to `to_address`.
+        Behavior:
+         - If a previous reminder was sent and we stored its EntryID (reminder_mail_entryid),
+           reply to that message (Reply()) so Outlook keeps the conversation/thread.
+         - Otherwise create a new mail using subject_title (no extra "Reminder:" prefix)
+           and set ConversationTopic when possible, then store its EntryID for future replies.
+        Returns True on success, False otherwise.
         """
         if not HAS_OUTLOOK:
             logger.debug("Outlook not available; cannot send reminder email.")
             return False
 
-        # ensure cached signature loaded once
         try:
-            if self._cached_signature is None:
-                self._cached_signature = self._load_outlook_signature() or ""
+            ol_app = win32com.client.Dispatch("Outlook.Application")
+            ns = ol_app.GetNamespace("MAPI")
         except Exception:
-            self._cached_signature = ""
+            logger.exception("Failed to initialize Outlook COM objects")
+            return False
 
-        def _worker_body():
+        # Normalize subject: keep exactly the conversation subject you want threaded
+        conv_subject = (subject_title or "Reminder").strip()
+
+        # Attempt to read stored reminder EntryID
+        entry_id = None
+        try:
+            if task_id:
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT reminder_mail_entryid FROM tasks WHERE id=?", (task_id,))
+                row = cur.fetchone()
+                if row and row["reminder_mail_entryid"]:
+                    entry_id = row["reminder_mail_entryid"]
+        except Exception:
+            logger.exception("Could not read reminder_mail_entryid")
+
+        # Helper to get signature HTML using a probe item (best-effort)
+        def _get_signature():
             try:
-                # lazy init Outlook.Application once per process
+                probe = ol_app.CreateItem(0)
+                probe.Display(False)
+                sig = probe.HTMLBody or ""
                 try:
-                    if self._outlook_app is None:
-                        self._outlook_app = win32com.client.Dispatch("Outlook.Application")
-                    ol = self._outlook_app
-                    ns = ol.GetNamespace("MAPI")
-                except Exception as e:
-                    logger.exception("Outlook COM dispatch failed")
-                    return False, f"COM dispatch failed: {e}"
-
-                # fetch task metadata (outlook_id and last_sent_entryid if present)
-                try:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT outlook_id, last_sent_entryid FROM tasks WHERE id=?", (task_id,))
-                    row = cur.fetchone()
-                    outlook_entryid = row["outlook_id"] if row and "outlook_id" in row.keys() else None
-                    last_sent_entryid = row["last_sent_entryid"] if row and "last_sent_entryid" in row.keys() else None
+                    probe.Close(0)
                 except Exception:
-                    outlook_entryid = None
-                    last_sent_entryid = None
+                    pass
+                return sig
+            except Exception:
+                return ""
 
-                def _get_item_by_entryid(eid):
-                    if not eid:
-                        return None
-                    try:
-                        return ns.GetItemFromID(eid)
-                    except Exception:
-                        try:
-                            inbox = ns.GetDefaultFolder(6)
-                            return inbox.Items.Find(f"[EntryID] = '{eid}'")
-                        except Exception:
-                            return None
+        signature_html = _get_signature()
 
+        # If we have an entry_id, try to get that item and reply to it (keeps thread)
+        if entry_id:
+            try:
+                orig_item = ns.GetItemFromID(entry_id)
+            except Exception:
                 orig_item = None
-                if last_sent_entryid:
-                    try:
-                        orig_item = _get_item_by_entryid(last_sent_entryid)
-                    except Exception:
-                        orig_item = None
-                if orig_item is None and outlook_entryid:
-                    try:
-                        orig_item = _get_item_by_entryid(outlook_entryid)
-                    except Exception:
-                        orig_item = None
 
-                base_subject = f"Reminder: {subject_title or 'Task Reminder'}"
-                safe_html = (html_body or "").strip()
-
-                def _save_sent_entryid(eid):
-                    try:
-                        with self.db.conn:
-                            self.db.conn.execute("UPDATE tasks SET last_sent_entryid=? WHERE id=?", (eid, task_id))
-                    except Exception:
-                        logger.exception("Failed to persist last_sent_entryid")
-
-                # Try to reply to previous message to preserve thread
-                if orig_item is not None:
-                    try:
-                        reply = None
-                        try:
-                            reply = orig_item.Reply()
-                        except Exception:
-                            try:
-                                reply = orig_item.ReplyAll()
-                            except Exception:
-                                reply = None
-
-                        if reply is not None:
-                            # override recipient if explicit
-                            if to_address:
-                                try:
-                                    reply.To = to_address
-                                except Exception:
-                                    pass
-
-                            final_body = safe_html
-                            sig = self._cached_signature or ""
-
-                            try:
-                                existing_reply_html = (reply.HTMLBody or "")
-                            except Exception:
-                                existing_reply_html = ""
-
-                            # append signature only if it's not already present in the composed body
-                            append_sig = False
-                            if sig:
-                                def _norm(s): return re.sub(r"\s+", " ", (s or "")).strip()
-                                try:
-                                    if _norm(sig) not in _norm(final_body[-len(sig) - 500:]):
-                                        append_sig = True
-                                except Exception:
-                                    append_sig = True
-
-                            if append_sig:
-                                final_body = final_body + "\n\n" + sig
-
-                            # try to place our composed HTML before the quoted content
-                            try:
-                                combined = final_body + (existing_reply_html or "")
-                                reply.HTMLBody = combined
-                            except Exception:
-                                try:
-                                    reply.Body = re.sub(r"<[^>]+>", "", final_body) + "\n\n" + (reply.Body or "")
-                                except Exception:
-                                    pass
-
-                            # Try sending directly; fallback to Display + Send only if necessary
-                            try:
-                                reply.Send()
-                            except Exception:
-                                try:
-                                    reply.Display(False)
-                                    reply.Send()
-                                except Exception as e:
-                                    logger.exception("Failed to send reply (after Display fallback)")
-                                    return False, f"Send failed: {e}"
-
-                            # attempt to capture EntryID
-                            sent_entryid = None
-                            try:
-                                sent_entryid = getattr(reply, "EntryID", None)
-                            except Exception:
-                                sent_entryid = None
-
-                            if not sent_entryid:
-                                # scan recent Sent Items for a match (best-effort)
-                                try:
-                                    sent_folder = ns.GetDefaultFolder(5)  # olFolderSentMail
-                                    items = sent_folder.Items
-                                    items.Sort("[SentOn]", True)
-                                    max_scan = 20
-                                    scanned = 0
-                                    for it in items:
-                                        if scanned >= max_scan:
-                                            break
-                                        scanned += 1
-                                        try:
-                                            subj = (it.Subject or "").lower()
-                                            if subj and (subj == (orig_item.Subject or "").lower() or base_subject.lower() in subj):
-                                                recips = getattr(it, "To", "") or ""
-                                                if to_address and to_address.lower() not in recips.lower():
-                                                    continue
-                                                sent_entryid = getattr(it, "EntryID", None)
-                                                if sent_entryid:
-                                                    break
-                                        except Exception:
-                                            continue
-                                except Exception:
-                                    sent_entryid = None
-
-                            if sent_entryid:
-                                _save_sent_entryid(sent_entryid)
-                            return True, None
-                    except Exception:
-                        logger.exception("Failed to reply to original item; will fall back to new mail")
-
-                # Create new mail if reply isn't possible
+            if orig_item is not None:
                 try:
-                    mail = ol.CreateItem(0)
-                    mail.To = to_address or ""
-                    mail.Subject = base_subject
-                    final_body = safe_html
-                    if self._cached_signature and self._cached_signature not in final_body:
-                        final_body = final_body + "\n\n" + self._cached_signature
+                    # Use Reply() to preserve the thread/topic; change to ReplyAll() to include all recipients.
+                    reply = orig_item.Reply()
+                    # Prepend our HTML content but preserve the quoted body that Reply() provides.
                     try:
-                        mail.HTMLBody = final_body
+                        reply.HTMLBody = (html_body or "") + signature_html + (reply.HTMLBody or "")
                     except Exception:
-                        try:
-                            mail.Body = re.sub(r"<[^>]+>", "", final_body)
-                        except Exception:
-                            mail.Body = final_body
+                        reply.Body = (html_body or "") + "\n\n" + (reply.Body or "")
+                    reply.Send()
 
+                    # After sending a reply, EntryID might change (a sent item has an EntryID).
                     try:
-                        mail.Send()
+                        new_eid = getattr(reply, "EntryID", None)
+                        if new_eid and task_id:
+                            try:
+                                self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (new_eid, task_id))
+                                self.db.conn.commit()
+                            except Exception:
+                                logger.exception("Could not update reminder_mail_entryid after reply")
                     except Exception:
-                        try:
-                            mail.Display(False)
-                            mail.Send()
-                        except Exception as e:
-                            logger.exception("Failed to send new mail")
-                            return False, f"Send failed (new mail): {e}"
+                        pass
 
+                    logger.info("Replied to existing reminder mail for task %s -> %s", task_id, to_address)
+                    return True
+                except Exception:
+                    logger.exception("Failed to reply to existing mail; will fallback to creating a new mail")
+                    # fall through to create new mail
+
+        # No existing thread (or reply failed) => create a new mail and ensure subject matches conv_subject
+        try:
+            mail = ol_app.CreateItem(0)  # olMailItem
+            mail.To = to_address or ""
+            # Use the exact conversation subject (no extra "Reminder:" prefix)
+            mail.Subject = conv_subject
+            # Try to set ConversationTopic to help Outlook thread grouping (best-effort)
+            try:
+                # Some Outlook object models expose ConversationTopic; set if present
+                try:
+                    setattr(mail, "ConversationTopic", conv_subject)
+                except Exception:
+                    # If attribute can't be set, ignore silently
+                    pass
+            except Exception:
+                pass
+
+            # Display briefly to get signature then send
+            try:
+                mail.Display(False)
+                base_sig = mail.HTMLBody or ""
+                mail.HTMLBody = (html_body or "") + base_sig
+                mail.Send()
+            except Exception:
+                # fallback: send without signature if display failed
+                try:
+                    mail.HTMLBody = html_body or ""
+                    mail.Send()
+                except Exception:
+                    logger.exception("Failed to send new reminder mail")
+                    return False
+
+            # Store EntryID on the task for future replies (if we have a real task row)
+            try:
+                eid = getattr(mail, "EntryID", None)
+                if eid and task_id:
                     try:
-                        eid = getattr(mail, "EntryID", None)
-                        if eid:
-                            _save_sent_entryid(eid)
+                        self.db.conn.execute("UPDATE tasks SET reminder_mail_entryid=? WHERE id=?", (eid, task_id))
+                        self.db.conn.commit()
                     except Exception:
-                        logger.exception("Could not persist new mail EntryID")
+                        logger.exception("Failed to store reminder_mail_entryid")
+            except Exception:
+                pass
 
-                    return True, None
-                except Exception as e:
-                    logger.exception("Failed to create/send new mail")
-                    return False, f"Create/send failed: {e}"
+            logger.info("Sent new reminder mail to %s for task %s (subject=%s)", to_address, task_id, conv_subject)
+            return True
 
-            except Exception as e:
-                logger.exception("Unhandled error in reminder send worker")
-                return False, f"Unhandled worker error: {e}"
-
-        # debug synchronous mode
-        if debug_sync:
-            ok, err = _worker_body()
-            if not ok:
-                logger.error("Synchronous send failed: %s", err)
-            else:
-                logger.info("Synchronous send succeeded")
-            return ok
-
-        # run in background thread for normal operation
-        def _thread_wrapper():
-            ok, err = _worker_body()
-            if not ok:
-                logger.error("Background send failed for task %s: %s", task_id, err)
-            else:
-                logger.info("Background send succeeded for task %s", task_id)
-
-        t = threading.Thread(target=_thread_wrapper, daemon=True)
-        t.start()
-        return True
+        except Exception:
+            logger.exception("Failed to create/send Outlook mail")
+            return False
 
     def _get_flagged_from_folder(self, folder, flagged):
         """Recursively fetch flagged mails from a folder + subfolders"""
@@ -3246,6 +3467,34 @@ class TaskApp(tk.Tk):
             rows = self.db.fetch_deleted()
         except Exception:
             rows = []
+
+        # Apply same global filters to Trash view
+        ft = (self.filter_text_var.get().strip().lower() if hasattr(self, "filter_text_var") else "").strip()
+        fpri = (self.filter_priority_var.get() if hasattr(self, "filter_priority_var") else "All")
+        fstat = (self.filter_status_var.get() if hasattr(self, "filter_status_var") else "All")
+        fdue = (self.filter_due_var.get().strip() if hasattr(self, "filter_due_var") else "").strip()
+
+        def _trash_row_matches(r):
+            if ft:
+                hay = ((r["title"] or "") + " " + (r["title"] or "")).lower()
+                if ft not in hay:
+                    return False
+            if fpri and fpri != "All":
+                if (r["priority"] or "") != fpri:
+                    return False
+            if fstat and fstat != "All":
+                if (r["status"] or "") != fstat:
+                    return False
+            if fdue:
+                try:
+                    if (r["due_date"] or "") != fdue:
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        rows = [r for r in rows if _trash_row_matches(r)]
+
         for r in rows:
             try:
                 deleted_at = r["deleted_at"] or "?"
