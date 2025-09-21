@@ -28,7 +28,6 @@ import urllib.request
 import os
 import subprocess
 import requests
-import msal
 from datetime import datetime, date, timedelta
 
 # ---- Persistent file logging (next to the app/exe) ----
@@ -106,10 +105,8 @@ SETTINGS_FILE = "settings.json"
 PRIORITIES = ["Low", "Medium", "High"]
 STATUSES = ["Pending", "In-Progress", "Done"]
 
-
 def _now_iso():
     return datetime.now().isoformat(timespec="seconds")
-
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
@@ -120,11 +117,9 @@ def load_settings():
             logger.exception("Could not load settings.json")
     return {"outlook_refresh_minutes": 30, "show_description": False}
 
-
 def save_settings(settings):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f)
-
 
 def _safe_show_toast(title, msg, duration=5):
     """
@@ -138,7 +133,6 @@ def _safe_show_toast(title, msg, duration=5):
         toaster.show_toast(title, (msg or "")[:200], duration=duration, threaded=True)
     except Exception:
         logger.exception("Toast error (ignored)")
-
 
 # -------------------- Database --------------------
 class TaskDB:
@@ -439,7 +433,6 @@ class TaskDB:
                 (now, now, task_id),
             )
 
-
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
     def __init__(self):
@@ -486,7 +479,6 @@ class TaskApp(tk.Tk):
             logger.exception("Failed to bind global double-click")
 
         
-
 
         # Key bindings
         try:
@@ -837,8 +829,6 @@ class TaskApp(tk.Tk):
         except Exception:
             pass
 
-
-
     ###
     def _create_filter_bar(self, parent):
         """
@@ -1128,6 +1118,7 @@ class TaskApp(tk.Tk):
         Open popup for adding/editing a task.
         Reminder Email field is placed below the progress 'Add entry' area,
         and a 'Send Reminder Now (Outlook)' button is present.
+        (MS Teams send functionality removed.)
         """
         try:
             from tkcalendar import DateEntry  # type: ignore
@@ -1245,7 +1236,6 @@ class TaskApp(tk.Tk):
         row += 1
 
         # Responsible (dropdown) - choices will be set from DB
-        # Responsible (dropdown populated from contacts)
         ttk.Label(content_frame, text="Responsible (contact)").grid(row=row, column=0, sticky="w", pady=(12,0))
         responsible_var = tk.StringVar(value="")
         responsible_cb = ttk.Combobox(content_frame, textvariable=responsible_var, values=[], width=40, state="readonly")
@@ -1342,10 +1332,6 @@ class TaskApp(tk.Tk):
         _load_contacts_to_combobox()
         row += 1
 
-
-        # If there is a responsible_id stored, map it to the combobox label
-
-
         # Description (below)
         ttk.Label(content_frame, text="Description").grid(row=row, column=0, sticky="nw", pady=(6, 0))
         desc_text = tk.Text(content_frame, height=8, width=80, wrap="word")
@@ -1437,61 +1423,10 @@ class TaskApp(tk.Tk):
                 messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
             else:
                 messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
-                
+
         row += 1
 
-        """# Centered Send Reminder Now button
-        # Centered Send Reminder Now buttons (Outlook + Teams)
-        btn_frame_send = ttk.Frame(content_frame)
-        btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
-        # Outlook send (existing behavior)
-        send_btn = ttk.Button(btn_frame_send, text="Send Reminder Now (Outlook)", command=_send_now_action)
-        send_btn.pack(side=tk.LEFT, padx=(0,10))
-        """
-        # Teams send
-        def _send_teams_now_action():
-            html_body = email_body_text.get("1.0", tk.END).strip()
-            if not html_body:
-                res = messagebox.askyesno("Send Empty Body?", "Reminder body is empty. Send anyway?")
-                if not res:
-                    return
-            # determine recipient the same way as for email
-            label = responsible_var.get().strip()
-            recipient = None
-            if label and hasattr(responsible_cb, "lookup_map"):
-                cid = responsible_cb.lookup_map.get(label)
-                if cid:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
-                    rowc = cur.fetchone()
-                    if rowc and rowc["email"]:
-                        recipient = rowc["email"]
-            if not recipient:
-                # ask user to enter an email or webhook URL
-                recipient = simpledialog.askstring("Recipient", "Enter recipient email address or Teams webhook URL:", parent=win)
-                if not recipient:
-                    messagebox.showinfo("Aborted", "No recipient provided; aborting Teams send.", parent=win)
-                    return
-
-            # format body for Teams: subject as bold heading then two blank lines then body
-            subject = title_var.get().strip() or "Task Reminder"
-            body = html_body  # plain text or HTML - webhook will display as markdown/text
-            ok = self._send_teams_reminder(task_id or 0, recipient, subject, body)
-            if ok:
-                messagebox.showinfo("Teams", "Teams reminder delivered (or chat opened).", parent=win)
-            else:
-                messagebox.showerror("Teams", "Failed to deliver Teams reminder (see logs).", parent=win)
-        # inside _open_edit_window where you have _send_now_action
-                # Centered Send Reminder Now button
-                    # Centered Send Reminder Now buttons (Outlook + Teams)
-                    # --- Create the Send buttons (Outlook + Teams) ---
-        # Make a small debug log so we can verify this code runs
-                    # --- Create the Send buttons (Outlook + Teams) ---
-        try:
-            logger.debug("_open_edit_window: creating send buttons (Outlook + Teams)")
-        except Exception:
-            pass
-
+        # Create the Send button(s) frame - Teams removed
         btn_frame_send = ttk.Frame(content_frame)
         btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
 
@@ -1502,19 +1437,8 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Failed to create Outlook send button")
 
-        # Teams send (use the _send_teams_now_action defined above)
-        try:
-            teams_btn = ttk.Button(btn_frame_send, text="Send Teams Reminder Now", command=_send_teams_now_action)
-            teams_btn.pack(side=tk.LEFT, padx=(0, 10))
-        except Exception:
-            logger.exception("Failed to create Teams send button")
-
-        # advance layout row index
         row += 1
-        
 
-
-        # .pack(side=tk.LEFT, padx=6)
         # Attachments
         ttk.Label(content_frame, text="Attachments").grid(row=row, column=0, sticky="nw", pady=(10, 0))
         attachments_frame = ttk.Frame(content_frame)
@@ -1701,8 +1625,8 @@ class TaskApp(tk.Tk):
             try:
                 if task_id:
                     self.db.update(task_id, title, desc, due or None, priority_var.get(), status_var.get(),
-                                   reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso, recurrence=rec_store,
-                                   responsible_id=responsible_id_val, reminder_email_body=reminder_email_html)
+                                reminder_minutes=reminder_minutes_int, reminder_set_at=reminder_set_at_iso, recurrence=rec_store,
+                                responsible_id=responsible_id_val, reminder_email_body=reminder_email_html)
                     if staged_attachments:
                         cur = self.db.conn.cursor()
                         cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
@@ -1753,7 +1677,6 @@ class TaskApp(tk.Tk):
             _on_frame_configure()
         win.bind("<Configure>", _on_win_configure)
 
-
     ###
     def _http_request_log(method, url, headers=None, json_payload=None, params=None):
         """
@@ -1770,169 +1693,6 @@ class TaskApp(tk.Tk):
             logger.exception("HTTP %s %s failed", method, url)
             raise
     # Add this method to TaskApp
-    def _send_teams_reminder(self, task_id, to_address, subject_title, html_body):
-        """
-        Send Teams reminder. Try Graph/MSAL first (if configured). If that fails,
-        fall back to browser automation with Selenium.
-
-        This version attempts:
-        1) Use real Chrome user-data-dir (so already-logged-in Teams web session is used).
-        2) If Chrome fails to start (DevToolsActivePort / crash), retry with a temporary
-            user-data-dir (clean profile) so ChromeLauncher won't collide with an existing Chrome.
-        """
-        import os
-        import time
-        import tempfile
-        import shutil
-        import logging
-        import urllib.parse
-        import re
-
-        # setup file logging to app folder
-        try:
-            app_dir = os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            app_dir = os.getcwd()
-        log_path = os.path.join(app_dir, "oats_teams.log")
-        file_handler = None
-        try:
-            root_logger = logging.getLogger()
-            # ensure single handler for log_path
-            existing = [h for h in root_logger.handlers if getattr(h, "baseFilename", "") == log_path]
-            if not existing:
-                file_handler = logging.FileHandler(log_path, encoding="utf-8")
-                file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-                root_logger.addHandler(file_handler)
-                root_logger.setLevel(logging.DEBUG)
-        except Exception:
-            logger.exception("Could not install file logger")
-
-        logger.debug("Attempt send Teams reminder to %s (task=%s)", to_address, task_id)
-
-        # --- 1) Try Graph/MSAL (same approach you had) ---
-        try:
-            cfg = self.settings.get("graph", {})
-            client_id = cfg.get("client_id")
-            tenant = cfg.get("tenant_id") or cfg.get("tenant")
-            scopes = cfg.get("scopes") or ["User.Read", "Chat.ReadWrite"]
-
-            if client_id and tenant:
-                logger.debug("Graph config present, attempting MSAL Graph path")
-                try:
-                    import msal, requests
-                    authority = f"https://login.microsoftonline.com/{tenant}"
-                    cache = msal.SerializableTokenCache()
-                    token_cache_file = os.path.join(os.path.expanduser("~"), ".oats_graph_token_cache.bin")
-                    if os.path.exists(token_cache_file):
-                        try:
-                            cache.deserialize(open(token_cache_file, "r").read())
-                        except Exception:
-                            pass
-                    app = msal.PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
-                    accounts = app.get_accounts()
-                    result = None
-                    if accounts:
-                        try:
-                            result = app.acquire_token_silent(scopes, account=accounts[0])
-                        except Exception:
-                            result = None
-                    if not result:
-                        flow = app.initiate_device_flow(scopes=scopes)
-                        if "user_code" not in flow:
-                            logger.error("MSAL device flow initiation failed: %s", flow)
-                            result = None
-                        else:
-                            messagebox.showinfo("Sign in required", f"To send Teams messages, sign in at {flow['verification_uri']} and enter the code {flow['user_code']}")
-                            result = app.acquire_token_by_device_flow(flow)
-                            try:
-                                with open(token_cache_file, "w") as fhc:
-                                    fhc.write(cache.serialize())
-                            except Exception:
-                                pass
-
-                    if result and "access_token" in result:
-                        access_token = result["access_token"]
-                        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
-                        # Resolve user by email
-                        user_get = requests.get(f"https://graph.microsoft.com/v1.0/users/{requests.utils.requote_uri(to_address)}", headers=headers)
-                        if user_get.status_code == 404:
-                            logger.error("Graph: Teams user not found for email %s", to_address)
-                        else:
-                            user_get.raise_for_status()
-                            recipient_id = user_get.json().get("id")
-                            if recipient_id:
-                                me_r = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers); me_r.raise_for_status()
-                                me_id = me_r.json().get("id")
-                                create_chat_payload = {
-                                    "chatType": "oneOnOne",
-                                    "members": [
-                                        {
-                                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                                            "roles": ["owner"],
-                                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{me_id}')"
-                                        },
-                                        {
-                                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                                            "roles": ["owner"],
-                                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{recipient_id}')"
-                                        }
-                                    ]
-                                }
-                                create_r = requests.post("https://graph.microsoft.com/v1.0/chats", headers=headers, json=create_chat_payload)
-                                chat_id = None
-                                if create_r.status_code in (200, 201):
-                                    chat_id = create_r.json().get("id")
-                                else:
-                                    logger.debug("Graph: create chat responded %s; trying to locate existing chat", create_r.status_code)
-                                    list_chats = requests.get("https://graph.microsoft.com/v1.0/me/chats", headers=headers, params={"$top": 50})
-                                    list_chats.raise_for_status()
-                                    for c in list_chats.json().get("value", []):
-                                        try:
-                                            members_r = requests.get(f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members", headers=headers); members_r.raise_for_status()
-                                            for m in members_r.json().get("value", []):
-                                                if m.get("userId") == recipient_id:
-                                                    chat_id = c["id"]; break
-                                            if chat_id: break
-                                        except Exception:
-                                            continue
-                                if chat_id:
-                                    message_html = f"<b>{(subject_title or 'Reminder').strip()}</b><br><br>{html_body or ''}"
-                                    send_payload = {"body": {"contentType": "html", "content": message_html}}
-                                    send_r = requests.post(f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages", headers=headers, json=send_payload)
-                                    if send_r.status_code in (200, 201):
-                                        logger.info("Graph: Teams message sent to %s (task=%s)", to_address, task_id)
-                                        return True
-                                    else:
-                                        logger.error("Graph send failed: %s %s", send_r.status_code, send_r.text)
-                    else:
-                        logger.debug("Graph: token not acquired or login aborted; will fallback to browser UI.")
-                except Exception:
-                    logger.exception("Graph path raised exception; falling back to browser automation")
-            else:
-                logger.debug("No Graph client_id/tenant present in settings; skip Graph")
-        except Exception:
-            logger.exception("Unhandled error during Graph/MSAL attempt (ignored)")
-
-        # --- 2) Browser fallback using Selenium ---
-        logger.debug("Falling back to browser automation for Teams web.")
-
-        try:
-            from selenium import webdriver
-            from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.common.keys import Keys
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from webdriver_manager.chrome import ChromeDriverManager
-        except Exception:
-            logger.exception("Selenium/webdriver-manager not installed - browser fallback unavailable")
-            return False
-
-        # build chat url for direct chat to email
-        users_q = urllib.parse.quote(to_address)
-        chat_url = f"https://teams.microsoft.com/l/chat/0/0?users={users_q}"
-
         def _start_driver_with_options(options, driver_path=None, timeout=60):
             """Start chrome driver using webdriver-manager (or provided driver_path). Return driver or raise."""
             try:
@@ -2327,7 +2087,6 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Unhandled error in global kanban double-click handler")
 
-
     ##
     def _on_kanban_double_click(self, event, lb=None):
         try:
@@ -2358,7 +2117,6 @@ class TaskApp(tk.Tk):
                 logger.exception("Error opening task editor from kanban double-click")
         except Exception:
             logger.exception("Unhandled error in _on_kanban_double_click")
-
 
     def _on_kanban_drag_motion(self, event):
         lb = event.widget
@@ -2625,7 +2383,6 @@ class TaskApp(tk.Tk):
             except Exception:
                 logger.exception("Error inserting row in _populate")
                 continue
-
 
     ####
     def _kanban_click_select(self, event, lb):
@@ -2975,8 +2732,6 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Unhandled error creating kanban card")
             return None
-
-
 
     ####------------------ Kanban Board --------------------            
     def _populate_kanban(self):
@@ -3944,12 +3699,10 @@ class TaskApp(tk.Tk):
             except Exception:
                 pass
 
-
 # -------------------- Main --------------------
 def main():
     app = TaskApp()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()
