@@ -136,6 +136,33 @@ def _safe_show_toast(title, msg, duration=5):
 
 # -------------------- Database --------------------
 class TaskDB:
+    def mark_future(self, task_id):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET is_future=1, updated_at=? WHERE id=?",
+                (_now_iso(), task_id)
+            )
+
+    def pull_from_future(self, task_id):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET is_future=0, updated_at=? WHERE id=?",
+                (_now_iso(), task_id)
+            )
+
+    def fetch_future_tasks(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT *
+            FROM tasks
+            WHERE deleted_at IS NULL
+            AND is_future = 1
+            AND status != 'Done'
+            ORDER BY due_date IS NULL, due_date ASC
+        """)
+        return cur.fetchall()
+
+
     def __init__(self, path=DB_FILE):
         self.conn = sqlite3.connect(path)
         # return rows as mapping
@@ -213,7 +240,13 @@ class TaskDB:
                 pass
             except Exception:
                 pass
-
+        try:
+            cur.execute("PRAGMA table_info(tasks)")
+            cols = [r["name"] for r in cur.fetchall()]
+            if "is_future" not in cols:
+                cur.execute("ALTER TABLE tasks ADD COLUMN is_future INTEGER DEFAULT 0")
+        except Exception:
+            pass
         self.conn.commit()
 
     # contact helpers
@@ -372,7 +405,12 @@ class TaskDB:
 
     def fetch(self):
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY due_date IS NULL, due_date ASC, priority DESC")
+        cur.execute("""
+            SELECT * FROM tasks
+            WHERE deleted_at IS NULL
+            AND (is_future IS NULL OR is_future = 0)
+            ORDER BY due_date IS NULL, due_date ASC, priority DESC
+        """)
         return cur.fetchall()
 
     def fetch_by_status(self, status):
@@ -435,6 +473,114 @@ class TaskDB:
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
+    def _delete_selected_future(self):
+        """
+        Soft-delete selected Future Tasks (move them to Trash).
+        """
+        sel = self.future_tree.selection()
+        if not sel:
+            return
+
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            f"Move {len(sel)} selected future task(s) to Trash?"
+        )
+        if not confirm:
+            return
+
+        for s in sel:
+            try:
+                task_id = int(self.future_tree.item(s, "values")[0])
+                self.db.soft_delete(task_id)
+            except Exception:
+                logger.exception("Failed to delete future task")
+
+        # refresh all views
+        self._populate()
+        self._populate_kanban()
+        self._populate_future_tasks()
+        self._populate_trash()
+    def _move_selected_to_future(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        for s in sel:
+            task_id = int(self.tree.item(s, "values")[0])
+            self.db.mark_future(task_id)
+        self._populate()
+        self._populate_kanban()
+        self._populate_future_tasks()
+
+
+    def _pull_selected_future(self):
+        sel = self.future_tree.selection()
+        if not sel:
+            return
+        for s in sel:
+            task_id = int(self.future_tree.item(s, "values")[0])
+            self.db.pull_from_future(task_id)
+        self._populate()
+        self._populate_kanban()
+        self._populate_future_tasks()
+        
+    def _populate_future_tasks(self):
+        try:
+            for iid in self.future_tree.get_children():
+                self.future_tree.delete(iid)
+        except Exception:
+            pass
+
+        rows = self.db.fetch_future_tasks()
+        ft = self.filter_text_var.get().strip().lower()
+        fpri = self.filter_priority_var.get()
+        fstat = self.filter_status_var.get()
+        fdue = self.filter_due_var.get().strip()
+
+        def match(r):
+            if ft and ft not in ((r["title"] or "") + (r["description"] or "")).lower():
+                return False
+            if fpri != "All" and r["priority"] != fpri:
+                return False
+            if fstat != "All" and r["status"] != fstat:
+                return False
+            if fdue and r["due_date"] != fdue:
+                return False
+            return True
+        rows = [r for r in rows if match(r)]
+        for r in rows:
+            self.future_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    r["id"],
+                    r["title"],
+                    r["due_date"] or "—",
+                    r["priority"],
+                    r["status"]
+                )
+            )
+
+
+    def _bind_global_kanban_mousewheel(self):
+        def _on_mousewheel(event):
+            widget = event.widget
+
+            # Walk up widget hierarchy to find a Canvas
+            while widget is not None:
+                if isinstance(widget, tk.Canvas):
+                    if event.delta:
+                        widget.yview_scroll(int(-event.delta / 120), "units")
+                    return "break"
+                widget = widget.master
+            return None
+
+        # Windows / macOS
+        self.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
+        # Linux
+        self.bind_all("<Button-4>", lambda e: _on_mousewheel(e), add="+")
+        self.bind_all("<Button-5>", lambda e: _on_mousewheel(e), add="+")
+
     def __init__(self):
         super().__init__()
         self.title("Office Activity Simplifier")
@@ -459,7 +605,9 @@ class TaskApp(tk.Tk):
 
         # Build UI
         self._build_ui()
+        self._bind_global_kanban_mousewheel()
 
+        
         ### Global
         # Global debug binds — confirm any double-click reaches us
         try:
@@ -504,6 +652,7 @@ class TaskApp(tk.Tk):
         self.after(100, self._populate)
         self.after(100, self._populate_kanban)
         self.after(200, self._populate_trash)
+        self.after(200, self._populate_future_tasks)
 
         # reminders
         self._schedule_task_reminder_checker()
@@ -644,10 +793,12 @@ class TaskApp(tk.Tk):
             except Exception:
                 logger.exception("Failed to schedule next reminder check")
 
+    # ####
     def _check_task_reminders(self):
         """
         Check for tasks where reminder_set_at + reminder_minutes <= now and not yet reminder_sent_at.
-        If a task has responsible_id and reminder_email_body, attempt to send.
+        Modified behavior: DO NOT automatically send reminder emails. Only show the popup notification.
+        Manual sending can be done via 'Send Reminder Now (Outlook)' button in the edit window.
         """
         try:
             cur = self.db.conn.cursor()
@@ -655,7 +806,7 @@ class TaskApp(tk.Tk):
                 SELECT id, title, description, reminder_minutes, reminder_set_at, reminder_sent_at, responsible_id, reminder_email_body
                 FROM tasks
                 WHERE reminder_minutes IS NOT NULL AND reminder_minutes != '' AND reminder_set_at IS NOT NULL
-                  AND status != 'Done'
+                AND status != 'Done'
             """)
             rows = cur.fetchall()
             now_dt = datetime.now()
@@ -663,14 +814,19 @@ class TaskApp(tk.Tk):
                 try:
                     rm_min = int(r["reminder_minutes"])
                 except Exception:
+                    # malformed minutes; skip
                     continue
                 try:
-                    set_at = datetime.fromisoformat(r["reminder_set_at"])
+                    set_at = datetime.fromisoformat(r["reminder_set_at"]) if r["reminder_set_at"] else None
                 except Exception:
+                    continue
+
+                if not set_at:
                     continue
 
                 target = set_at + timedelta(minutes=rm_min)
 
+                # If target reached and not already sent/shown, show popup.
                 sent = None
                 if r["reminder_sent_at"]:
                     try:
@@ -679,35 +835,13 @@ class TaskApp(tk.Tk):
                         sent = None
 
                 if now_dt >= target and (sent is None or sent < target):
-                    # show popup
-                    self._show_reminder_popup(r["id"], r["title"], r["description"])
-
-                    # attempt to send email if configured
+                    # show popup only — do NOT automatically send email
                     try:
-                        resp = r["responsible_id"]
-                        body = r["reminder_email_body"]
-                        title = r["title"] or "Task Reminder"
-                        if resp and body:
-                            # resolve email
-                            try:
-                                cro = self.db.conn.cursor()
-                                cro.execute("SELECT email FROM contacts WHERE id=?", (int(resp),))
-                                cro_r = cro.fetchone()
-                                if cro_r and cro_r["email"]:
-                                    to_email = cro_r["email"]
-                                    self._send_reminder_email(int(r["id"]), to_email, title, body)
-                            except Exception:
-                                logger.exception("Could not resolve responsible email")
+                        self._show_reminder_popup(r["id"], r["title"], r["description"])
                     except Exception:
-                        logger.exception("Error attempting to send reminder email")
-
-                    # mark reminder_sent_at
-                    now_iso = datetime.now().isoformat(timespec="seconds")
-                    try:
-                        self.db.conn.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=?", (now_iso, r["id"]))
-                        self.db.conn.commit()
-                    except Exception:
-                        logger.exception("Failed to update reminder_sent_at")
+                        logger.exception("Error showing reminder popup")
+                    # IMPORTANT: do NOT update reminder_sent_at here. Leaving reminder_sent_at unset
+                    # allows the user to still manually send the reminder via the editor.
         except Exception:
             logger.exception("Reminder check error")
 
@@ -1008,6 +1142,9 @@ class TaskApp(tk.Tk):
         ttk.Button(btns, text="Edit", command=lambda: self._open_edit_window(self._selected_tree_task_id() or None)).pack(side=tk.LEFT, padx=5)
         ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=5)
         ttk.Button(btns, text="Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Move to Future",
+           command=self._move_selected_to_future).pack(side=tk.LEFT, padx=5)
+        
 
         # Kanban tab
         self.kanban_tab = ttk.Frame(self.notebook, padding=10)
@@ -1028,14 +1165,35 @@ class TaskApp(tk.Tk):
             ttk.Label(col, text=status, font=("", 12, "bold")).pack(anchor="w")
 
             # Canvas to hold cards + inner frame
-            canvas_col = tk.Canvas(col, height=700, highlightthickness=0)
+            canvas_col = tk.Canvas(col, highlightthickness=0)
             vscroll = ttk.Scrollbar(col, orient=tk.VERTICAL, command=canvas_col.yview)
             canvas_col.configure(yscrollcommand=vscroll.set)
             vscroll.pack(side=tk.RIGHT, fill=tk.Y)
             canvas_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
+            # ---- Mouse wheel support for Kanban canvas (Windows / macOS / Linux) ----
+            def _bind_kanban_mousewheel(canvas):
+                def _on_mousewheel(event):
+                    if event.delta:
+                        canvas.yview_scroll(int(-event.delta / 120), "units")
+
+                # Windows & macOS
+                canvas.bind("<MouseWheel>", _on_mousewheel)
+
+                # Linux
+                canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+                canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+            _bind_kanban_mousewheel(canvas_col)
+
             inner = ttk.Frame(canvas_col)
-            canvas_col.create_window((0, 0), window=inner, anchor="nw")
+            window_id = canvas_col.create_window((0, 0), window=inner, anchor="nw")
+
+            # Make inner frame stretch to canvas width
+            def _resize_inner(event, c=canvas_col, wid=window_id):
+                c.itemconfig(wid, width=event.width)
+
+            canvas_col.bind("<Configure>", _resize_inner)
 
             def _configure_inner(e, c=canvas_col):
                 c.configure(scrollregion=c.bbox("all"))
@@ -1104,6 +1262,42 @@ class TaskApp(tk.Tk):
         self.trash_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.trash_tree.bind("<Double-1>", lambda e: self._restore_selected_trash())
 
+        # add future
+        future_tab = ttk.Frame(self.notebook)
+        self._create_filter_bar(future_tab)
+        self.notebook.add(future_tab, text="Future Tasks")
+
+        future_toolbar = ttk.Frame(future_tab, padding=6)
+        future_toolbar.pack(fill=tk.X)
+
+        ttk.Button(future_toolbar, text="Pull to Working",
+                command=self._pull_selected_future).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(future_toolbar, text="Delete",
+                command=self._delete_selected_future).pack(side=tk.LEFT, padx=4)
+
+        self.future_tree = ttk.Treeview(
+            future_tab,
+            columns=["id", "title", "due", "priority", "status"],
+            show="headings"
+        )
+
+        self.future_tree.heading("id", text="ID")
+        self.future_tree.heading("title", text="Title")
+        self.future_tree.heading("due", text="Due")
+        self.future_tree.heading("priority", text="Priority")
+        self.future_tree.heading("status", text="Status")
+
+        self.future_tree.column("id", width=60, anchor="center")
+        self.future_tree.column("title", width=420, anchor="w")
+
+        self.future_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        # end future
+
+
+
+
+
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
         action_frame.pack(fill=tk.X)
         self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled"); self.btn_edit.pack(side=tk.LEFT, padx=5)
@@ -1112,13 +1306,51 @@ class TaskApp(tk.Tk):
         self.btn_prev = ttk.Button(action_frame, text="← Move Previous", command=self._move_prev_selected, state="disabled"); self.btn_prev.pack(side=tk.LEFT, padx=5)
         self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled"); self.btn_next.pack(side=tk.LEFT, padx=5)
 
+
+    ####
+    def _send_teams_disabled(self, task_id, recipient_label, subject, body):
+        """
+        Stub used when Teams automation is removed/disabled.
+        Keeps UI stable and gives the user clear feedback.
+        """
+        try:
+            # If recipient_label looks like an email, try to resolve a contact email for clarity
+            to_address = None
+            if recipient_label and hasattr(self, "db"):
+                # recipient_label might be "Name <email>" or just an email
+                if "<" in recipient_label and ">" in recipient_label:
+                    m = re.search(r"<([^>]+)>", recipient_label)
+                    if m:
+                        to_address = m.group(1)
+                else:
+                    # try lookup in contacts
+                    for c in (self.db.get_contacts() or []):
+                        if c["name"] == recipient_label or c["email"] == recipient_label:
+                            to_address = c["email"]
+                            break
+
+            display_recipient = to_address or (recipient_label or "(no recipient)")
+
+            messagebox.showinfo(
+                "Teams Disabled",
+                f"Teams integration is disabled in this build.\n\n"
+                f"Would have sent to: {display_recipient}\nSubject: {subject}\n\n"
+                "If you need Teams messaging, install optional dependencies and re-enable the feature in settings."
+            )
+        except Exception:
+            try:
+                messagebox.showinfo("Teams Disabled", "Teams integration is disabled.")
+            except Exception:
+                pass
+        return False
+
     # -------------------- Edit Window --------------------
     def _open_edit_window(self, task_id=None):
         """
         Open popup for adding/editing a task.
         Reminder Email field is placed below the progress 'Add entry' area,
         and a 'Send Reminder Now (Outlook)' button is present.
-        (MS Teams send functionality removed.)
+        This version avoids calling any Teams sending function.
         """
         try:
             from tkcalendar import DateEntry  # type: ignore
@@ -1178,9 +1410,9 @@ class TaskApp(tk.Tk):
                 delta = -1 * int(event.delta)
             canvas.yview_scroll(delta, "units")
 
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
         # columns
         for c in range(6):
@@ -1426,7 +1658,7 @@ class TaskApp(tk.Tk):
 
         row += 1
 
-        # Create the Send button(s) frame - Teams removed
+        # Provide the send buttons. Teams button now calls the disabled-stub (no external dependencies).
         btn_frame_send = ttk.Frame(content_frame)
         btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
 
@@ -1436,6 +1668,13 @@ class TaskApp(tk.Tk):
             send_btn.pack(side=tk.LEFT, padx=(0, 10))
         except Exception:
             logger.exception("Failed to create Outlook send button")
+
+        # Teams send (disabled/stub)
+        try:
+            teams_btn = ttk.Button(btn_frame_send, text="Send Teams Reminder Now", command=lambda: self._send_teams_disabled(task_id, responsible_var.get().strip(), title_var.get().strip(), email_body_text.get("1.0", tk.END).strip()))
+            teams_btn.pack(side=tk.LEFT, padx=(0, 10))
+        except Exception:
+            logger.exception("Failed to create Teams send button")
 
         row += 1
 
@@ -1678,179 +1917,7 @@ class TaskApp(tk.Tk):
         win.bind("<Configure>", _on_win_configure)
 
     ###
-    def _http_request_log(method, url, headers=None, json_payload=None, params=None):
-        """
-        Wrapper around requests.request with detailed logging of request/response.
-        """
-        try:
-            logger.debug("HTTP %s %s headers=%s params=%s", method, url, headers, params)
-            if json_payload:
-                logger.debug("Payload: %s", str(json_payload)[:1000])  # limit length
-            resp = requests.request(method, url, headers=headers, json=json_payload, params=params, timeout=30)
-            logger.debug("Response status=%s body=%s", resp.status_code, resp.text[:2000])
-            return resp
-        except Exception:
-            logger.exception("HTTP %s %s failed", method, url)
-            raise
-    # Add this method to TaskApp
-        def _start_driver_with_options(options, driver_path=None, timeout=60):
-            """Start chrome driver using webdriver-manager (or provided driver_path). Return driver or raise."""
-            try:
-                # If driver_path provided use it (packaged driver); else use webdriver-manager
-                if driver_path:
-                    service = webdriver.chrome.service.Service(driver_path)
-                else:
-                    chromedriver_path = ChromeDriverManager().install()
-                    service = webdriver.chrome.service.Service(chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=options)
-                driver.set_page_load_timeout(timeout)
-                return driver
-            except Exception:
-                raise
-
-        # prepare options common
-        options = webdriver.ChromeOptions()
-        options.add_argument("--disable-infobars")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        # don't use headless - want interactive session (and Teams web may block headless)
-        # options.add_argument("--headless=new")  # not recommended for Teams
-
-        # Try user's Chrome profile first (best UX)
-        tried_temp_profile = False
-        temp_profile_dir = None
-        driver = None
-        try_user_profile = True
-        user_profile_dir = None
-        try:
-            if os.name == "nt":
-                user_profile_dir = os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Google", "Chrome", "User Data")
-            elif sys.platform == "darwin":
-                user_profile_dir = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-            else:
-                user_profile_dir = os.path.expanduser("~/.config/google-chrome")
-
-            if user_profile_dir and os.path.exists(user_profile_dir):
-                try:
-                    options.add_argument(f"--user-data-dir={user_profile_dir}")
-                    logger.debug("Using Chrome user-data-dir: %s", user_profile_dir)
-                except Exception:
-                    logger.exception("Could not set --user-data-dir (ignoring)")
-            else:
-                try_user_profile = False
-                logger.debug("No existing Chrome user-data-dir found, skipping user profile attempt")
-        except Exception:
-            logger.exception("Error while determining user profile dir")
-
-        # Attempt loop: try user profile -> on failure remove that flag and try temp profile
-        last_exception = None
-        for attempt in range(2):
-            try:
-                logger.debug("Chrome start attempt #%s (using user profile? %s)", attempt + 1, try_user_profile)
-                driver = _start_driver_with_options(options)
-                logger.debug("Chrome started successfully (attempt %s)", attempt + 1)
-                break
-            except Exception as e:
-                last_exception = e
-                logger.exception("Chrome start failed on attempt %s", attempt + 1)
-                # if first attempt used real profile, retry with temp profile
-                if try_user_profile:
-                    logger.debug("Will retry with a temporary profile to avoid profile lock/crash")
-                    # remove user-data-dir arg and create a temp dir
-                    try:
-                        # remove any existing --user-data-dir from options
-                        new_args = [a for a in options.arguments if not a.startswith("--user-data-dir")]
-                        # unfortunately ChromeOptions doesn't expose simple removal API; recreate options
-                        options = webdriver.ChromeOptions()
-                        options.add_argument("--disable-infobars"); options.add_argument("--no-sandbox")
-                        options.add_argument("--disable-dev-shm-usage"); options.add_argument("--disable-gpu")
-                        temp_profile_dir = tempfile.mkdtemp(prefix="oats_chrome_profile_")
-                        options.add_argument(f"--user-data-dir={temp_profile_dir}")
-                        logger.debug("Created temporary chrome profile at %s", temp_profile_dir)
-                        tried_temp_profile = True
-                        tried_user_profile = False
-                        try_user_profile = False  # ensure next loop uses temp profile
-                        continue  # next attempt
-                    except Exception:
-                        logger.exception("Failed to prepare temporary profile; aborting browser fallback")
-                        break
-                else:
-                    # already tried temp profile or nothing left to try
-                    break
-
-        if driver is None:
-            logger.error("Failed to start Chrome for browser automation. Last error: %s", repr(last_exception))
-            # cleanup temp profile if created
-            if temp_profile_dir:
-                try:
-                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            return False
-
-        # driver is running; navigate and attempt to send
-        try:
-            logger.debug("Navigating to Teams chat URL: %s", chat_url)
-            driver.get(chat_url)
-            wait = WebDriverWait(driver, 60)
-            # wait for a contenteditable input area
-            try:
-                editable = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
-            except Exception:
-                logger.debug("Editable area not found quickly; waiting up to 120s (login or SSO possible)")
-                try:
-                    editable = WebDriverWait(driver, 120).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']")))
-                except Exception:
-                    logger.error("Could not find Teams chat input area; leaving browser open for manual send")
-                    return False
-
-            # Compose plain text fallback from HTML
-            text_body = re.sub(r"<[^>]+>", "", html_body or "")
-            subject = (subject_title or "Reminder").strip()
-            to_send = f"{subject}\n\n{text_body}"
-
-            # click and send
-            try:
-                editable.click()
-            except Exception:
-                pass
-            # send message (typing then Enter)
-            editable.send_keys(to_send)
-            time.sleep(0.4)
-            editable.send_keys(Keys.ENTER)
-            logger.info("Browser automation: Teams message sent/queued to %s (task=%s)", to_address, task_id)
-            time.sleep(1.2)
-            try:
-                driver.quit()
-            except Exception:
-                pass
-            # cleanup temp profile if created
-            if temp_profile_dir:
-                try:
-                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            return True
-        except Exception:
-            logger.exception("Error while automating Teams web to send message")
-            try:
-                driver.quit()
-            except Exception:
-                pass
-            if temp_profile_dir:
-                try:
-                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            return False
-        finally:
-            try:
-                if file_handler is not None:
-                    root_logger.removeHandler(file_handler)
-                    file_handler.close()
-            except Exception:
-                pass
+    
     # -------------------- Other CRUD helpers & Kanban --------------------
 
         # Recurrence helpers
@@ -2750,6 +2817,7 @@ class TaskApp(tk.Tk):
         ###
         try:
             all_rows = self.db.fetch()
+            rows = [r for r in all_rows if not r["is_future"]]
         except Exception:
             all_rows = []
 
@@ -2796,31 +2864,31 @@ class TaskApp(tk.Tk):
                 groups.setdefault(matched, []).append(r)
             except Exception:
                 continue
-
+        ##            
         today = date.today()
+
         for status in STATUSES:
             colinfo = self.kanban_columns.get(status)
             if not colinfo:
                 continue
+
             inner = colinfo["frame"]
+            canvas = colinfo["canvas"]
 
             items = groups.get(status, [])
+
+            # --- CREATE CARDS (single loop only) ---
             for r in items:
                 try:
-                    # create a card and add it to the column frame
                     wrapper = self._create_kanban_card(inner, r)
-                    self.kanban_item_map[status].append(r["id"])
+                    if wrapper:
+                        self.kanban_item_map[status].append(r["id"])
                 except Exception:
                     logger.exception("Error creating kanban card")
-                    continue
 
-            # ensure smallest width/wrapping is okay
-            try:
-                colinfo["canvas"].update_idletasks()
-                # set canvas scrollregion
-                colinfo["canvas"].configure(scrollregion=colinfo["canvas"].bbox("all"))
-            except Exception:
-                pass
+            # --- UPDATE SCROLL REGION ONCE ---
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _kanban_select(self, event):
         lb = event.widget
