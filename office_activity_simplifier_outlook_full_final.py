@@ -1495,7 +1495,7 @@ class TaskApp(tk.Tk):
         ttk.Button(
             btns,
             text="📧 Open Original Email",
-            command=lambda: self._open_selected_outlook_email
+            command=self._open_selected_outlook_email()
         ).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Move to Future",
            command=self._move_selected_to_future).pack(side=tk.LEFT, padx=5)
