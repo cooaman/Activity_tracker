@@ -3463,71 +3463,73 @@ class TaskApp(tk.Tk):
             return False
     ###
     def _get_flagged_from_folder(self, folder, flagged):
+        """
+        Safely fetch flagged mails from a folder.
+        Skips digitally signed / receipt-request emails that Outlook blocks in COM.
+        """
         try:
             items = folder.Items
             items.Sort("[ReceivedTime]", True)
 
-            for item in items:
+            try:
+                flagged_items = items.Restrict("[FlagStatus] = 2")
+            except Exception:
+                flagged_items = items
+
+            for item in flagged_items:
                 try:
-                    # Only MailItem
-                    if getattr(item, "Class", 0) != 43:
+                    if getattr(item, "Class", None) != 43:  # MailItem
                         continue
 
-                    # Check flag manually (DO NOT use Restrict)
-                    flag_status = getattr(item, "FlagStatus", 0)
-                    flag_request = str(getattr(item, "FlagRequest", "") or "").strip()
-                    if flag_status == 0 and not flag_request:
-                        continue
+                    # --- SAFE metadata (always allowed) ---
+                    subject = item.Subject
+                    entry_id = item.EntryID
+                    sender = getattr(item, "SenderEmailAddress", None)
 
-                    # ---------- SAFE DATETIME ----------
                     try:
-                        received = item.ReceivedTime
-                        received_str = received.strftime("%Y-%m-%d %H:%M:%S") if received else None
+                        received = item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S")
                     except Exception:
-                        received_str = None
+                        received = None
 
-                    # ---------- SAFE DUE DATE ----------
+                    # --- PROTECTED access (wrap individually) ---
+                    description = ""
                     try:
-                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                        description = item.HTMLBody or ""
                     except Exception:
-                        due = None
+                        logger.warning("HTMLBody blocked for signed email: %s", subject)
 
-                    # ---------- SAFE ATTACHMENTS ----------
                     attachments = []
                     try:
                         if item.Attachments.Count > 0:
-                            base_dir = os.path.join(self.app_data_dir, "attachments", "outlook")
-                            os.makedirs(base_dir, exist_ok=True)
-
+                            os.makedirs("attachments", exist_ok=True)
                             for att in item.Attachments:
                                 try:
-                                    fname = re.sub(r"[\\/:*?\"<>|]", "_", att.FileName)
-                                    path = os.path.join(base_dir, fname)
-                                    att.SaveAsFile(path)
-                                    attachments.append(path)
+                                    fname = os.path.join("attachments", att.FileName)
+                                    att.SaveAsFile(fname)
+                                    attachments.append(fname)
                                 except Exception:
-                                    logger.exception("Failed to save attachment")
+                                    logger.warning("Attachment blocked: %s", att.FileName)
                     except Exception:
-                        logger.exception("Attachment processing error")
+                        logger.warning("Attachments blocked for signed email: %s", subject)
 
-                    # ---------- ADD TASK ----------
                     flagged.append({
-                        "title": f"[Mail] {item.Subject}",
-                        "description": getattr(item, "HTMLBody", "") or getattr(item, "Body", ""),
-                        "due_date": due,
+                        "title": f"[Mail] {subject}",
+                        "description": description,
+                        "due_date": None,
                         "priority": "Medium",
                         "status": "Pending",
-                        "outlook_id": item.EntryID,
+                        "outlook_id": entry_id,
                         "outlook_storeid": item.Parent.StoreID,
-                        "outlook_received_time": received_str,
-                        "outlook_sender": item.SenderEmailAddress,
+                        "outlook_received_time": received,
+                        "outlook_sender": sender,
                         "attachments": json.dumps(attachments)
                     })
 
                 except Exception:
-                    logger.exception("Error processing flagged Outlook mail")
+                    logger.exception("Skipping restricted Outlook mail item")
+                    continue
 
-            # Recurse folders
+            # recurse into subfolders
             for sub in folder.Folders:
                 self._get_flagged_from_folder(sub, flagged)
 
