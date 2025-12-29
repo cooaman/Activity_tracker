@@ -135,7 +135,38 @@ def _safe_show_toast(title, msg, duration=5):
         logger.exception("Toast error (ignored)")
 
 # -------------------- Database --------------------
+
+def normalize_subject(subj: str) -> str:
+    if not subj:
+        return ""
+    subj = subj.lower().strip()
+    prefixes = ["re:", "fw:", "fwd:", "[om]:"]
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if subj.startswith(p):
+                subj = subj[len(p):].strip()
+                changed = True
+    return subj
 class TaskDB:
+    def update_task(self, task_id, **fields):
+        keys = []
+        values = []
+        for k, v in fields.items():
+            keys.append(f"{k}=?")
+            values.append(v)
+        values.append(task_id)
+        sql = f"UPDATE tasks SET {', '.join(keys)}, updated_at=? WHERE id=?"
+        values.insert(-1, _now_iso())
+        with self.conn:
+            self.conn.execute(sql, values)
+            
+    def get_task(self, task_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+        return cur.fetchone()
+
     def mark_future(self, task_id):
         with self.conn:
             self.conn.execute(
@@ -473,6 +504,126 @@ class TaskDB:
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
+
+    def _open_outlook_email(self, task_id):
+        task = self.db.get_task(task_id)
+
+        if not task or not task["outlook_id"]:
+            messagebox.showinfo("Outlook", "This task is not linked to an Outlook email.")
+            return
+
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            mail = outlook.GetItemFromID(task["outlook_id"], task["outlook_storeid"])
+            mail.Display()
+        except Exception:
+            logger.exception("Failed to open Outlook email")
+            messagebox.showerror(
+                "Outlook",
+                "Unable to open the Outlook email. It may have been moved or deleted."
+            )
+    def _convert_reply_to_comment(self, task_id):
+        task = self.db.get_task(task_id)
+        if not task:
+            return
+
+        mail = self._find_latest_outlook_mail(task)
+        if not mail:
+            messagebox.showinfo("Outlook", "No reply found.")
+            return
+
+        confirm = messagebox.askyesno(
+            "Confirm",
+            "Append latest reply content to task description?"
+        )
+        if not confirm:
+            return
+
+        reply_html = mail.HTMLBody or ""
+        stamp = (
+            "<hr>"
+            f"<p><b>Outlook Reply ({mail.ReceivedTime}):</b></p>"
+        )
+
+        new_desc = (task["description"] or "") + stamp + reply_html
+        self.db.update_task(task_id, description=new_desc)
+
+        messagebox.showinfo("Task", "Reply appended to description.")
+        self._open_edit_window(task_id)
+
+
+    def _refresh_email_chain(self, task_id):
+        task = self.db.get_task(task_id)
+        if not task:
+            return
+
+        mail = self._find_latest_outlook_mail(task)
+        if not mail:
+            messagebox.showinfo("Outlook", "No updated email found.")
+            return
+
+        self.db.update_task(
+            task_id,
+            subject=mail.Subject,
+            last_outlook_received=mail.ReceivedTime
+        )
+
+        messagebox.showinfo("Outlook", "Email chain refreshed.")
+        self._populate()
+
+    def _attach_latest_reply(self, task_id):
+        task = self.db.get_task(task_id)
+        if not task or not task["outlook_id"]:
+            messagebox.showwarning("Outlook", "This task is not linked to Outlook.")
+            return
+
+        mail = self._find_latest_outlook_mail(task)
+        if not mail:
+            messagebox.showinfo("Outlook", "No related reply found.")
+            return
+
+        attach_dir = os.path.join(self.app_data_dir, "attachments", str(task_id))
+        os.makedirs(attach_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(attach_dir, f"reply_{ts}.msg")
+
+        mail.SaveAs(path, 3)  # 3 = .msg format
+
+        self.db.add_attachment(
+            task_id=task_id,
+            file_path=path,
+            file_type="outlook_msg",
+            description="Latest Outlook reply"
+        )
+
+        messagebox.showinfo("Attachment", "Latest reply attached.")
+        self._populate_attachments(task_id)
+
+
+
+
+
+    def _find_latest_outlook_mail(self, task_row):
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            inbox = outlook.GetDefaultFolder(6)  # Inbox
+            items = inbox.Items
+            items.Sort("[ReceivedTime]", True)
+
+            target_norm = normalize_subject(task_row["subject"])
+
+            for mail in items:
+                try:
+                    if normalize_subject(mail.Subject) == target_norm:
+                        return mail
+                except Exception:
+                    continue
+        except Exception:
+            logger.exception("Failed to find latest Outlook mail")
+
+        return None
+
     def _delete_selected_future(self):
         """
         Soft-delete selected Future Tasks (move them to Trash).
@@ -1432,6 +1583,42 @@ class TaskApp(tk.Tk):
         existing_attachments = []
         staged_progress_entries = ""
 
+        #Moved here
+        # Send Reminder Now button (next to email field)
+        def _send_now_action():
+            html_body = email_body_text.get("1.0", tk.END).strip()
+            if not html_body:
+                res = messagebox.askyesno("Send Empty Body?", "Reminder email body is empty. Send anyway?")
+                if not res:
+                    return
+            # determine recipient
+            label = responsible_var.get().strip()
+            to_address = None
+            if label and hasattr(responsible_cb, "lookup_map"):
+                cid = responsible_cb.lookup_map.get(label)
+                if cid:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
+                    rowc = cur.fetchone()
+                    if rowc and rowc["email"]:
+                        to_address = rowc["email"]
+            if not to_address:
+                # ask user to enter an email address
+                to_address = simpledialog.askstring("Recipient", "Enter recipient email address:", parent=win)
+                if not to_address:
+                    messagebox.showinfo("Aborted", "No recipient provided; aborting send.", parent=win)
+                    return
+            # send via Outlook
+            if not HAS_OUTLOOK:
+                messagebox.showwarning("Outlook Unavailable", "Outlook integration is not available on this system.")
+                return
+            sent_ok = self._send_reminder_email(task_id or 0, to_address, title_var.get().strip() or "Task Reminder", html_body)
+            if sent_ok:
+                messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
+            else:
+                messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
+
+
         row = 0
         # Title
         ttk.Label(content_frame, text="Title *").grid(row=row, column=0, sticky="w")
@@ -1508,59 +1695,7 @@ class TaskApp(tk.Tk):
                 except Exception:
                     pass
 
-        def _insert_table_dialog():
-            dlg = tk.Toplevel(win)
-            dlg.title("Insert Table")
-            ttk.Label(dlg, text="Rows:").grid(row=0, column=0, padx=6, pady=6)
-            rows_var = tk.IntVar(value=2)
-            ttk.Entry(dlg, textvariable=rows_var, width=6).grid(row=0, column=1, padx=6, pady=6)
-            ttk.Label(dlg, text="Cols:").grid(row=1, column=0, padx=6, pady=6)
-            cols_var = tk.IntVar(value=2)
-            ttk.Entry(dlg, textvariable=cols_var, width=6).grid(row=1, column=1, padx=6, pady=6)
-
-            def _do_insert_table():
-                r = max(1, int(rows_var.get()))
-                c = max(1, int(cols_var.get()))
-                html = "<table border='1' cellpadding='4' cellspacing='0'>\n"
-                for _ in range(r):
-                    html += "  <tr>\n"
-                    for _ in range(c):
-                        html += "    <td>&nbsp;</td>\n"
-                    html += "  </tr>\n"
-                html += "</table>\n"
-                _insert_html_at_cursor(html)
-                try:
-                    dlg.destroy()
-                except Exception:
-                    pass
-
-            ttk.Button(dlg, text="Insert", command=_do_insert_table).grid(row=2, column=0, columnspan=2, pady=8)
-
-        def _insert_image_dialog():
-            f = filedialog.askopenfilename(parent=win, filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp"), ("All files","*.*")])
-            if not f:
-                return
-            file_url = f"file://{os.path.abspath(f)}"
-            html = f'<img src="{file_url}" alt="Image" style="max-width:600px; height:auto;" />\n'
-            _insert_html_at_cursor(html)
-
-        def _insert_snippet():
-            dlg = tk.Toplevel(win)
-            dlg.title("Insert HTML Snippet")
-            txt = tk.Text(dlg, height=8, width=60, wrap="none")
-            txt.pack(padx=6, pady=6)
-            def _ok():
-                snippet = txt.get("1.0", tk.END)
-                _insert_html_at_cursor(snippet)
-                try:
-                    dlg.destroy()
-                except Exception:
-                    pass
-            ttk.Button(dlg, text="Insert", command=_ok).pack(pady=(0,8))
-
-        ttk.Button(email_toolbar, text="Table", command=_insert_table_dialog).pack(side=tk.LEFT, padx=(0,4))
-        ttk.Button(email_toolbar, text="Image", command=_insert_image_dialog).pack(side=tk.LEFT, padx=(0,4))
-        ttk.Button(email_toolbar, text="Snippet", command=_insert_snippet).pack(side=tk.LEFT, padx=(0,4))
+        
         _load_contacts_to_combobox()
         row += 1
 
@@ -1622,60 +1757,93 @@ class TaskApp(tk.Tk):
         email_body_text = tk.Text(content_frame, height=8, width=80, wrap="word")
         email_body_text.grid(row=row, column=1, columnspan=4, sticky="we", padx=6, pady=(10, 0))
 
-        # Send Reminder Now button (next to email field)
-        def _send_now_action():
-            html_body = email_body_text.get("1.0", tk.END).strip()
-            if not html_body:
-                res = messagebox.askyesno("Send Empty Body?", "Reminder email body is empty. Send anyway?")
-                if not res:
-                    return
-            # determine recipient
-            label = responsible_var.get().strip()
-            to_address = None
-            if label and hasattr(responsible_cb, "lookup_map"):
-                cid = responsible_cb.lookup_map.get(label)
-                if cid:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
-                    rowc = cur.fetchone()
-                    if rowc and rowc["email"]:
-                        to_address = rowc["email"]
-            if not to_address:
-                # ask user to enter an email address
-                to_address = simpledialog.askstring("Recipient", "Enter recipient email address:", parent=win)
-                if not to_address:
-                    messagebox.showinfo("Aborted", "No recipient provided; aborting send.", parent=win)
-                    return
-            # send via Outlook
-            if not HAS_OUTLOOK:
-                messagebox.showwarning("Outlook Unavailable", "Outlook integration is not available on this system.")
-                return
-            sent_ok = self._send_reminder_email(task_id or 0, to_address, title_var.get().strip() or "Task Reminder", html_body)
-            if sent_ok:
-                messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
-            else:
-                messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
+        #####try
+        # ===== Reminder Email (HTML) =====
+        ttk.Label(content_frame, text="Reminder Email (HTML)").grid(
+            row=row, column=0, sticky="nw", pady=(12, 4)
+        )
 
-        row += 1
+        email_body_text = tk.Text(
+            content_frame,
+            height=10,
+            width=90,
+            wrap="word"
+        )
+        email_body_text.grid(
+            row=row,
+            column=1,
+            columnspan=5,
+            sticky="we",
+            padx=6,
+            pady=(12, 4)
+        )
 
-        # Provide the send buttons. Teams button now calls the disabled-stub (no external dependencies).
-        btn_frame_send = ttk.Frame(content_frame)
-        btn_frame_send.grid(row=row, column=0, columnspan=6, pady=(10, 0))
+        row += 1  # ✅ move to NEXT row
 
-        # Outlook send (existing behavior)
-        try:
-            send_btn = ttk.Button(btn_frame_send, text="Send Reminder Now (Outlook)", command=_send_now_action)
-            send_btn.pack(side=tk.LEFT, padx=(0, 10))
-        except Exception:
-            logger.exception("Failed to create Outlook send button")
 
+        # ===== Outlook helper buttons (below editor) =====
+        outlook_tools = ttk.Frame(content_frame)
+        outlook_tools.grid(
+            row=row,
+            column=1,
+            columnspan=5,
+            sticky="w",
+            padx=6,
+            pady=(4, 10)
+        )
+
+        ttk.Button(
+            outlook_tools,
+            text="📎 Attach latest reply",
+            command=lambda: self._attach_latest_reply(task_id)
+        ).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(
+            outlook_tools,
+            text="🔄 Refresh email chain",
+            command=lambda: self._refresh_email_chain(task_id)
+        ).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(
+            outlook_tools,
+            text="📨 Convert reply to comment",
+            command=lambda: self._convert_reply_to_comment(task_id)
+        ).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(
+            outlook_tools,
+            text="📧 Open Original Email",
+            command=lambda: self._open_outlook_email(task_id)
+        ).pack(side=tk.LEFT, padx=4)
+
+        row += 1  # ✅ move to NEXT row
+
+
+        # ===== Send Reminder Now (centered) =====
+        send_frame = ttk.Frame(content_frame)
+        send_frame.grid(
+            row=row,
+            column=0,
+            columnspan=6,
+            pady=(12, 16)
+        )
+
+        ttk.Button(
+            send_frame,
+            text="Send Reminder Now (Outlook)",
+            command=_send_now_action
+        ).pack()
+
+        
+
+        """
         # Teams send (disabled/stub)
         try:
             teams_btn = ttk.Button(btn_frame_send, text="Send Teams Reminder Now", command=lambda: self._send_teams_disabled(task_id, responsible_var.get().strip(), title_var.get().strip(), email_body_text.get("1.0", tk.END).strip()))
             teams_btn.pack(side=tk.LEFT, padx=(0, 10))
         except Exception:
             logger.exception("Failed to create Teams send button")
-
+        """
         row += 1
 
         # Attachments
@@ -1898,10 +2066,32 @@ class TaskApp(tk.Tk):
             self._populate_kanban()
             _close()
 
-        btn_frame = ttk.Frame(bottom_frame)
-        btn_frame.pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="Save", command=_save).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btn_frame, text="Cancel", command=_close).pack(side=tk.RIGHT, padx=(0, 6))
+        #btn_frame = ttk.Frame(bottom_frame)
+        #btn_frame.pack(side=tk.RIGHT)
+        
+        # ===== Footer buttons =====
+        footer = ttk.Frame(content_frame)
+        footer.grid(
+            row=row,
+            column=0,
+            columnspan=6,
+            pady=(14, 18)
+        )
+
+        ttk.Button(
+            footer,
+            text="Save",
+            command=_save
+        ).pack(side=tk.LEFT, padx=8)
+
+        ttk.Button(
+            footer,
+            text="Cancel",
+            command=win.destroy
+        ).pack(side=tk.LEFT, padx=8)
+
+        
+
 
         try:
             win.focus_force()
