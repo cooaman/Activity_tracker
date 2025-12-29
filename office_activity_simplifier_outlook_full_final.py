@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, date, timedelta
 
+
 # ---- Persistent file logging (next to the app/exe) ----
 import sys
 
@@ -551,6 +552,82 @@ class TaskDB:
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
+
+    def _show_kanban_readable_desc(self, task_id):
+        task = self._get_task(task_id)
+        if not task:
+            return
+
+        html = task.get("description", "")
+        if not html.strip():
+            messagebox.showinfo("Description", "No description available.")
+            return
+
+        text = self._html_to_text(html)
+
+        win = tk.Toplevel(self)
+        win.title("Readable Description")
+        win.geometry("750x450")
+        win.transient(self)
+
+        txt = scrolledtext.ScrolledText(
+            win,
+            wrap="word",
+            font=("Segoe UI", 10)
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+    def _get_selected_task_id(self):
+        """Return selected task id from main task tree"""
+        selected = self.task_tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection", "No task selected")
+            return None
+        return int(selected[0])    
+    def _open_selected_outlook_email(self):
+        task_id = self._get_selected_task_id()
+        if not task_id:
+            messagebox.showinfo("Outlook", "Select a task first.")
+            return
+
+        self._open_outlook_email(task_id)
+    def _html_to_text(self, html):
+        """
+        Convert HTML to readable plain text.
+        Safe for Outlook HTML bodies.
+        """
+        if not html:
+            return ""
+
+        # Remove script and style blocks
+        html = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style.*?>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+
+        # Line breaks
+        html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+        html = re.sub(r'</p>', '\n\n', html, flags=re.IGNORECASE)
+
+        # Remove all remaining tags
+        html = re.sub(r'<[^>]+>', '', html)
+
+        # Decode basic HTML entities
+        html = html.replace('&nbsp;', ' ')
+        html = html.replace('&amp;', '&')
+        html = html.replace('&lt;', '<')
+        html = html.replace('&gt;', '>')
+        html = html.replace('&quot;', '"')
+        html = html.replace('&#39;', "'")
+
+        # Cleanup whitespace
+        html = re.sub(r'\n\s+\n', '\n\n', html)
+        html = re.sub(r'[ \t]+', ' ', html)
+
+        return html.strip()
+
 
     def _open_outlook_email(self, task_id):
         task = self.db.get_task(task_id)
@@ -1383,8 +1460,14 @@ class TaskApp(tk.Tk):
         ttk.Button(btns, text="Edit", command=lambda: self._open_edit_window(self._selected_tree_task_id() or None)).pack(side=tk.LEFT, padx=5)
         ttk.Button(btns, text="Mark Done", command=self._mark_done).pack(side=tk.LEFT, padx=5)
         ttk.Button(btns, text="Delete", command=self._delete_task).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btns,
+            text="📧 Open Original Email",
+            command=self._open_selected_outlook_email
+        ).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Move to Future",
            command=self._move_selected_to_future).pack(side=tk.LEFT, padx=5)
+
         
 
         # Kanban tab
@@ -1536,17 +1619,38 @@ class TaskApp(tk.Tk):
         # end future
 
 
-
-
-
         action_frame = ttk.Frame(self.kanban_tab, padding=5)
         action_frame.pack(fill=tk.X)
-        self.btn_edit = ttk.Button(action_frame, text="Edit", command=self._edit_selected_kanban, state="disabled"); self.btn_edit.pack(side=tk.LEFT, padx=5)
-        self.btn_delete = ttk.Button(action_frame, text="Delete", command=self._delete_selected_kanban, state="disabled"); self.btn_delete.pack(side=tk.LEFT, padx=5)
-        self.btn_done = ttk.Button(action_frame, text="Mark Done", command=self._mark_done_selected_kanban, state="disabled"); self.btn_done.pack(side=tk.LEFT, padx=5)
-        self.btn_prev = ttk.Button(action_frame, text="← Move Previous", command=self._move_prev_selected, state="disabled"); self.btn_prev.pack(side=tk.LEFT, padx=5)
-        self.btn_next = ttk.Button(action_frame, text="Move Next →", command=self._move_next_selected, state="disabled"); self.btn_next.pack(side=tk.LEFT, padx=5)
 
+        self.btn_edit = ttk.Button(
+            action_frame, text="Edit",
+            command=self._edit_selected_kanban, state="disabled"
+        )
+        self.btn_edit.pack(side=tk.LEFT, padx=5)
+
+        self.btn_delete = ttk.Button(
+            action_frame, text="Delete",
+            command=self._delete_selected_kanban, state="disabled"
+        )
+        self.btn_delete.pack(side=tk.LEFT, padx=5)
+
+        self.btn_done = ttk.Button(
+            action_frame, text="Mark Done",
+            command=self._mark_done_selected_kanban, state="disabled"
+        )
+        self.btn_done.pack(side=tk.LEFT, padx=5)
+
+        self.btn_prev = ttk.Button(
+            action_frame, text="← Move Previous",
+            command=self._move_prev_selected, state="disabled"
+        )
+        self.btn_prev.pack(side=tk.LEFT, padx=5)
+
+        self.btn_next = ttk.Button(
+            action_frame, text="Move Next →",
+            command=self._move_next_selected, state="disabled"
+        )
+        self.btn_next.pack(side=tk.LEFT, padx=5)
 
     ####
     def _send_teams_disabled(self, task_id, recipient_label, subject, body):
@@ -1759,9 +1863,50 @@ class TaskApp(tk.Tk):
         row += 1
 
         # Description (below)
+        # Description (below)
         ttk.Label(content_frame, text="Description").grid(row=row, column=0, sticky="nw", pady=(6, 0))
+
         desc_text = tk.Text(content_frame, height=8, width=80, wrap="word")
-        desc_text.grid(row=row, column=1, columnspan=5, sticky="we", padx=6, pady=(6, 0))
+        desc_text.grid(row=row, column=1, columnspan=4, sticky="we", padx=6, pady=(6, 0))
+
+        def _open_html_converter():
+            html_value = desc_text.get("1.0", tk.END).strip()
+            if not html_value:
+                messagebox.showinfo("HTML Converter", "Description is empty.", parent=win)
+                return
+
+            converted = self._html_to_text(html_value)
+
+            conv_win = tk.Toplevel(win)
+            conv_win.title("HTML → Text Converter")
+            conv_win.geometry("800x500")
+            conv_win.transient(win)
+            conv_win.grab_set()
+
+            ttk.Label(conv_win, text="Converted Plain Text", font=("", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+
+            text_area = tk.Text(conv_win, wrap="word")
+            text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+            text_area.insert("1.0", converted)
+
+            def apply_text():
+                desc_text.delete("1.0", tk.END)
+                desc_text.insert(tk.END, text_area.get("1.0", tk.END).strip())
+                conv_win.destroy()
+
+            btn_frame = ttk.Frame(conv_win)
+            btn_frame.pack(pady=10)
+
+            ttk.Button(btn_frame, text="Apply to Description", command=apply_text).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btn_frame, text="Close", command=conv_win.destroy).pack(side=tk.LEFT, padx=6)
+
+        # Button on the right
+        ttk.Button(
+            content_frame,
+            text="HTML → Text",
+            command=_open_html_converter
+        ).grid(row=row, column=5, sticky="nw", padx=6, pady=(6, 0))
+
         row += 1
 
         # Progress log
