@@ -3464,49 +3464,46 @@ class TaskApp(tk.Tk):
     ###
     def _get_flagged_from_folder(self, folder, flagged):
         """
-        Recursively fetch flagged mails from a folder and its subfolders.
-        Robust across Outlook versions (FlagStatus / FlagRequest differences).
+        Robust Outlook flagged mail scan.
+        Works for Exchange, O365, Cached mode, Search folders.
         """
+
         try:
             items = folder.Items
             items.Sort("[ReceivedTime]", True)
 
-            # Try restriction, but fallback safely
-            try:
-                flagged_items = items.Restrict("[FlagStatus] <> 0")
-            except Exception:
-                flagged_items = items
-
-            for item in flagged_items:
+            for item in items:
                 try:
                     # Only MailItem
                     if getattr(item, "Class", 0) != 43:
                         continue
 
+                    # Flag detection (DO NOT use Restrict)
                     flag_status = getattr(item, "FlagStatus", 0)
-                    flag_request = getattr(item, "FlagRequest", "")
+                    flag_request = str(getattr(item, "FlagRequest", "") or "").strip()
 
-                    # Not flagged
-                    if flag_status not in (1, 2) and not flag_request:
-                        continue
+                    if flag_status == 0 and not flag_request:
+                        continue  # not flagged
 
+                    # --- Attachments ---
                     attachments = []
                     try:
                         if item.Attachments.Count > 0:
                             os.makedirs("attachments", exist_ok=True)
                             for att in item.Attachments:
-                                fname = os.path.join("attachments", att.FileName)
-                                att.SaveAsFile(fname)
-                                attachments.append(fname)
+                                path = os.path.join("attachments", att.FileName)
+                                att.SaveAsFile(path)
+                                attachments.append(path)
                     except Exception:
-                        logger.exception("Attachment import error")
+                        logger.exception("Attachment import failed")
 
+                    # --- Due date ---
                     due = None
                     try:
                         if getattr(item, "TaskDueDate", None):
                             due = item.TaskDueDate.strftime("%Y-%m-%d")
                     except Exception:
-                        due = None
+                        pass
 
                     flagged.append({
                         "title": f"[Mail] {item.Subject}",
@@ -3522,14 +3519,14 @@ class TaskApp(tk.Tk):
                     })
 
                 except Exception:
-                    logger.exception("Error processing flagged mail item")
+                    logger.exception("Error processing Outlook mail item")
 
-            # Recurse into subfolders
+            # Recurse subfolders
             for sub in folder.Folders:
                 self._get_flagged_from_folder(sub, flagged)
 
         except Exception:
-            logger.exception("Error scanning Outlook folder for flagged items")
+            logger.exception("Error scanning Outlook folder")
 
     def _get_flagged_emails(self):
         if not HAS_OUTLOOK:
