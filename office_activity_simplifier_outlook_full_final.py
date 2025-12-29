@@ -25,9 +25,6 @@ import logging
 import webbrowser
 import urllib.parse
 import urllib.request
-import os
-import subprocess
-import requests
 from datetime import datetime, date, timedelta
 
 # ---- Persistent file logging (next to the app/exe) ----
@@ -209,8 +206,8 @@ class TaskDB:
     def _init_db(self):
         cur = self.conn.cursor()
         # Primary tasks table
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS tasks(
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tasks(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 description TEXT,
@@ -221,6 +218,9 @@ class TaskDB:
                 updated_at TEXT,
                 done_at TEXT,
                 outlook_id TEXT,
+                outlook_storeid TEXT,
+                outlook_received_time TEXT,
+                outlook_sender TEXT,
                 progress_log TEXT,
                 attachments TEXT,
                 reminder_minutes INTEGER,
@@ -229,9 +229,12 @@ class TaskDB:
                 deleted_at TEXT,
                 recurrence TEXT,
                 responsible_id INTEGER,
-                reminder_email_body TEXT
-            );"""
-        )
+                reminder_email_body TEXT,
+                reminder_mail_entryid TEXT,
+                is_future INTEGER DEFAULT 0
+            );
+        """)
+        
 
         # contacts table for Name + Email
         cur.execute(
@@ -258,9 +261,20 @@ class TaskDB:
             pass
 
         cols_to_ensure = [
-            "outlook_id", "progress_log", "attachments", "reminder_minutes",
-            "reminder_set_at", "reminder_sent_at", "deleted_at", "recurrence",
-            "responsible_id", "reminder_email_body", "reminder_mail_entryid"
+            "outlook_id",
+            "outlook_storeid",
+            "outlook_received_time",
+            "outlook_sender",
+            "progress_log",
+            "attachments",
+            "reminder_minutes",
+            "reminder_set_at",
+            "reminder_sent_at",
+            "deleted_at",
+            "recurrence",
+            "responsible_id",
+            "reminder_email_body",
+            "reminder_mail_entryid"
         ]
         for col in cols_to_ensure:
             try:
@@ -376,16 +390,40 @@ class TaskDB:
         return added
 
     # tasks methods
-    def add(self, title, description, due_date, priority, status="Pending", outlook_id=None,
-            reminder_minutes=None, reminder_set_at=None, recurrence=None, responsible_id=None, reminder_email_body=None):
+    def add(self, title, description, due_date, priority, status="Pending",
+        outlook_id=None, reminder_minutes=None, reminder_set_at=None,
+        recurrence=None, responsible_id=None, reminder_email_body=None):
+
         now = _now_iso()
         done_at = now if status == "Done" else None
+
         with self.conn:
             self.conn.execute(
-                """INSERT INTO tasks(title, description, due_date, priority, status,
-                   created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at, deleted_at, recurrence, responsible_id, reminder_email_body)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (title, description, due_date, priority, status, now, now, done_at, outlook_id, "", reminder_minutes, reminder_set_at, None, None, recurrence, responsible_id, reminder_email_body),
+                """INSERT INTO tasks(
+                    title, description, due_date, priority, status,
+                    created_at, updated_at, done_at,
+                    outlook_id,
+                    reminder_minutes, reminder_set_at, reminder_sent_at,
+                    recurrence, responsible_id, reminder_email_body
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    description,
+                    due_date,
+                    priority,
+                    status,
+                    now,
+                    now,
+                    done_at,
+                    outlook_id,
+                    reminder_minutes,
+                    reminder_set_at,
+                    None,
+                    recurrence,
+                    responsible_id,
+                    reminder_email_body
+                )
             )
 
     def update(self, task_id, title, description, due_date, priority, status, reminder_minutes=None, reminder_set_at=None, recurrence=None, responsible_id=None, reminder_email_body=None):
@@ -471,10 +509,16 @@ class TaskDB:
         with self.conn:
             for r in rows:
                 done_at = now if r.get("status") == "Done" else None
+                ###
                 self.conn.execute(
-                    """INSERT INTO tasks(title, description, due_date, priority, status,
-                                        created_at, updated_at, done_at, outlook_id, progress_log, reminder_minutes, reminder_set_at, reminder_sent_at, deleted_at, recurrence)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO tasks(
+                        title, description, due_date, priority, status,
+                        created_at, updated_at, done_at,
+                        outlook_id, outlook_storeid, outlook_received_time, outlook_sender,
+                        progress_log, attachments,
+                        reminder_minutes, reminder_set_at, reminder_sent_at, deleted_at, recurrence
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         r.get("title"),
                         r.get("description"),
@@ -485,7 +529,11 @@ class TaskDB:
                         now,
                         done_at,
                         r.get("outlook_id"),
+                        r.get("outlook_storeid"),
+                        r.get("outlook_received_time"),
+                        r.get("outlook_sender"),
                         r.get("progress_log", ""),
+                        r.get("attachments"),
                         None,
                         None,
                         None,
@@ -493,7 +541,6 @@ class TaskDB:
                         r.get("recurrence")
                     ),
                 )
-
     def mark_done(self, task_id):
         now = _now_iso()
         with self.conn:
@@ -507,21 +554,50 @@ class TaskApp(tk.Tk):
 
     def _open_outlook_email(self, task_id):
         task = self.db.get_task(task_id)
-
         if not task or not task["outlook_id"]:
             messagebox.showinfo("Outlook", "This task is not linked to an Outlook email.")
             return
 
         try:
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            mail = outlook.GetItemFromID(task["outlook_id"], task["outlook_storeid"])
-            mail.Display()
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            ns = outlook.GetNamespace("MAPI")
+
+            # 1️⃣ Fast path: EntryID + StoreID
+            try:
+                storeid = task["outlook_storeid"] if "outlook_storeid" in task.keys() else None
+                mail = ns.GetItemFromID(task["outlook_id"], storeid) if storeid else ns.GetItemFromID(task["outlook_id"])
+                mail.Display()
+                return
+            except Exception:
+                logger.warning("EntryID failed, falling back to search")
+
+            # 2️⃣ Smart fallback search
+            norm = normalize_subject(task["title"])
+            inbox = ns.GetDefaultFolder(6)
+            items = inbox.Items
+            items.Sort("[ReceivedTime]", True)
+
+            for item in items:
+                try:
+                    if item.Class != 43:
+                        continue
+                    if normalize_subject(item.Subject) != norm:
+                        continue
+                    if task["outlook_sender"] and item.SenderEmailAddress != task["outlook_sender"]:
+                        continue
+                    item.Display()
+                    return
+                except Exception:
+                    continue
+
+            messagebox.showwarning("Outlook", "Original email not found (moved or deleted).")
+
         except Exception:
             logger.exception("Failed to open Outlook email")
-            messagebox.showerror(
-                "Outlook",
-                "Unable to open the Outlook email. It may have been moved or deleted."
-            )
+            messagebox.showerror("Outlook", "Unable to access Outlook.")
+
+
+            
     def _convert_reply_to_comment(self, task_id):
         task = self.db.get_task(task_id)
         if not task:
@@ -564,8 +640,8 @@ class TaskApp(tk.Tk):
 
         self.db.update_task(
             task_id,
-            subject=mail.Subject,
-            last_outlook_received=mail.ReceivedTime
+            outlook_received_time=mail.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S"),
+            outlook_sender=mail.SenderEmailAddress
         )
 
         messagebox.showinfo("Outlook", "Email chain refreshed.")
@@ -590,12 +666,23 @@ class TaskApp(tk.Tk):
 
         mail.SaveAs(path, 3)  # 3 = .msg format
 
-        self.db.add_attachment(
-            task_id=task_id,
-            file_path=path,
-            file_type="outlook_msg",
-            description="Latest Outlook reply"
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone()
+
+        files = []
+        if row and row["attachments"]:
+            try:
+                files = json.loads(row["attachments"])
+            except Exception:
+                files = []
+
+        files.append(path)
+        self.db.conn.execute(
+            "UPDATE tasks SET attachments=? WHERE id=?",
+            (json.dumps(files), task_id)
         )
+        self.db.conn.commit()
 
         messagebox.showinfo("Attachment", "Latest reply attached.")
         self._populate_attachments(task_id)
@@ -611,7 +698,7 @@ class TaskApp(tk.Tk):
             items = inbox.Items
             items.Sort("[ReceivedTime]", True)
 
-            target_norm = normalize_subject(task_row["subject"])
+            target_norm = normalize_subject(task_row["title"])
 
             for mail in items:
                 try:
@@ -777,7 +864,8 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Failed to bind global double-click")
 
-        
+        self.app_data_dir = os.path.join(app_dir, "data")
+        os.makedirs(self.app_data_dir, exist_ok=True)
 
         # Key bindings
         try:
@@ -1585,38 +1673,7 @@ class TaskApp(tk.Tk):
 
         #Moved here
         # Send Reminder Now button (next to email field)
-        def _send_now_action():
-            html_body = email_body_text.get("1.0", tk.END).strip()
-            if not html_body:
-                res = messagebox.askyesno("Send Empty Body?", "Reminder email body is empty. Send anyway?")
-                if not res:
-                    return
-            # determine recipient
-            label = responsible_var.get().strip()
-            to_address = None
-            if label and hasattr(responsible_cb, "lookup_map"):
-                cid = responsible_cb.lookup_map.get(label)
-                if cid:
-                    cur = self.db.conn.cursor()
-                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
-                    rowc = cur.fetchone()
-                    if rowc and rowc["email"]:
-                        to_address = rowc["email"]
-            if not to_address:
-                # ask user to enter an email address
-                to_address = simpledialog.askstring("Recipient", "Enter recipient email address:", parent=win)
-                if not to_address:
-                    messagebox.showinfo("Aborted", "No recipient provided; aborting send.", parent=win)
-                    return
-            # send via Outlook
-            if not HAS_OUTLOOK:
-                messagebox.showwarning("Outlook Unavailable", "Outlook integration is not available on this system.")
-                return
-            sent_ok = self._send_reminder_email(task_id or 0, to_address, title_var.get().strip() or "Task Reminder", html_body)
-            if sent_ok:
-                messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
-            else:
-                messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
+        
 
 
         row = 0
@@ -1754,15 +1811,6 @@ class TaskApp(tk.Tk):
 
         # Reminder Email (HTML) placed below progress section
         ttk.Label(content_frame, text="Reminder Email (HTML)").grid(row=row, column=0, sticky="nw", pady=(10, 0))
-        email_body_text = tk.Text(content_frame, height=8, width=80, wrap="word")
-        email_body_text.grid(row=row, column=1, columnspan=4, sticky="we", padx=6, pady=(10, 0))
-
-        #####try
-        # ===== Reminder Email (HTML) =====
-        ttk.Label(content_frame, text="Reminder Email (HTML)").grid(
-            row=row, column=0, sticky="nw", pady=(12, 4)
-        )
-
         email_body_text = tk.Text(
             content_frame,
             height=10,
@@ -1780,7 +1828,38 @@ class TaskApp(tk.Tk):
 
         row += 1  # ✅ move to NEXT row
 
-
+        def _send_now_action():
+            html_body = email_body_text.get("1.0", tk.END).strip()
+            if not html_body:
+                res = messagebox.askyesno("Send Empty Body?", "Reminder email body is empty. Send anyway?")
+                if not res:
+                    return
+            # determine recipient
+            label = responsible_var.get().strip()
+            to_address = None
+            if label and hasattr(responsible_cb, "lookup_map"):
+                cid = responsible_cb.lookup_map.get(label)
+                if cid:
+                    cur = self.db.conn.cursor()
+                    cur.execute("SELECT email FROM contacts WHERE id=?", (cid,))
+                    rowc = cur.fetchone()
+                    if rowc and rowc["email"]:
+                        to_address = rowc["email"]
+            if not to_address:
+                # ask user to enter an email address
+                to_address = simpledialog.askstring("Recipient", "Enter recipient email address:", parent=win)
+                if not to_address:
+                    messagebox.showinfo("Aborted", "No recipient provided; aborting send.", parent=win)
+                    return
+            # send via Outlook
+            if not HAS_OUTLOOK:
+                messagebox.showwarning("Outlook Unavailable", "Outlook integration is not available on this system.")
+                return
+            sent_ok = self._send_reminder_email(task_id or 0, to_address, title_var.get().strip() or "Task Reminder", html_body)
+            if sent_ok:
+                messagebox.showinfo("Sent", f"Reminder email sent to {to_address}.", parent=win)
+            else:
+                messagebox.showerror("Send Failed", "Failed to send reminder email (see logs).", parent=win)
         # ===== Outlook helper buttons (below editor) =====
         outlook_tools = ttk.Frame(content_frame)
         outlook_tools.grid(
@@ -1970,10 +2049,8 @@ class TaskApp(tk.Tk):
                 logger.exception("Error populating edit window")
 
         # Save & Cancel
-        bottom_frame = ttk.Frame(win, padding=8)
-        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        sep = ttk.Separator(bottom_frame, orient="horizontal")
-        sep.pack(fill=tk.X, pady=(0, 6))
+        footer = ttk.Frame(win, padding=10)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
 
         def _close():
             try:
@@ -2070,13 +2147,8 @@ class TaskApp(tk.Tk):
         #btn_frame.pack(side=tk.RIGHT)
         
         # ===== Footer buttons =====
-        footer = ttk.Frame(content_frame)
-        footer.grid(
-            row=row,
-            column=0,
-            columnspan=6,
-            pady=(14, 18)
-        )
+        footer = ttk.Frame(win, padding=10)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
 
         ttk.Button(
             footer,
@@ -3422,6 +3494,9 @@ class TaskApp(tk.Tk):
                         "priority": "Medium",
                         "status": "Pending",
                         "outlook_id": item.EntryID,
+                        "outlook_storeid": item.Parent.StoreID,
+                        "outlook_received_time": item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S"),
+                        "outlook_sender": item.SenderEmailAddress,
                         "attachments": json.dumps(attachments)
                     })
             for sub in folder.Folders:
@@ -3444,13 +3519,30 @@ class TaskApp(tk.Tk):
                             due = item.DueDate.strftime("%Y-%m-%d") if getattr(item, "DueDate", None) else None
                         except Exception:
                             due = None
+                        desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+                        attachments = []
+
+                        try:
+                            if item.Attachments.Count > 0:
+                                os.makedirs("attachments", exist_ok=True)
+                                for att in item.Attachments:
+                                    fname = os.path.join("attachments", att.FileName)
+                                    att.SaveAsFile(fname)
+                                    attachments.append(fname)
+                        except Exception:
+                            pass
+
                         flagged.append({
-                            "title": f"[OM] {item.Subject}",
-                            "description": item.Body or "",
+                            "title": f"[Mail] {item.Subject}",
+                            "description": desc,
                             "due_date": due,
                             "priority": "Medium",
                             "status": "Pending",
-                            "outlook_id": item.EntryID
+                            "outlook_id": item.EntryID,
+                            "outlook_storeid": item.Parent.StoreID,
+                            "outlook_received_time": item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S"),
+                            "outlook_sender": item.SenderEmailAddress,
+                            "attachments": json.dumps(attachments)
                         })
             except Exception:
                 logger.exception("To-Do List fetch error")
