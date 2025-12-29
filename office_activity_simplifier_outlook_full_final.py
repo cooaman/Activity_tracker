@@ -3463,11 +3463,6 @@ class TaskApp(tk.Tk):
             return False
     ###
     def _get_flagged_from_folder(self, folder, flagged):
-        """
-        Robust Outlook flagged mail scan.
-        Works for Exchange, O365, Cached mode, Search folders.
-        """
-
         try:
             items = folder.Items
             items.Sort("[ReceivedTime]", True)
@@ -3478,33 +3473,44 @@ class TaskApp(tk.Tk):
                     if getattr(item, "Class", 0) != 43:
                         continue
 
-                    # Flag detection (DO NOT use Restrict)
+                    # Check flag manually (DO NOT use Restrict)
                     flag_status = getattr(item, "FlagStatus", 0)
                     flag_request = str(getattr(item, "FlagRequest", "") or "").strip()
-
                     if flag_status == 0 and not flag_request:
-                        continue  # not flagged
+                        continue
 
-                    # --- Attachments ---
+                    # ---------- SAFE DATETIME ----------
+                    try:
+                        received = item.ReceivedTime
+                        received_str = received.strftime("%Y-%m-%d %H:%M:%S") if received else None
+                    except Exception:
+                        received_str = None
+
+                    # ---------- SAFE DUE DATE ----------
+                    try:
+                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                    except Exception:
+                        due = None
+
+                    # ---------- SAFE ATTACHMENTS ----------
                     attachments = []
                     try:
                         if item.Attachments.Count > 0:
-                            os.makedirs("attachments", exist_ok=True)
+                            base_dir = os.path.join(self.app_data_dir, "attachments", "outlook")
+                            os.makedirs(base_dir, exist_ok=True)
+
                             for att in item.Attachments:
-                                path = os.path.join("attachments", att.FileName)
-                                att.SaveAsFile(path)
-                                attachments.append(path)
+                                try:
+                                    fname = re.sub(r"[\\/:*?\"<>|]", "_", att.FileName)
+                                    path = os.path.join(base_dir, fname)
+                                    att.SaveAsFile(path)
+                                    attachments.append(path)
+                                except Exception:
+                                    logger.exception("Failed to save attachment")
                     except Exception:
-                        logger.exception("Attachment import failed")
+                        logger.exception("Attachment processing error")
 
-                    # --- Due date ---
-                    due = None
-                    try:
-                        if getattr(item, "TaskDueDate", None):
-                            due = item.TaskDueDate.strftime("%Y-%m-%d")
-                    except Exception:
-                        pass
-
+                    # ---------- ADD TASK ----------
                     flagged.append({
                         "title": f"[Mail] {item.Subject}",
                         "description": getattr(item, "HTMLBody", "") or getattr(item, "Body", ""),
@@ -3513,15 +3519,15 @@ class TaskApp(tk.Tk):
                         "status": "Pending",
                         "outlook_id": item.EntryID,
                         "outlook_storeid": item.Parent.StoreID,
-                        "outlook_received_time": item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S"),
+                        "outlook_received_time": received_str,
                         "outlook_sender": item.SenderEmailAddress,
                         "attachments": json.dumps(attachments)
                     })
 
                 except Exception:
-                    logger.exception("Error processing Outlook mail item")
+                    logger.exception("Error processing flagged Outlook mail")
 
-            # Recurse subfolders
+            # Recurse folders
             for sub in folder.Folders:
                 self._get_flagged_from_folder(sub, flagged)
 
