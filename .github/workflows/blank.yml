@@ -32,16 +32,12 @@ jobs:
           python -c "import win32com.client"
 
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller ^
-            --onefile ^
-            --windowed ^
-            --clean ^
-            --noconfirm ^
-            --hidden-import=win32timezone ^
-            --hidden-import=win32com.client ^
-            --hidden-import=win32com.server ^
-            office_activity_simplifier_outlook_full_final.py
+        run: >
+          pyinstaller --onefile --windowed --clean --noconfirm
+          --hidden-import=win32timezone
+          --hidden-import=win32com.client
+          --hidden-import=win32com.server
+          office_activity_simplifier_outlook_full_final.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
