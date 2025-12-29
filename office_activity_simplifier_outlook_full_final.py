@@ -552,7 +552,15 @@ class TaskDB:
 
 # -------------------- App --------------------
 class TaskApp(tk.Tk):
-
+    def _get_task(self, task_id):
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+            return cur.fetchone()
+        except Exception:
+            logger.exception("Failed to fetch task %s", task_id)
+            return None
+        
     def _show_kanban_readable_desc(self, task_id):
         task = self._get_task(task_id)
         if not task:
@@ -582,12 +590,21 @@ class TaskApp(tk.Tk):
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
 
     def _get_selected_task_id(self):
-        """Return selected task id from main task tree"""
-        selected = self.task_tree.selection()
+        tree = getattr(self, "active_task_tree", None)
+
+        if not tree:
+            messagebox.showwarning("Selection", "No task list active")
+            return None
+
+        selected = tree.selection()
         if not selected:
             messagebox.showwarning("Selection", "No task selected")
             return None
-        return int(selected[0])    
+
+        try:
+            return int(selected[0])
+        except Exception:
+            return None
     def _open_selected_outlook_email(self):
         task_id = self._get_selected_task_id()
         if not task_id:
@@ -1417,6 +1434,12 @@ class TaskApp(tk.Tk):
         # Treeview
         self.tree = ttk.Treeview(list_tab, columns=cols, show="headings", displaycolumns=display_cols)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.task_tree = self.tree
+        self.active_task_tree = self.tree  # default active tree
+        self.tree.bind(
+            "<<TreeviewSelect>>",
+            lambda e, t=self.tree: setattr(self, "active_task_tree", t)
+        )
 
         for col in cols:
             header_text = col.title() if col != "id" else "ID"
