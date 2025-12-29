@@ -3461,15 +3461,35 @@ class TaskApp(tk.Tk):
         except Exception:
             logger.exception("Failed to create/send Outlook mail")
             return False
-
+    ###
     def _get_flagged_from_folder(self, folder, flagged):
-        """Recursively fetch flagged mails from a folder + subfolders"""
+        """
+        Recursively fetch flagged mails from a folder and its subfolders.
+        Robust across Outlook versions (FlagStatus / FlagRequest differences).
+        """
         try:
             items = folder.Items
             items.Sort("[ReceivedTime]", True)
-            flagged_items = items.Restrict("[FlagStatus] = 2")
+
+            # Try restriction, but fallback safely
+            try:
+                flagged_items = items.Restrict("[FlagStatus] <> 0")
+            except Exception:
+                flagged_items = items
+
             for item in flagged_items:
-                if getattr(item, "Class", 0) == 43:  # MailItem
+                try:
+                    # Only MailItem
+                    if getattr(item, "Class", 0) != 43:
+                        continue
+
+                    flag_status = getattr(item, "FlagStatus", 0)
+                    flag_request = getattr(item, "FlagRequest", "")
+
+                    # Not flagged
+                    if flag_status not in (1, 2) and not flag_request:
+                        continue
+
                     attachments = []
                     try:
                         if item.Attachments.Count > 0:
@@ -3483,13 +3503,14 @@ class TaskApp(tk.Tk):
 
                     due = None
                     try:
-                        due = item.TaskDueDate.strftime("%Y-%m-%d") if getattr(item, "TaskDueDate", None) else None
+                        if getattr(item, "TaskDueDate", None):
+                            due = item.TaskDueDate.strftime("%Y-%m-%d")
                     except Exception:
                         due = None
-                    desc = getattr(item, "HTMLBody", "") or getattr(item, "Body", "")
+
                     flagged.append({
                         "title": f"[Mail] {item.Subject}",
-                        "description": desc,
+                        "description": getattr(item, "HTMLBody", "") or getattr(item, "Body", ""),
                         "due_date": due,
                         "priority": "Medium",
                         "status": "Pending",
@@ -3499,10 +3520,16 @@ class TaskApp(tk.Tk):
                         "outlook_sender": item.SenderEmailAddress,
                         "attachments": json.dumps(attachments)
                     })
+
+                except Exception:
+                    logger.exception("Error processing flagged mail item")
+
+            # Recurse into subfolders
             for sub in folder.Folders:
                 self._get_flagged_from_folder(sub, flagged)
+
         except Exception:
-            logger.exception("Error scanning folder for flagged items")
+            logger.exception("Error scanning Outlook folder for flagged items")
 
     def _get_flagged_emails(self):
         if not HAS_OUTLOOK:
@@ -3565,16 +3592,50 @@ class TaskApp(tk.Tk):
         return flagged
 
     def _import_outlook_flags(self):
+        """
+        Import flagged Outlook emails and tasks.
+        Prevents duplicates even if EntryID changes.
+        """
         flagged = self._get_flagged_emails()
+
+        logger.info("Outlook flagged emails found: %d", len(flagged))
+
         if not flagged:
-            messagebox.showinfo("Outlook", "No active tasks or flagged emails found.")
+            messagebox.showinfo("Outlook", "No flagged emails or tasks found.")
             return
+
         cur = self.db.conn.cursor()
-        new_items = [f for f in flagged if not cur.execute("SELECT 1 FROM tasks WHERE outlook_id=?", (f["outlook_id"],)).fetchone()]
+        new_items = []
+
+        for f in flagged:
+            try:
+                exists = cur.execute(
+                    """
+                    SELECT 1 FROM tasks
+                    WHERE outlook_id = ?
+                    OR lower(title) = lower(?)
+                    """,
+                    (f["outlook_id"], f["title"])
+                ).fetchone()
+
+                if not exists:
+                    new_items.append(f)
+
+            except Exception:
+                logger.exception("Duplicate check failed for Outlook item")
+
+        logger.info("New Outlook tasks to import: %d", len(new_items))
+
         if new_items:
             self.db.bulk_add(new_items)
-            self._populate(); self._populate_kanban()
-        messagebox.showinfo("Outlook", f"Imported {len(new_items)} new tasks.")
+            self._populate()
+            self._populate_kanban()
+
+        messagebox.showinfo(
+            "Outlook Import",
+            f"Imported {len(new_items)} new task(s).\n"
+            f"Skipped {len(flagged) - len(new_items)} existing item(s)."
+        )
 
     def _refresh_outlook_flags(self):
         self._import_outlook_flags()
