@@ -599,93 +599,95 @@ class TaskApp(tk.Tk):
 
             
     def _convert_reply_to_comment(self, task_id):
-        task = self.db.get_task(task_id)
+        task = self._get_task(task_id)
         if not task:
             return
 
-        mail = self._find_latest_outlook_mail(task)
-        if not mail:
-            messagebox.showinfo("Outlook", "No reply found.")
+        entry_id = task.get("outlook_entryid")
+        store_id = task.get("outlook_storeid")
+        if not entry_id or not store_id:
             return
 
-        confirm = messagebox.askyesno(
-            "Confirm",
-            "Append latest reply content to task description?"
-        )
-        if not confirm:
-            return
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            ns = outlook.GetNamespace("MAPI")
+            mail = ns.GetItemFromID(entry_id, store_id)
 
-        reply_html = mail.HTMLBody or ""
-        stamp = (
-            "<hr>"
-            f"<p><b>Outlook Reply ({mail.ReceivedTime}):</b></p>"
-        )
+            try:
+                body = mail.Body  # plain text, SAFE
+            except Exception:
+                body = "[Outlook body blocked]"
 
-        new_desc = (task["description"] or "") + stamp + reply_html
-        self.db.update_task(task_id, description=new_desc)
+            self._append_comment(task_id, body[:5000])
+            messagebox.showinfo("Comment", "Latest reply added as comment")
 
-        messagebox.showinfo("Task", "Reply appended to description.")
-        self._open_edit_window(task_id)
-
+        except Exception:
+            logger.exception("Convert reply failed")
 
     def _refresh_email_chain(self, task_id):
-        task = self.db.get_task(task_id)
+        task = self._get_task(task_id)
         if not task:
             return
 
-        mail = self._find_latest_outlook_mail(task)
-        if not mail:
-            messagebox.showinfo("Outlook", "No updated email found.")
+        subject = task["title"].replace("[OM]:", "").strip()
+
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        ns = outlook.GetNamespace("MAPI")
+        inbox = ns.GetDefaultFolder(6)  # Inbox
+
+        items = inbox.Items
+        items.Sort("[ReceivedTime]", True)
+
+        chain = []
+        for mail in items:
+            try:
+                if subject.lower() in mail.Subject.lower():
+                    chain.append(mail)
+            except Exception:
+                continue
+
+        if not chain:
+            messagebox.showinfo("Outlook", "No matching email chain found")
             return
 
-        self.db.update_task(
-            task_id,
-            outlook_received_time=mail.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S"),
-            outlook_sender=mail.SenderEmailAddress
-        )
-
-        messagebox.showinfo("Outlook", "Email chain refreshed.")
-        self._populate()
+        # show latest email
+        chain[0].Display()
 
     def _attach_latest_reply(self, task_id):
-        task = self.db.get_task(task_id)
-        if not task or not task["outlook_id"]:
-            messagebox.showwarning("Outlook", "This task is not linked to Outlook.")
+        task = self._get_task(task_id)
+        if not task:
+            messagebox.showerror("Error", "Task not found")
             return
 
-        mail = self._find_latest_outlook_mail(task)
-        if not mail:
-            messagebox.showinfo("Outlook", "No related reply found.")
+        entry_id = task.get("outlook_entryid")
+        store_id = task.get("outlook_storeid")
+        if not entry_id or not store_id:
+            messagebox.showwarning("Outlook", "No Outlook email linked to this task")
             return
 
-        attach_dir = os.path.join(self.app_data_dir, "attachments", str(task_id))
-        os.makedirs(attach_dir, exist_ok=True)
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            ns = outlook.GetNamespace("MAPI")
+            mail = ns.GetItemFromID(entry_id, store_id)
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(attach_dir, f"reply_{ts}.msg")
+            attachments = []
+            attach_dir = os.path.join(self.app_dir, "attachments", str(task_id))
+            os.makedirs(attach_dir, exist_ok=True)
 
-        mail.SaveAs(path, 3)  # 3 = .msg format
+            for att in mail.Attachments:
+                try:
+                    path = os.path.join(attach_dir, att.FileName)
+                    att.SaveAsFile(path)
+                    attachments.append(path)
+                except Exception:
+                    continue
 
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT attachments FROM tasks WHERE id=?", (task_id,))
-        row = cur.fetchone()
+            self._add_attachments_to_task(task_id, attachments)
+            messagebox.showinfo("Outlook", "Latest attachments added")
 
-        files = []
-        if row and row["attachments"]:
-            try:
-                files = json.loads(row["attachments"])
-            except Exception:
-                files = []
-
-        files.append(path)
-        self.db.conn.execute(
-            "UPDATE tasks SET attachments=? WHERE id=?",
-            (json.dumps(files), task_id)
-        )
-        self.db.conn.commit()
-
-        messagebox.showinfo("Attachment", "Latest reply attached.")
-        self._populate_attachments(task_id)
+        except Exception as e:
+            logger.exception("Attach latest reply failed")
+            messagebox.showerror("Outlook", str(e))
 
 
 
