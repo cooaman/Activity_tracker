@@ -7,7 +7,6 @@ tkhtmlview>=0.2.0
 
 # Windows / Outlook integration
 pywin32>=306
-win32timezone>=0.1.0
 
 # Packaging
 pyinstaller>=6.3.0
