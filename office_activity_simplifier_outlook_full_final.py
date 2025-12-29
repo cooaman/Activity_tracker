@@ -590,21 +590,30 @@ class TaskApp(tk.Tk):
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
 
     def _get_selected_task_id(self):
+        """
+        Robust task selection resolver.
+        Works even when focus moves to buttons.
+        """
+
+        # 1️⃣ Prefer active task tree (if set)
         tree = getattr(self, "active_task_tree", None)
+        if tree:
+            sel = tree.selection()
+            if sel:
+                try:
+                    return int(tree.item(sel[0], "values")[0])
+                except Exception:
+                    pass
 
-        if not tree:
-            messagebox.showwarning("Selection", "No task list active")
-            return None
-
-        selected = tree.selection()
-        if not selected:
-            messagebox.showwarning("Selection", "No task selected")
-            return None
-
+        # 2️⃣ Fallback: main Task List tree
         try:
-            return int(selected[0])
+            sel = self.tree.selection()
+            if sel:
+                return int(self.tree.item(sel[0], "values")[0])
         except Exception:
-            return None
+            pass
+
+        return None
     def _open_selected_outlook_email(self):
         task_id = self._get_selected_task_id()
         if not task_id:
@@ -1486,7 +1495,7 @@ class TaskApp(tk.Tk):
         ttk.Button(
             btns,
             text="📧 Open Original Email",
-            command=self._open_selected_outlook_email
+            command=lambda: self._open_selected_outlook_email
         ).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Move to Future",
            command=self._move_selected_to_future).pack(side=tk.LEFT, padx=5)
